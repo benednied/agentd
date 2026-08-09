@@ -257,6 +257,11 @@ def test_dockerfile_keeps_runtime_tools_and_never_embeds_credentials() -> None:
     assert "mv /usr/bin/bwrap /usr/libexec/agentd/bwrap.real" in dockerfile
     assert "/build/bwrap /usr/bin/bwrap" in dockerfile
     assert "--chown=0:0 --chmod=0555" in dockerfile
+    assert "/usr/libexec/agentd/codex-linux-sandbox" in dockerfile
+    assert "/usr/libexec/agentd/codex-execve-wrapper" in dockerfile
+    assert "/usr/libexec/agentd/apply_patch" in dockerfile
+    assert "/usr/libexec/agentd/applypatch" in dockerfile
+    assert 'PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:' in dockerfile
     assert "runtime_sandbox_probe.py" in dockerfile
     assert "sandbox_payload.py" in dockerfile
     assert "auth.json" not in dockerfile
@@ -359,12 +364,20 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
         "/opt/agentd/venv",
         "/usr/local/bin",
         "/usr/bin",
+        "/usr/libexec/agentd",
         "/bin",
         "/usr/lib",
         "/lib",
     ):
         assert filesystem[root] == "read"
-    assert filesystem["/home/bened/.local/share/agentd/codex-home"] == "deny"
+    codex_home = "/home/bened/.local/share/agentd/codex-home"
+    assert filesystem[codex_home] == "deny"
+    assert {
+        path: access
+        for path, access in filesystem.items()
+        if path.startswith(f"{codex_home}/")
+    } == {}
+    assert f"{codex_home}/auth.json" not in filesystem
     assert filesystem["/home/bened/.local/state/agentd"] == "deny"
     assert filesystem["/home/bened/.local/share/agentd/workspaces"] == "deny"
     assert profile["network"] == {"enabled": False}
@@ -400,7 +413,10 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert "_run_shim_rejection_probes()" in preflight
     assert "_require_bwrap_rewrite_audit" in preflight
     assert 'fields.get("rewrite_dev") == "1"' in preflight
+    assert 'fields.get("rewrite_helper") == "1"' in preflight
     assert 'fields.get("unshare_net") != "1"' in preflight
+    assert "require_helper_rewrite=True" in preflight
+    assert "CODEX_HELPER_ALIASES" in preflight
     assert "secrets.token_hex(16)" in preflight
     assert "_run_codex_generated_command_probe(worktree)" in preflight
     assert "shutil.copyfile(PAYLOAD, workspace_payload)" in preflight
@@ -409,9 +425,14 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert '"command": [str(toolchain_launcher), str(workspace_payload)]' in preflight
     assert "result.exit_code != 0" in preflight
     assert "/home/bened/.local/share/agentd/codex-home/auth.json" in payload
+    assert 'ARG0_ROOT = AUTH_FILE.parent / "tmp/arg0"' in payload
+    assert "_is_readable(ARG0_ROOT)" in payload
     assert "/home/bened/.local/state/agentd/state.sqlite" in payload
     assert 'REPOSITORY_ROOT = Path("/home/bened/goldenage")' in payload
     assert 'UV_CACHE_ROOT = Path("/home/bened/.cache/uv")' in payload
+    assert "AUTH_FILE.parent" in payload
+    assert 'for helper in ("apply_patch", "applypatch")' in payload
+    assert "_exercise_patch_helper(worktree, helper)" in payload
     assert "_unexpectedly_writable" in payload
     assert "os.O_WRONLY | os.O_CREAT | os.O_EXCL" in payload
     assert "socket.SOCK_DGRAM" in payload
@@ -426,6 +447,11 @@ def test_bwrap_compatibility_shim_is_narrow_and_fail_closed() -> None:
 
     assert '#define REAL_BWRAP "/usr/libexec/agentd/bwrap.real"' in shim
     assert '#define AUDIT_DIRECTORY "/run/agentd"' in shim
+    assert (
+        '#define CODEX_SANDBOX_ALIAS "/usr/libexec/agentd/codex-linux-sandbox"' in shim
+    )
+    assert "valid_codex_sandbox_helper" in shim
+    assert "unvalidated Codex-home command path rejected" in shim
     assert 'strcmp(argument, "--dev") == 0' in shim
     assert '(char *)"--dev-bind"' in shim
     assert 'rewritten[output++] = (char *)"--unshare-net"' not in shim
@@ -435,6 +461,7 @@ def test_bwrap_compatibility_shim_is_narrow_and_fail_closed() -> None:
     assert 'strcmp(argument, "--dev-bind-try") == 0' in shim
     assert "unknown Bubblewrap option rejected" in shim
     assert "inspection->unshare_net_seen ? 1 : 0" in shim
+    assert "inspection->helper_rewrite_index >= 0 ? 1 : 0" in shim
     assert "O_NOFOLLOW" in shim
     assert "metadata.st_uid != 0" in shim
     assert "fexecve(real_bwrap, rewritten, environ)" in shim

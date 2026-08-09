@@ -68,6 +68,18 @@ RUN apt-get update \
 COPY --from=bwrap-compat-builder --chown=0:0 --chmod=0555 \
     /build/bwrap /usr/bin/bwrap
 COPY --from=builder /build/.venv /opt/agentd/venv
+RUN ln -s \
+        /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
+        /usr/libexec/agentd/codex-linux-sandbox \
+    && ln -s \
+        /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
+        /usr/libexec/agentd/codex-execve-wrapper \
+    && ln -s \
+        /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
+        /usr/libexec/agentd/apply_patch \
+    && ln -s \
+        /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
+        /usr/libexec/agentd/applypatch
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
@@ -78,7 +90,7 @@ COPY --chmod=0555 \
     /opt/agentd/security/
 COPY --chmod=0444 deploy/container/config.toml /opt/agentd/security/config.toml
 
-ENV PATH="/opt/agentd/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+ENV PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:/usr/local/bin:/usr/bin:/bin" \
     HOME="/home/bened" \
     CODEX_HOME="/home/bened/.local/share/agentd/codex-home" \
     UV_CACHE_DIR="/home/bened/.cache/uv" \

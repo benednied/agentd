@@ -34,6 +34,15 @@ BWRAP_AUDIT_TOKEN_ENV = "AGENTD_BWRAP_AUDIT_TOKEN"
 PAYLOAD = Path("/opt/agentd/security/sandbox_payload.py")
 EXPECTED_CONFIG = Path("/opt/agentd/security/config.toml")
 PERMISSION_PROFILE = "agentd-workspace"
+CODEX_HELPER_ALIASES = tuple(
+    Path("/usr/libexec/agentd") / name
+    for name in (
+        "codex-linux-sandbox",
+        "codex-execve-wrapper",
+        "apply_patch",
+        "applypatch",
+    )
+)
 
 
 def _require_runtime_layout() -> None:
@@ -90,6 +99,16 @@ def _require_runtime_layout() -> None:
             raise RuntimeError(f"security executable is not executable: {executable}")
     if BWRAP.samefile(REAL_BWRAP):
         raise RuntimeError("bubblewrap compatibility shim aliases the real binary")
+    runtime = bundled_codex_path()
+    for alias in CODEX_HELPER_ALIASES:
+        metadata = alias.lstat()
+        if (
+            not alias.is_symlink()
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or Path(os.readlink(alias)) != runtime
+        ):
+            raise RuntimeError(f"invalid pinned Codex helper alias: {alias}")
     resolved_bwrap = shutil.which("bwrap")
     if resolved_bwrap != str(BWRAP):
         raise RuntimeError(f"bwrap resolves to {resolved_bwrap!r}, expected {BWRAP}")
@@ -129,7 +148,12 @@ def _reset_bwrap_audit() -> None:
     BWRAP_AUDIT_FILE.unlink()
 
 
-def _require_bwrap_rewrite_audit(token: str, description: str) -> None:
+def _require_bwrap_rewrite_audit(
+    token: str,
+    description: str,
+    *,
+    require_helper_rewrite: bool,
+) -> None:
     if not BWRAP_AUDIT_FILE.is_file() or BWRAP_AUDIT_FILE.is_symlink():
         raise RuntimeError(f"{description} did not create a regular bwrap audit record")
     metadata = BWRAP_AUDIT_FILE.stat()
@@ -142,9 +166,10 @@ def _require_bwrap_rewrite_audit(token: str, description: str) -> None:
         raise RuntimeError(f"{description} created an unsafe bwrap audit record")
 
     matching_rewrites = 0
+    helper_rewrites = 0
     for line in BWRAP_AUDIT_FILE.read_text(encoding="ascii").splitlines():
         parts = line.split()
-        if len(parts) != 5 or parts[0] != "v1":
+        if len(parts) != 6 or parts[0] != "v1":
             raise RuntimeError(f"{description} emitted a malformed bwrap audit record")
         try:
             fields = dict(part.split("=", 1) for part in parts[1:])
@@ -160,10 +185,18 @@ def _require_bwrap_rewrite_audit(token: str, description: str) -> None:
                 raise RuntimeError(
                     f"{description} did not preserve network namespace isolation"
                 )
+        if fields.get("rewrite_helper") == "1":
+            helper_rewrites += 1
     if matching_rewrites != 1:
         raise RuntimeError(
             f"{description} applied {matching_rewrites} audited /dev rewrites; "
             "expected 1"
+        )
+    expected_helper_rewrites = 1 if require_helper_rewrite else 0
+    if helper_rewrites != expected_helper_rewrites:
+        raise RuntimeError(
+            f"{description} applied {helper_rewrites} audited helper rewrites; "
+            f"expected {expected_helper_rewrites}"
         )
 
 
@@ -174,6 +207,15 @@ def _run_shim_rejection_probes() -> None:
         ("--dev-bind", "/dev/null", "/dev/null", "--version"),
         ("--dev-bind-try", "/dev", "/dev", "--version"),
         ("--args", "0"),
+        (
+            "--",
+            "/home/bened/.local/share/agentd/codex-home/tmp/arg0/"
+            "codex-arg0AAAAAA/codex-linux-sandbox",
+        ),
+        (
+            "/home/bened/.local/share/agentd/codex-home/tmp/arg0/"
+            "codex-arg0AAAAAA/codex-linux-sandbox",
+        ),
     ):
         result = subprocess.run(
             [str(BWRAP), *arguments],
@@ -233,7 +275,11 @@ def _run_direct_bwrap_probe(worktree: Path) -> None:
             "direct nested bwrap security probe failed "
             f"({result.returncode}): {result.stderr.strip()}"
         )
-    _require_bwrap_rewrite_audit(token, "direct nested sandbox probe")
+    _require_bwrap_rewrite_audit(
+        token,
+        "direct nested sandbox probe",
+        require_helper_rewrite=False,
+    )
 
 
 def _create_toolchain_launcher(token: str) -> Path:
@@ -309,6 +355,7 @@ def _run_codex_generated_command_probe(worktree: Path) -> None:
         _require_bwrap_rewrite_audit(
             token,
             "pinned Codex generated-command probe",
+            require_helper_rewrite=True,
         )
     finally:
         toolchain_launcher.unlink(missing_ok=True)

@@ -57,19 +57,28 @@ Codex. The shim rewrites only one exact `--dev /dev` pair to
 `--dev-bind /dev /dev`, binding the container's already-minimal `/dev`; Compose
 maps no host devices. It rejects alternate device targets, try-style device binds,
 argument-file expansion, explicit `--share-net`, unknown options, and malformed
-invocations before executing the private binary. It neither grants capabilities
-nor injects network isolation. The trusted dependency provisioner can therefore
-retain its deliberate outbound network access, while Codex must still supply its
-own `--unshare-net` for model-generated commands.
+invocations before executing the private binary. App Server also selects its
+sandbox helper through a temporary `codex-home/tmp/arg0/codex-arg0XXXXXX`
+symlink. The shim accepts only that exact six-alphanumeric path shape, verifies
+that the service-owned symlink targets the pinned bundled Codex ELF, and replaces
+the child path with the root-owned
+`/usr/libexec/agentd/codex-linux-sandbox` alias. Image-owned aliases for
+`codex-execve-wrapper`, `apply_patch`, and `applypatch` target the same pinned ELF
+and follow the venv on `PATH`. The shim neither grants capabilities nor injects
+network isolation. The trusted dependency provisioner can therefore retain its
+deliberate outbound network access, while Codex must still supply its own
+`--unshare-net` for model-generated commands.
 
 The pinned `openai-codex==0.144.4` runtime supports named permission profiles on
 its experimental App Server wire protocol. The dedicated config selects the
 `agentd-workspace` profile: platform/toolchain paths are read-only, the dynamic
 runtime workspace root is writable, the exact Codex home and agentd state roots
 are denied, the workspace-pool parent is denied, and command network access is
-disabled. A more-specific runtime-root rule reopens only the current lease.
-Thread start, resume, and turn requests select that profile and supply the
-leased worktree as their sole `runtimeWorkspaceRoots` entry.
+disabled. The entire Codex home remains denied; no temporary subtree is reopened.
+The root-owned `/usr/libexec/agentd` helper-alias directory is read-only. A
+more-specific runtime-root rule reopens only the current lease. Thread start,
+resume, and turn requests select that profile and supply the leased worktree as
+their sole `runtimeWorkspaceRoots` entry.
 
 App Server owns and invokes its Linux sandbox directly, so the compatibility ELF
 occupies the exact system path instead of relying on PATH ordering. During
@@ -77,14 +86,16 @@ service startup, a private nonce makes the shim append a mode-`0600` record belo
 the service-only `/run/agentd` tmpfs. Startup executes both a direct nested probe
 and a standalone command through the exact SDK-bundled App Server with
 `permissionProfile=agentd-workspace`, then requires one audited device rewrite
-with `--unshare-net` preserved for each. The App Server command executes a
-temporary mode-`0500` launcher from the read-only uv toolchain root. Together the
-probes prove that `auth.json` and SQLite are unreadable, the uv toolchain is
-executable but not writable, only the temporary leased worktree is writable, and
-an AF_INET route cannot be selected. Unsafe shim-argument probes must also fail
-with the dedicated rejection status. Any missing audit or failed invariant
-aborts startup and therefore activation; the nonce, launcher, and audit record
-are removed after the probe.
+with `--unshare-net` preserved for each, plus one helper-path rewrite on the real
+App Server command. The App Server command executes a temporary mode-`0500`
+launcher from the read-only uv toolchain root. Together the probes prove that
+root-owned alias dispatch succeeds, the Codex home is neither readable nor
+writable, SQLite is unreadable, the uv toolchain is executable but not writable,
+only the temporary leased worktree is writable, and an AF_INET route cannot be
+selected. Unsafe shim-argument probes
+must also fail with the dedicated rejection status. Any missing audit or failed
+invariant aborts startup and therefore activation; the nonce, launcher, and audit
+record are removed after the probe.
 
 ## Prerequisites
 

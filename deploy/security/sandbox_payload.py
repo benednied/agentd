@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import errno
 import os
+import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
+ARG0_ROOT = AUTH_FILE.parent / "tmp/arg0"
 STATE_DATABASE = Path("/home/bened/.local/state/agentd/state.sqlite")
 WORKSPACE_ROOT = Path("/home/bened/.local/share/agentd/workspaces")
 REPOSITORY_ROOT = Path("/home/bened/goldenage")
@@ -44,6 +47,35 @@ def _unexpectedly_writable(directory: Path) -> bool:
     return True
 
 
+def _exercise_patch_helper(worktree: Path, helper: str) -> bool:
+    executable = shutil.which(helper)
+    if executable is None:
+        print(f"sandbox cannot resolve {helper}", file=sys.stderr)
+        return False
+    relative = f".agentd-{helper}-probe-{os.getpid()}"
+    destination = worktree / relative
+    patch = f"*** Begin Patch\n*** Add File: {relative}\n+{helper}-ok\n*** End Patch"
+    result = subprocess.run(
+        [executable, patch],
+        cwd=worktree,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    try:
+        if result.returncode != 0 or destination.read_text() != f"{helper}-ok\n":
+            print(
+                f"sandbox {helper} probe failed ({result.returncode}): "
+                f"{result.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    finally:
+        destination.unlink(missing_ok=True)
+
+
 def main() -> int:
     worktree = Path(os.environ.get("AGENTD_SECURITY_WORKTREE", ""))
     try:
@@ -58,10 +90,18 @@ def main() -> int:
     if _is_readable(AUTH_FILE):
         print("sandbox opened the dedicated auth.json", file=sys.stderr)
         return 40
+    if _is_readable(ARG0_ROOT):
+        print("sandbox opened the Codex argv0 helper directory", file=sys.stderr)
+        return 47
     if _is_readable(STATE_DATABASE):
         print("sandbox opened the agentd state database", file=sys.stderr)
         return 41
-    for directory in (REPOSITORY_ROOT, WORKSPACE_ROOT, UV_CACHE_ROOT):
+    for directory in (
+        AUTH_FILE.parent,
+        REPOSITORY_ROOT,
+        WORKSPACE_ROOT,
+        UV_CACHE_ROOT,
+    ):
         if _unexpectedly_writable(directory):
             print(
                 f"sandbox wrote outside its leased worktree: {directory}",
@@ -83,6 +123,10 @@ def main() -> int:
     except OSError as exc:
         print(f"sandbox could not write its leased worktree: {exc}", file=sys.stderr)
         return 43
+
+    for helper in ("apply_patch", "applypatch"):
+        if not _exercise_patch_helper(worktree, helper):
+            return 46
 
     network_probe: socket.socket | None = None
     try:

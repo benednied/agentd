@@ -27,11 +27,17 @@
 #ifndef REJECTED_EXIT_STATUS
 #define REJECTED_EXIT_STATUS 64
 #endif
+#define CODEX_HOME_PREFIX "/home/bened/.local/share/agentd/codex-home/"
+#define CODEX_ARG0_PREFIX CODEX_HOME_PREFIX "tmp/arg0/codex-arg0"
+#define CODEX_BUNDLED_ELF \
+    "/opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
+#define CODEX_SANDBOX_ALIAS "/usr/libexec/agentd/codex-linux-sandbox"
 
 extern char **environ;
 
 struct inspection {
     int rewrite_index;
+    int helper_rewrite_index;
     bool device_seen;
     bool unshare_net_seen;
 };
@@ -149,16 +155,75 @@ static void require_operands(int argc, int index, int count) {
     }
 }
 
+static bool starts_with(const char *value, const char *prefix) {
+    return strncmp(value, prefix, strlen(prefix)) == 0;
+}
+
+static bool valid_codex_sandbox_helper(const char *path) {
+    if (!starts_with(path, CODEX_ARG0_PREFIX)) {
+        return false;
+    }
+    const char *suffix = path + strlen(CODEX_ARG0_PREFIX);
+    static const char helper_suffix[] = "/codex-linux-sandbox";
+    if (strlen(suffix) != 6U + sizeof(helper_suffix) - 1U) {
+        return false;
+    }
+    for (size_t index = 0; index < 6; index++) {
+        const char value = suffix[index];
+        if (
+            !((value >= '0' && value <= '9') ||
+              (value >= 'A' && value <= 'Z') ||
+              (value >= 'a' && value <= 'z'))
+        ) {
+            return false;
+        }
+    }
+    if (strcmp(suffix + 6, helper_suffix) != 0) {
+        return false;
+    }
+
+    struct stat metadata;
+    if (
+        lstat(path, &metadata) != 0 || !S_ISLNK(metadata.st_mode) ||
+        metadata.st_uid != geteuid() || metadata.st_gid != getegid()
+    ) {
+        return false;
+    }
+    char target[sizeof(CODEX_BUNDLED_ELF)];
+    const ssize_t length = readlink(path, target, sizeof(target));
+    return length == (ssize_t)(sizeof(CODEX_BUNDLED_ELF) - 1U) &&
+           memcmp(target, CODEX_BUNDLED_ELF, sizeof(CODEX_BUNDLED_ELF) - 1U) == 0;
+}
+
 static struct inspection inspect_arguments(int argc, char *const argv[]) {
     struct inspection result = {
         .rewrite_index = -1,
+        .helper_rewrite_index = -1,
         .device_seen = false,
         .unshare_net_seen = false,
     };
 
     for (int index = 1; index < argc;) {
         const char *argument = argv[index];
-        if (strcmp(argument, "--") == 0 || argument[0] != '-') {
+        if (strcmp(argument, "--") == 0) {
+            if (index + 1 < argc) {
+                const char *command = argv[index + 1];
+                if (starts_with(command, CODEX_HOME_PREFIX)) {
+                    if (!valid_codex_sandbox_helper(command)) {
+                        fail("unvalidated Codex-home command path rejected");
+                    }
+                    result.helper_rewrite_index = index + 1;
+                }
+            }
+            break;
+        }
+        if (argument[0] != '-') {
+            if (starts_with(argument, CODEX_HOME_PREFIX)) {
+                if (!valid_codex_sandbox_helper(argument)) {
+                    fail("unvalidated Codex-home command path rejected");
+                }
+                result.helper_rewrite_index = index;
+            }
             break;
         }
         if (argument[0] != '-' || argument[1] != '-') {
@@ -309,10 +374,11 @@ static void write_audit_record(
     const int length = snprintf(
         record,
         sizeof(record),
-        "v1 token=%s pid=%ld rewrite_dev=%d unshare_net=%d\n",
+        "v1 token=%s pid=%ld rewrite_dev=%d rewrite_helper=%d unshare_net=%d\n",
         token,
         (long)getpid(),
         inspection->rewrite_index >= 0 ? 1 : 0,
+        inspection->helper_rewrite_index >= 0 ? 1 : 0,
         inspection->unshare_net_seen ? 1 : 0
     );
     if (length < 0 || (size_t)length >= sizeof(record)) {
@@ -364,6 +430,10 @@ int main(int argc, char *argv[]) {
             rewritten[output++] = (char *)"/dev";
             rewritten[output++] = (char *)"/dev";
             index++;
+            continue;
+        }
+        if (index == inspection.helper_rewrite_index) {
+            rewritten[output++] = (char *)CODEX_SANDBOX_ALIAS;
             continue;
         }
         rewritten[output++] = argv[index];
