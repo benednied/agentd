@@ -87,6 +87,9 @@ class UnitWorkspaceManager:
     def current_commit(self, lease: WorkspaceLease) -> str:
         return lease.commit or "b" * 40
 
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        return self.current_commit(lease)
+
 
 @INVALID_CONSUMPTION
 def test_invalid_driver_result_cannot_persist_or_terminalize_run(

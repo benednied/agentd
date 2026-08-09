@@ -47,14 +47,13 @@ COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=codex-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --chmod=0755 deploy/container/bwrap /usr/local/libexec/agentd/bwrap
 COPY --chmod=0555 \
     deploy/security/runtime_sandbox_probe.py \
     deploy/security/sandbox_payload.py \
     /opt/agentd/security/
 COPY --chmod=0444 deploy/container/config.toml /opt/agentd/security/config.toml
 
-ENV PATH="/usr/local/libexec/agentd:/opt/agentd/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+ENV PATH="/opt/agentd/venv/bin:/usr/local/bin:/usr/bin:/bin" \
     HOME="/home/bened" \
     CODEX_HOME="/home/bened/.local/share/agentd/codex-home" \
     UV_CACHE_DIR="/home/bened/.cache/uv" \

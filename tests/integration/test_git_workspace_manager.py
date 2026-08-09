@@ -11,6 +11,7 @@ from agentd.domain.models import EffortEstimate, Job, QuotaBudget
 from agentd.workspaces import (
     GitWorkspaceManager,
     WorkspaceAllocationError,
+    WorkspaceCommitError,
     WorkspaceError,
     WorkspaceManager,
     WorkspaceReleaseError,
@@ -100,6 +101,73 @@ def test_release_records_commit_retains_branch_and_is_idempotent(
     assert manager.release(lease).commit == worker_commit
 
 
+def test_trusted_commit_captures_nonignored_changes_with_fixed_identity(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    (repository / "obsolete.txt").write_text("remove me\n")
+    _git(repository, "add", "obsolete.txt")
+    _git(repository, "commit", "-m", "add obsolete fixture")
+    main_commit = _git(repository, "rev-parse", "HEAD")
+    manager = GitWorkspaceManager(tmp_path / "worktrees")
+    lease = manager.allocate(_job(repository))
+    working_directory = Path(lease.working_directory)
+
+    (working_directory / "README.md").write_text("updated\n")
+    (working_directory / "obsolete.txt").unlink()
+    (working_directory / "result.txt").write_text("review me\n")
+    (working_directory / ".gitignore").write_text("ignored.log\n")
+    (working_directory / "ignored.log").write_text("do not commit\n")
+
+    # A repository-controlled hook must not execute in the trusted service path.
+    hook_sentinel = tmp_path / "hook-ran"
+    hook = repository / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {hook_sentinel}\nexit 91\n")
+    hook.chmod(0o755)
+
+    commit = manager.commit_changes(lease)
+
+    assert commit != main_commit
+    assert _git(working_directory, "show", "-s", "--format=%s", commit) == (
+        "agentd: capture review handoff"
+    )
+    assert _git(working_directory, "show", "-s", "--format=%an <%ae>", commit) == (
+        "agentd automation <agentd@localhost>"
+    )
+    assert _git(working_directory, "show", "-s", "--format=%cn <%ce>", commit) == (
+        "agentd automation <agentd@localhost>"
+    )
+    assert _git(working_directory, "status", "--short") == ""
+    assert "ignored.log" not in _git(working_directory, "ls-files").splitlines()
+    assert not hook_sentinel.exists()
+    assert _git(repository, "rev-parse", "HEAD") == main_commit
+
+    commit_count = _git(working_directory, "rev-list", "--count", "HEAD")
+    assert manager.commit_changes(lease) == commit
+    assert _git(working_directory, "rev-list", "--count", "HEAD") == commit_count
+
+
+def test_trusted_commit_validates_registration_before_staging(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    manager = GitWorkspaceManager(tmp_path / "worktrees")
+    lease = manager.allocate(_job(repository))
+    working_directory = Path(lease.working_directory)
+    (working_directory / "result.txt").write_text("must remain unstaged\n")
+    git_directory = Path(_git(working_directory, "rev-parse", "--git-dir"))
+    registration = git_directory / "gitdir"
+    original_registration = registration.read_text()
+    registration.write_text(str(tmp_path / "different-worktree" / ".git") + "\n")
+
+    try:
+        with pytest.raises(WorkspaceCommitError, match="registered Git worktree"):
+            manager.commit_changes(lease)
+    finally:
+        registration.write_text(original_registration)
+
+    assert _git(working_directory, "diff", "--cached", "--name-only") == ""
+    assert _git(working_directory, "status", "--short") == "?? result.txt"
+
+
 def test_job_names_cannot_escape_root_or_create_invalid_refs(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     worktree_root = tmp_path / "worktrees"
@@ -153,6 +221,8 @@ def test_forged_lease_identity_cannot_read_or_release_victim_worktree(
 
     with pytest.raises(WorkspaceError, match="does not belong"):
         manager.current_commit(forged)
+    with pytest.raises(WorkspaceCommitError, match="does not belong"):
+        manager.commit_changes(forged)
     with pytest.raises(WorkspaceReleaseError, match="does not belong"):
         manager.release(forged)
 

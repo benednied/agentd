@@ -67,6 +67,9 @@ class RegressionWorkspaceManager:
     def current_commit(self, lease: WorkspaceLease) -> str:
         return lease.commit or "f" * 40
 
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        return self.current_commit(lease)
+
     def is_available(self, lease: WorkspaceLease) -> bool:
         self.availability_checks.append(lease.id)
         return (

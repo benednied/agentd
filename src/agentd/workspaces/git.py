@@ -16,6 +16,7 @@ from agentd.domain.enums import WorkspaceState
 from agentd.domain.models import Job, WorkspaceLease
 from agentd.workspaces.base import (
     WorkspaceAllocationError,
+    WorkspaceCommitError,
     WorkspaceError,
     WorkspaceReleaseError,
 )
@@ -23,6 +24,9 @@ from agentd.workspaces.base import (
 _INVALID_BRANCH_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]+")
 _REPEATED_DOTS = re.compile(r"\.{2,}")
 _COMMIT_ID = re.compile(r"[0-9a-fA-F]{40,64}")
+_AUTOMATION_NAME = "agentd automation"
+_AUTOMATION_EMAIL = "agentd@localhost"
+_AUTOMATION_COMMIT_MESSAGE = "agentd: capture review handoff"
 
 
 class _GitCommandError(RuntimeError):
@@ -262,6 +266,110 @@ class GitWorkspaceManager:
                 f"Could not inspect workspace lease {lease.id}: {exc}"
             ) from exc
 
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        """Create an idempotent trusted commit for all nonignored lease changes.
+
+        The message and identity are deliberately fixed rather than derived from
+        model or job text. Repository hooks are disabled for this control-plane
+        operation so staging a handoff cannot invoke repository-provided code.
+        """
+
+        if lease.state is not WorkspaceState.LEASED:
+            raise WorkspaceCommitError(
+                f"Workspace lease {lease.id} is not available for a trusted commit"
+            )
+
+        try:
+            repository = self._repository_root(lease.repository)
+            working_directory = Path(lease.working_directory).resolve()
+            self._assert_within_root(working_directory)
+            self._assert_owned_branch(lease.branch)
+            self._assert_lease_identity(lease, working_directory)
+            if not working_directory.is_dir():
+                raise WorkspaceError(
+                    f"Leased worktree does not exist: {working_directory}"
+                )
+            self._assert_expected_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+            self._assert_registered_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+
+            self._run_git(working_directory, "add", "--all", "--", ".")
+
+            # Revalidate ownership after staging and before moving the ref. A
+            # failed attempt can be retried safely because the index is retained.
+            self._assert_expected_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+            self._assert_registered_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+            difference = self._run_git(
+                working_directory,
+                "diff",
+                "--cached",
+                "--quiet",
+                "--exit-code",
+                check=False,
+            )
+            if difference.returncode == 0:
+                return self._commit_at_path(working_directory)
+            if difference.returncode != 1:
+                detail = difference.stderr.strip() or difference.stdout.strip()
+                raise _GitCommandError(
+                    difference.args,
+                    difference.returncode,
+                    detail,
+                )
+
+            identity = {
+                "GIT_AUTHOR_NAME": _AUTOMATION_NAME,
+                "GIT_AUTHOR_EMAIL": _AUTOMATION_EMAIL,
+                "GIT_COMMITTER_NAME": _AUTOMATION_NAME,
+                "GIT_COMMITTER_EMAIL": _AUTOMATION_EMAIL,
+            }
+            self._run_git(
+                working_directory,
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                f"user.name={_AUTOMATION_NAME}",
+                "-c",
+                f"user.email={_AUTOMATION_EMAIL}",
+                "commit",
+                "--no-gpg-sign",
+                "--message",
+                _AUTOMATION_COMMIT_MESSAGE,
+                environment=identity,
+            )
+            self._assert_expected_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+            self._assert_registered_worktree(
+                repository,
+                working_directory,
+                lease.branch,
+            )
+            return self._commit_at_path(working_directory)
+        except (OSError, _GitCommandError, WorkspaceError) as exc:
+            if isinstance(exc, WorkspaceCommitError):
+                raise
+            raise WorkspaceCommitError(
+                f"Could not commit workspace lease {lease.id}: {exc}"
+            ) from exc
+
     def _repository_root(self, repository: str) -> Path:
         candidate = Path(repository).expanduser().resolve()
         result = self._run_git(candidate, "rev-parse", "--show-toplevel")
@@ -460,6 +568,7 @@ class GitWorkspaceManager:
         repository: Path,
         *arguments: str,
         check: bool = True,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = (
             self._git_executable,
@@ -467,15 +576,17 @@ class GitWorkspaceManager:
             str(repository),
             *arguments,
         )
-        environment = os.environ.copy()
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        process_environment = os.environ.copy()
+        process_environment["GIT_TERMINAL_PROMPT"] = "0"
+        if environment is not None:
+            process_environment.update(environment)
         try:
             result = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
-                env=environment,
+                env=process_environment,
                 timeout=self._command_timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:

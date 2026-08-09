@@ -14,18 +14,20 @@ from pathlib import Path
 from codex_cli_bin import bundled_codex_path
 from openai_codex import __version__ as installed_sdk_version
 from openai_codex.client import CodexClient, CodexConfig
-from openai_codex.generated.v2_all import CommandExecParams, CommandExecResponse
+from openai_codex.generated.v2_all import (
+    CommandExecResponse,
+    PermissionProfileListResponse,
+)
 
 EXPECTED_SDK_VERSION = "0.144.4"
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
 CONFIG_FILE = Path("/home/bened/.local/share/agentd/codex-home/config.toml")
 STATE_DATABASE = Path("/home/bened/.local/state/agentd/state.sqlite")
 WORKSPACE_ROOT = Path("/home/bened/.local/share/agentd/workspaces")
-WRAPPER = Path("/usr/local/libexec/agentd/bwrap")
+BWRAP = Path("/usr/bin/bwrap")
 PAYLOAD = Path("/opt/agentd/security/sandbox_payload.py")
 EXPECTED_CONFIG = Path("/opt/agentd/security/config.toml")
-AUDIT_NAME = ".agentd-bwrap-invoked"
-AUDIT_VALUE = "agentd-bwrap-wrapper-v1\n"
+PERMISSION_PROFILE = "agentd-workspace"
 
 
 def _require_runtime_layout() -> None:
@@ -34,7 +36,7 @@ def _require_runtime_layout() -> None:
         (CONFIG_FILE, "reviewed Codex config.toml"),
         (STATE_DATABASE, "agentd state database"),
         (WORKSPACE_ROOT, "workspace root"),
-        (WRAPPER, "agentd bwrap wrapper"),
+        (BWRAP, "bubblewrap"),
         (PAYLOAD, "sandbox probe payload"),
         (EXPECTED_CONFIG, "image-pinned Codex config.toml"),
     ):
@@ -56,7 +58,7 @@ def _require_runtime_layout() -> None:
         raise RuntimeError(
             "dedicated Codex config.toml differs from the image-pinned policy"
         )
-    for path in (WRAPPER, PAYLOAD, EXPECTED_CONFIG, Path("/usr/bin/bwrap")):
+    for path in (BWRAP, PAYLOAD, EXPECTED_CONFIG):
         metadata = path.stat()
         if metadata.st_uid != 0 or metadata.st_gid != 0:
             raise RuntimeError(f"image security artifact has unexpected owner: {path}")
@@ -65,10 +67,8 @@ def _require_runtime_layout() -> None:
                 f"image security artifact is group/world writable: {path}"
             )
     resolved_bwrap = shutil.which("bwrap")
-    if resolved_bwrap != str(WRAPPER):
-        raise RuntimeError(
-            f"bwrap resolves to {resolved_bwrap!r}, expected hardened wrapper {WRAPPER}"
-        )
+    if resolved_bwrap != str(BWRAP):
+        raise RuntimeError(f"bwrap resolves to {resolved_bwrap!r}, expected {BWRAP}")
     if installed_sdk_version != EXPECTED_SDK_VERSION:
         raise RuntimeError(
             f"openai-codex {installed_sdk_version!r} does not match "
@@ -76,39 +76,25 @@ def _require_runtime_layout() -> None:
         )
 
 
-def _probe_environment(worktree: Path, audit_file: Path) -> dict[str, str]:
+def _probe_environment(worktree: Path) -> dict[str, str]:
     return {
         "AGENTD_SECURITY_WORKTREE": str(worktree),
-        "AGENTD_BWRAP_AUDIT_FILE": str(audit_file),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
-def _prepare_audit_file(audit_file: Path) -> None:
-    audit_file.unlink(missing_ok=True)
-
-
-def _require_wrapper_audit(audit_file: Path, phase: str) -> None:
-    try:
-        contents = audit_file.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"{phase} bypassed the agentd bwrap wrapper") from exc
-    if contents != AUDIT_VALUE:
-        raise RuntimeError(f"{phase} produced an invalid bwrap wrapper audit marker")
-
-
-def _run_direct_bwrap_probe(worktree: Path, audit_file: Path) -> None:
-    _prepare_audit_file(audit_file)
+def _run_direct_bwrap_probe(worktree: Path) -> None:
     environment = os.environ.copy()
-    environment.update(_probe_environment(worktree, audit_file))
+    environment.update(_probe_environment(worktree))
     result = subprocess.run(
         [
-            str(WRAPPER),
+            str(BWRAP),
             "--die-with-parent",
             "--new-session",
             "--unshare-user",
             "--unshare-pid",
             "--unshare-ipc",
+            "--unshare-net",
             "--ro-bind",
             "/",
             "/",
@@ -118,6 +104,10 @@ def _run_direct_bwrap_probe(worktree: Path, audit_file: Path) -> None:
             "--ro-bind",
             "/proc",
             "/proc",
+            "--tmpfs",
+            str(AUTH_FILE.parent),
+            "--tmpfs",
+            str(STATE_DATABASE.parent),
             "--bind",
             str(worktree),
             str(worktree),
@@ -138,11 +128,9 @@ def _run_direct_bwrap_probe(worktree: Path, audit_file: Path) -> None:
             "direct nested bwrap security probe failed "
             f"({result.returncode}): {result.stderr.strip()}"
         )
-    _require_wrapper_audit(audit_file, "direct nested bwrap")
 
 
-def _run_codex_generated_command_probe(worktree: Path, audit_file: Path) -> None:
-    _prepare_audit_file(audit_file)
+def _run_codex_generated_command_probe(worktree: Path) -> None:
     runtime = bundled_codex_path()
     if not runtime.is_file():
         raise RuntimeError(f"pinned Codex runtime is missing: {runtime}")
@@ -152,32 +140,39 @@ def _run_codex_generated_command_probe(worktree: Path, audit_file: Path) -> None
             f"pinned Codex runtime is not root-owned/immutable: {runtime}"
         )
     environment = os.environ.copy()
-    environment.update(_probe_environment(worktree, audit_file))
+    environment.update(_probe_environment(worktree))
+    workspace_payload = worktree / ".agentd-security-payload.py"
+    shutil.copyfile(PAYLOAD, workspace_payload)
+    workspace_payload.chmod(0o500)
     config = CodexConfig(
+        cwd=str(worktree),
         env=environment,
         client_name="agentd_security_preflight",
         client_title="agentd security preflight",
         experimental_api=True,
     )
-    params = CommandExecParams.model_validate(
-        {
-            "command": [sys.executable, str(PAYLOAD)],
-            "cwd": str(worktree),
-            "env": _probe_environment(worktree, audit_file),
-            "timeoutMs": 30_000,
-            "outputBytesCap": 16_384,
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [str(worktree)],
-                "networkAccess": False,
-                "excludeSlashTmp": True,
-                "excludeTmpdirEnvVar": True,
-            },
-        }
-    )
-    payload = params.model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload = {
+        "command": [sys.executable, str(workspace_payload)],
+        "cwd": str(worktree),
+        "env": _probe_environment(worktree),
+        "timeoutMs": 30_000,
+        "outputBytesCap": 16_384,
+        "permissionProfile": PERMISSION_PROFILE,
+    }
     with CodexClient(config) as client:
         client.initialize()
+        profiles = client.request(
+            "permissionProfile/list",
+            {"cwd": str(worktree)},
+            response_model=PermissionProfileListResponse,
+        )
+        if not any(
+            profile.id == PERMISSION_PROFILE and profile.allowed
+            for profile in profiles.data
+        ):
+            raise RuntimeError(
+                f"required permission profile is unavailable: {PERMISSION_PROFILE}"
+            )
         result = client.request(
             "command/exec",
             payload,
@@ -188,19 +183,17 @@ def _run_codex_generated_command_probe(worktree: Path, audit_file: Path) -> None
             "pinned Codex generated-command sandbox probe failed "
             f"({result.exit_code}): {result.stderr.strip()}"
         )
-    _require_wrapper_audit(audit_file, "pinned Codex generated command")
 
 
 def main() -> int:
     _require_runtime_layout()
     worktree = Path(tempfile.mkdtemp(prefix=".security-lease.", dir=WORKSPACE_ROOT))
-    audit_file = worktree / AUDIT_NAME
     try:
-        _run_direct_bwrap_probe(worktree, audit_file)
-        _run_codex_generated_command_probe(worktree, audit_file)
+        _run_direct_bwrap_probe(worktree)
+        _run_codex_generated_command_probe(worktree)
     finally:
         shutil.rmtree(worktree)
-    print("nested bwrap and pinned Codex sandbox invariants passed")
+    print("nested bwrap and pinned Codex permission-profile invariants passed")
     return 0
 
 

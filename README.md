@@ -264,8 +264,11 @@ safe local demonstrations.
 The SDK driver is fixed to `gpt-5.6-terra` with reasoning effort `medium`. It starts
 or resumes a durable thread, streams turn and token-usage notifications, requires a
 strict structured review result, and sends steer, checkpoint, suspend, interrupt,
-and cancel commands through App Server. Only the leased worktree is writable;
-network access is disabled and additional toolchain roots are requested read-only.
+and cancel commands through App Server. A named permission profile makes only the
+leased runtime workspace root writable, exposes reviewed toolchain paths read-only,
+explicitly denies the Codex-home and agentd-state roots, and disables command
+network access. The workspace-pool parent is denied; only the more-specific
+runtime lease is reopened for writes.
 The worker receives the bounded `ExecutionContract`, never account percentages,
 quota scarcity, node details, or policy thresholds.
 
@@ -326,10 +329,11 @@ merges a worker branch into the integration branch.
 - Startup recovery is specific to the managed SDK driver and resumes a durable
   thread with a new App Server process and turn; it cannot reattach the previous
   stdio transport. The legacy CLI adapter remains process-local.
-- The pinned SDK's generated schema does not retain the newer restricted-read
-  sandbox field. The reviewed Linux deployment therefore fails closed unless its
-  outer Bubblewrap wrapper and runtime canary prove auth/state unreadable,
-  worktree-only writes, and no model-command network route.
+- The Python package's generated request models omit experimental permission
+  fields, so the adapter uses raw App Server dictionaries from the pinned runtime
+  schema. The Linux deployment fails closed unless its permission-profile canary
+  proves auth/state unreadable, worktree-only writes, and no model-command network
+  route.
 - Dependency and gang readiness are implemented, but gang launch is not atomic and
   there is no persisted barrier aggregate.
 - Tail-governor decisions and explicit reset events still require a caller. Codex
@@ -341,9 +345,10 @@ merges a worker branch into the integration branch.
   and acceptance require an operator or external caller.
 - Invalid terminal telemetry deliberately leaves a job in `METERING_PENDING`; the
   MVP has no automated provider-side reconciliation for that state.
-- Commit handoff uses `RunResult.commit` or falls back to the workspace's current
-  `HEAD`. That fallback does not prove the worker created a new commit or that an
-  integrator accepted it.
+- A valid managed Codex completion gets an automation-authored trusted handoff
+  commit before `REVIEW`; other paths may still fall back to the workspace's
+  current `HEAD`. A handoff commit records the artifact but does not mean an
+  operator accepted or integrated it.
 
 ## Package map
 

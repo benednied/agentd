@@ -47,23 +47,22 @@ arguments are behind a pointer, so it is the one explicit modern-kernel namespac
 compatibility exception. Capability dropping and `no-new-privileges` remain in
 force inside and outside a nested namespace.
 
-The pinned `openai-codex==0.144.4` generated App Server schema does not retain
-the newer restricted-read policy field. A same-UID model command must therefore
-not rely on read-only outer mounts: those mounts would still allow it to read
-`auth.json` and the SQLite database. The image puts a root-owned wrapper ahead
-of Bubblewrap on `PATH`. Every nested sandbox invocation is delegated to
-`/usr/bin/bwrap` only after the wrapper injects `--unshare-net` and final
-`--tmpfs` masks over the exact dedicated Codex home and agentd state directory.
-It rejects `--share-net` and invocations without an explicit command separator.
+The pinned `openai-codex==0.144.4` runtime supports named permission profiles on
+its experimental App Server wire protocol. The dedicated config selects the
+`agentd-workspace` profile: platform/toolchain paths are read-only, the dynamic
+runtime workspace root is writable, the exact Codex home and agentd state roots
+are denied, the workspace-pool parent is denied, and command network access is
+disabled. A more-specific runtime-root rule reopens only the current lease.
+Thread start, resume, and turn requests select that profile and supply the
+leased worktree as their sole `runtimeWorkspaceRoots` entry.
 
-This wrapper is a fail-closed compatibility boundary, not an assertion that the
-SDK policy is sufficient. Service startup executes both a direct nested
-Bubblewrap probe and a command through the exact SDK-bundled Codex App Server.
-Both probes must prove all of the following: the wrapper was invoked,
-`auth.json` is unreadable, the SQLite database is unreadable, the temporary
-leased worktree is writable, and an AF_INET route cannot be selected. Any
-failure, including Codex bypassing the wrapper, aborts startup and therefore the
-deployment.
+App Server owns and invokes its Linux sandbox directly; it does not rely on a
+PATH-interposed Bubblewrap wrapper. Service startup executes both a direct
+nested Bubblewrap probe and a standalone command through the exact SDK-bundled
+App Server with `permissionProfile=agentd-workspace`. Together they prove that
+`auth.json` and SQLite are unreadable, only the temporary leased worktree is
+writable, and an AF_INET route cannot be selected. Any failure aborts startup
+and therefore activation.
 
 ## Prerequisites
 
@@ -215,7 +214,7 @@ the pinned local Codex App Server binary but starts no model turn, sends no prom
 and calls no LLM API. It verifies UID/GID, zero effective capabilities,
 `NoNewPrivs`, read-only root, absence of Docker sockets and a broad home mount,
 and successful unprivileged user-namespace creation. It then runs the direct and
-Codex-generated-command sandbox probes described above. The network assertion is
+App-Server-generated-command sandbox probes described above. The network assertion is
 a UDP route selection to the documentation-only `192.0.2.1` address and sends no
 packet:
 
@@ -226,6 +225,6 @@ packet:
 
 The user systemd unit runs this check as a mandatory `ExecStartPre`; it is not an
 optional warning in normal deployment. A missing auth/config/state file, wrong
-ownership or mode, unavailable nested user namespace, wrapper bypass, readable
+ownership or mode, unavailable named profile or nested user namespace, readable
 sensitive file, unwritable lease, or available network route prevents the
 container service from starting.

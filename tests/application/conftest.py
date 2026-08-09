@@ -67,6 +67,9 @@ class FakeWorkspaceManager:
     def current_commit(self, lease: WorkspaceLease) -> str:
         return lease.commit or "f" * 40
 
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        return self.current_commit(lease)
+
 
 @dataclass(slots=True)
 class ApplicationRig:

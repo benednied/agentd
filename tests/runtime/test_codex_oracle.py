@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -46,8 +46,6 @@ class ScriptedAccountClient:
         model: str,
         effort: str,
         output_schema: Mapping[str, JsonValue],
-        writable_roots: Sequence[str],
-        readable_roots: Sequence[str],
     ) -> str:
         raise AssertionError("oracle must not start a turn")
 

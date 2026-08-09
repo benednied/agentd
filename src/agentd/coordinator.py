@@ -1237,6 +1237,13 @@ class SchedulerCoordinator:
             )
             return self._store.get_job(job.id)
 
+        if result.outcome is RunOutcome.COMPLETED:
+            result = self._trusted_workspace_commit_result(run, result)
+            run = replace(run, result=result)
+            # The Git ref is an external effect. Persist its trusted value while
+            # terminal reconciliation remains retryable, before entering REVIEW.
+            self._store.save_run(run)
+
         reservation = self._store.get_reservation(run.reservation_id)
         self._quota.release(
             reservation.id,
@@ -1355,6 +1362,17 @@ class SchedulerCoordinator:
                 "untrusted_reported_commit": result.commit,
             },
         )
+
+    def _trusted_workspace_commit_result(
+        self,
+        run: RunRecord,
+        result: RunResult,
+    ) -> RunResult:
+        workspace = self._store.get_workspace(run.workspace_id)
+        commit = self._workspaces.commit_changes(workspace)
+        if workspace.commit != commit:
+            self._store.save_workspace(replace(workspace, commit=commit))
+        return replace(result, commit=commit)
 
     @staticmethod
     def _capsule_from_result(result: RunResult) -> ResumeCapsule:

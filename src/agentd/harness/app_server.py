@@ -7,7 +7,7 @@ fully scriptable without starting Codex or making network calls.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Protocol, cast, runtime_checkable
@@ -22,6 +22,7 @@ from agentd.domain.models import JsonValue
 PINNED_OPENAI_CODEX_VERSION = "0.144.4"
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_PERMISSION_PROFILE = "agentd-workspace"
 TERMINAL_EVENT_METHODS = frozenset({"turn/completed", "turn/failed", "error"})
 
 
@@ -80,8 +81,6 @@ class AppServerClient(Protocol):
         model: str,
         effort: str,
         output_schema: Mapping[str, JsonValue],
-        writable_roots: Sequence[str],
-        readable_roots: Sequence[str],
     ) -> str: ...
 
     def events(self, turn_id: str) -> AsyncIterator[AppServerEvent]: ...
@@ -101,6 +100,7 @@ class OpenAICodexClient:
         *,
         environment: Mapping[str, str] | None = None,
         codex_bin: str | None = None,
+        cwd: str | None = None,
     ) -> None:
         if installed_sdk_version != PINNED_OPENAI_CODEX_VERSION:
             raise RuntimeError(
@@ -110,10 +110,11 @@ class OpenAICodexClient:
         self._client = AsyncCodexClient(
             CodexConfig(
                 codex_bin=codex_bin,
+                cwd=cwd,
                 env=dict(environment or {}),
                 client_name="agentd",
                 client_title="agentd control plane",
-                experimental_api=False,
+                experimental_api=True,
             )
         )
         self._metadata: AppServerMetadata | None = None
@@ -163,7 +164,9 @@ class OpenAICodexClient:
                 "cwd": cwd,
                 "ephemeral": False,
                 "model": model,
-                "sandbox": "workspace-write",
+                "permissions": DEFAULT_PERMISSION_PROFILE,
+                "runtimeWorkspaceRoots": [cwd],
+                "serviceName": "agentd",
             }
         )
         return response.thread.id
@@ -181,7 +184,8 @@ class OpenAICodexClient:
                 "approvalPolicy": "never",
                 "cwd": cwd,
                 "model": model,
-                "sandbox": "workspace-write",
+                "permissions": DEFAULT_PERMISSION_PROFILE,
+                "runtimeWorkspaceRoots": [cwd],
             },
         )
         return response.thread.id
@@ -195,8 +199,6 @@ class OpenAICodexClient:
         model: str,
         effort: str,
         output_schema: Mapping[str, JsonValue],
-        writable_roots: Sequence[str],
-        readable_roots: Sequence[str],
     ) -> str:
         response = await self._client.turn_start(
             thread_id,
@@ -207,18 +209,8 @@ class OpenAICodexClient:
                 "effort": effort,
                 "model": model,
                 "outputSchema": dict(output_schema),
-                "sandboxPolicy": {
-                    "type": "workspaceWrite",
-                    "writableRoots": list(writable_roots),
-                    "networkAccess": False,
-                    "excludeSlashTmp": True,
-                    "excludeTmpdirEnvVar": True,
-                    "readOnlyAccess": {
-                        "type": "restricted",
-                        "includePlatformDefaults": True,
-                        "readableRoots": list(readable_roots),
-                    },
-                },
+                "permissions": DEFAULT_PERMISSION_PROFILE,
+                "runtimeWorkspaceRoots": [cwd],
             },
         )
         return response.turn.id

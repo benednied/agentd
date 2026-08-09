@@ -266,6 +266,9 @@ class SelectivelyFailingWorkspaceManager:
     def current_commit(self, _lease: WorkspaceLease) -> str:
         return "f" * 40
 
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        return self.current_commit(lease)
+
 
 def test_driver_start_failure_compensates_admission_effects(
     make_application_rig,

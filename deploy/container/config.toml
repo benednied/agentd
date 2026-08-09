@@ -2,12 +2,28 @@
 # The runtime preflight verifies the effective sandbox instead of trusting this
 # file alone.
 approval_policy = "never"
-sandbox_mode = "workspace-write"
+default_permissions = "agentd-workspace"
 
-[sandbox_workspace_write]
-network_access = false
-exclude_tmpdir_env_var = true
-exclude_slash_tmp = true
+[permissions.agentd-workspace]
+description = "Agentd leased workspace only"
+
+[permissions.agentd-workspace.filesystem]
+":minimal" = "read"
+"/opt/agentd/venv" = "read"
+"/usr/local/bin" = "read"
+"/usr/bin" = "read"
+"/bin" = "read"
+"/usr/lib" = "read"
+"/lib" = "read"
+"/home/bened/.local/share/agentd/codex-home" = "deny"
+"/home/bened/.local/state/agentd" = "deny"
+"/home/bened/.local/share/agentd/workspaces" = "deny"
+
+[permissions.agentd-workspace.filesystem.":workspace_roots"]
+"." = "write"
+
+[permissions.agentd-workspace.network]
+enabled = false
 
 [analytics]
 enabled = false

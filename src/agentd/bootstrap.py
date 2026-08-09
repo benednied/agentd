@@ -94,22 +94,17 @@ def create_local_runtime(
     if include_codex_driver:
         codex_environment = {"CODEX_HOME": str(effective_config.codex_home)}
 
-        def client_factory(_execution: ExecutionContract) -> OpenAICodexClient:
-            return OpenAICodexClient(environment=codex_environment)
+        def client_factory(execution: ExecutionContract) -> OpenAICodexClient:
+            return OpenAICodexClient(
+                environment=codex_environment,
+                cwd=execution.working_directory,
+            )
 
         supervisor = RunSupervisor(
             store,
             client_factory=client_factory,
             model=effective_config.model,
             effort=effective_config.reasoning_effort,
-            toolchain_read_roots=(
-                "/opt/agentd/venv",
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-                "/usr/lib",
-                "/lib",
-            ),
         )
         drivers.register(CodexSdkDriver(supervisor))
         account_oracle = CodexAccountOracle(

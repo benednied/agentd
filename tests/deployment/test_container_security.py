@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import copy
 import json
-import runpy
 import subprocess
 import sys
 import tomllib
-from collections.abc import Callable
 from pathlib import Path
-from typing import cast
-
-import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 DEPLOY = REPOSITORY / "deploy"
@@ -255,8 +250,8 @@ def test_dockerfile_keeps_runtime_tools_and_never_embeds_credentials() -> None:
     assert "COPY --from=uv-runtime /uv /usr/local/bin/uv" in dockerfile
     assert "COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv" in dockerfile
     assert 'UV_CACHE_DIR="/home/bened/.cache/uv"' in dockerfile
-    assert 'PATH="/usr/local/libexec/agentd:' in dockerfile
-    assert "deploy/container/bwrap /usr/local/libexec/agentd/bwrap" in dockerfile
+    assert 'PATH="/opt/agentd/venv/bin:' in dockerfile
+    assert "deploy/container/bwrap" not in dockerfile
     assert "runtime_sandbox_probe.py" in dockerfile
     assert "sandbox_payload.py" in dockerfile
     assert "auth.json" not in dockerfile
@@ -347,53 +342,33 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
     dockerfile = (REPOSITORY / "Dockerfile").read_text(encoding="utf-8")
 
     assert config["approval_policy"] == "never"
-    assert config["sandbox_mode"] == "workspace-write"
-    assert config["sandbox_workspace_write"] == {
-        "network_access": False,
-        "exclude_tmpdir_env_var": True,
-        "exclude_slash_tmp": True,
-    }
+    assert config["default_permissions"] == "agentd-workspace"
+    assert "sandbox_mode" not in config
+    assert "sandbox_workspace_write" not in config
+    profile = config["permissions"]["agentd-workspace"]
+    assert profile["description"] == "Agentd leased workspace only"
+    filesystem = profile["filesystem"]
+    assert filesystem[":minimal"] == "read"
+    assert filesystem[":workspace_roots"] == {".": "write"}
+    for root in (
+        "/opt/agentd/venv",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/lib",
+        "/lib",
+    ):
+        assert filesystem[root] == "read"
+    assert filesystem["/home/bened/.local/share/agentd/codex-home"] == "deny"
+    assert filesystem["/home/bened/.local/state/agentd"] == "deny"
+    assert filesystem["/home/bened/.local/share/agentd/workspaces"] == "deny"
+    assert profile["network"] == {"enabled": False}
     assert config["analytics"] == {"enabled": False}
     assert "auth" not in config_path.read_text(encoding="utf-8").lower()
     assert "../container/config.toml" in provision
     assert 'install -o 1000 -g 1000 -m 0600 "$config_source"' in provision
     assert 'chmod 0600 "$AGENTD_CODEX_HOME/config.toml"' in provision
     assert "deploy/container/config.toml /opt/agentd/security/config.toml" in dockerfile
-
-
-def test_bwrap_wrapper_masks_sensitive_roots_and_forces_network_namespace() -> None:
-    wrapper_path = DEPLOY / "container" / "bwrap"
-    wrapper = wrapper_path.read_text(encoding="utf-8")
-
-    assert 'REAL_BWRAP = "/usr/bin/bwrap"' in wrapper
-    assert 'CODEX_HOME = "/home/bened/.local/share/agentd/codex-home"' in wrapper
-    assert 'STATE_HOME = "/home/bened/.local/state/agentd"' in wrapper
-    assert '"--unshare-net"' in wrapper
-    assert wrapper.count('"--tmpfs"') == 2
-    assert 'arguments.index("--")' in wrapper
-    assert "*arguments[:command_separator]" in wrapper
-    assert "*arguments[command_separator:]" in wrapper
-    assert 'if "--share-net" in arguments[:command_separator]' in wrapper
-    assert "os.execv(" in wrapper and "REAL_BWRAP" in wrapper
-    assert "AGENTD_BWRAP_AUDIT_FILE" in wrapper
-
-    wrapped_argv = cast(
-        Callable[[list[str]], list[str]],
-        runpy.run_path(str(wrapper_path))["_wrapped_argv"],
-    )
-    generated = wrapped_argv(["--ro-bind", "/", "/", "--", "/bin/true"])
-    separator = generated.index("--")
-    assert generated[0] == "/usr/bin/bwrap"
-    assert generated[separator - 5 : separator] == [
-        "--unshare-net",
-        "--tmpfs",
-        "/home/bened/.local/share/agentd/codex-home",
-        "--tmpfs",
-        "/home/bened/.local/state/agentd",
-    ]
-    assert generated[separator:] == ["--", "/bin/true"]
-    with pytest.raises(SystemExit, match="refuses --share-net"):
-        wrapped_argv(["--share-net", "--", "/bin/true"])
 
 
 def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None:
@@ -405,15 +380,20 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert 'EXPECTED_SDK_VERSION = "0.144.4"' in preflight
     assert "bundled_codex_path" in preflight
     assert "launch_args_override" not in preflight
-    assert "CommandExecParams" in preflight
+    assert "CommandExecParams" not in preflight
+    assert "PermissionProfileListResponse" in preflight
+    assert "cwd=str(worktree)" in preflight
+    assert '"permissionProfile/list"' in preflight
     assert '"command/exec"' in preflight
-    assert '"type": "workspaceWrite"' in preflight
-    assert '"writableRoots": [str(worktree)]' in preflight
-    assert '"networkAccess": False' in preflight
-    assert "_run_direct_bwrap_probe(worktree, audit_file)" in preflight
+    assert '"permissionProfile": PERMISSION_PROFILE' in preflight
+    assert '"sandboxPolicy"' not in preflight
+    assert "_run_direct_bwrap_probe(worktree)" in preflight
+    assert '"--unshare-net"' in preflight
+    assert preflight.count('"--tmpfs"') == 2
     assert '"--dev-bind"' in preflight
-    assert "_run_codex_generated_command_probe(worktree, audit_file)" in preflight
-    assert "_require_wrapper_audit" in preflight
+    assert "_run_codex_generated_command_probe(worktree)" in preflight
+    assert "_require_wrapper_audit" not in preflight
+    assert "shutil.copyfile(PAYLOAD, workspace_payload)" in preflight
     assert "result.exit_code != 0" in preflight
     assert "/home/bened/.local/share/agentd/codex-home/auth.json" in payload
     assert "/home/bened/.local/state/agentd/state.sqlite" in payload

@@ -23,6 +23,10 @@ class WorkspaceReleaseError(WorkspaceError):
     """Raised when a workspace lease cannot be released safely."""
 
 
+class WorkspaceCommitError(WorkspaceError):
+    """Raised when a trusted workspace handoff cannot be committed safely."""
+
+
 @runtime_checkable
 class WorkspaceManager(Protocol):
     """Allocate exclusive workspaces for write-capable jobs."""
@@ -41,4 +45,8 @@ class WorkspaceManager(Protocol):
 
     def current_commit(self, lease: WorkspaceLease) -> str:
         """Return the commit currently associated with ``lease``."""
+        ...
+
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        """Commit all nonignored lease changes using the automation identity."""
         ...

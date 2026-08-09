@@ -234,10 +234,14 @@ release unsafe, the persisted lease becomes `RETAINED` for inspection instead of
 destroying the output. Agentd never merges a worker branch.
 
 New work starts from the latest resume-capsule commit, otherwise the most recent
-dependency result commit, otherwise `HEAD`. On checkpoint, review and completion,
-the coordinator fills an omitted result commit from the workspace's current
-`HEAD`. This creates a stable handoff reference, but it does not prove that the
-worker made a new commit or that review/integration accepted it.
+dependency result commit, otherwise `HEAD`. After a managed Codex turn completes
+with valid telemetry, the trusted control plane stages all nonignored lease
+changes and creates an idempotent review-handoff commit as
+`agentd automation <agentd@localhost>`. Repository hooks and signing are disabled
+for this service operation, and ownership is revalidated before and after staging.
+The job then enters `REVIEW`; the commit records the artifact but does not imply
+review or integration acceptance. Other lifecycle paths still fill an omitted
+result commit from the workspace's current `HEAD`.
 
 ## Interfaces and execution adapters
 
@@ -268,15 +272,19 @@ are fixed to `gpt-5.6-terra` with effort `medium`. The adapter starts/resumes
 threads, streams turn/token notifications, uses a strict structured review-result
 schema, and supports steering, safe-boundary checkpoint/suspend commands,
 interrupts, idempotent collection, and same-thread continuation. Its sandbox
-request makes only the lease writable, disables network access, and explicitly
-restricts read-only roots to the worktree and configured toolchain paths.
+selects the named `agentd-workspace` permission profile and supplies the validated
+lease as its sole dynamic runtime workspace root. The profile exposes only minimal
+platform and reviewed toolchain paths for reading, explicitly denies Codex account
+state, agentd SQLite state, and the workspace-pool parent, then reopens only the
+more-specific runtime lease for writes and disables command network access.
 
-The pinned generated schema does not retain the newer `readOnlyAccess` field. The
-driver keeps the raw field and fails closed if App Server rejects it; the reviewed
-Linux deployment additionally requires an outer Bubblewrap boundary and a startup
-canary proving account/state unreadable, worktree writes available, and model
-network unavailable. An outer same-UID container mount alone is not treated as
-sufficient isolation.
+The Python package's generated request models omit the experimental profile
+fields even though the pinned runtime schema supports them. The adapter therefore
+uses raw dictionaries for `permissions` and `runtimeWorkspaceRoots`; it never
+combines them with legacy `sandbox` or `sandboxPolicy` fields. The reviewed Linux
+deployment requires a direct App Server permission-profile startup canary proving
+account/state unreadable, worktree writes available, and model network unavailable.
+An outer same-UID container mount alone is not treated as sufficient isolation.
 
 The optional `codex-cli` capability is `CodexCliDriver`. It launches a local,
 shell-free `codex exec --json` process and retains the previous process-group

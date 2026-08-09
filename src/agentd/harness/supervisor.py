@@ -27,6 +27,7 @@ from agentd.domain.models import (
 )
 from agentd.harness.app_server import (
     DEFAULT_CODEX_MODEL,
+    DEFAULT_PERMISSION_PROFILE,
     DEFAULT_REASONING_EFFORT,
     TERMINAL_EVENT_METHODS,
     AppServerClient,
@@ -146,7 +147,6 @@ class RunSupervisor:
         model: str = DEFAULT_CODEX_MODEL,
         effort: str = DEFAULT_REASONING_EFFORT,
         output_schema: Mapping[str, JsonValue] = CODEX_RESULT_SCHEMA,
-        toolchain_read_roots: Sequence[str] = (),
     ) -> None:
         if model != DEFAULT_CODEX_MODEL:
             raise ValueError(
@@ -162,7 +162,6 @@ class RunSupervisor:
         self._model = model
         self._effort = effort
         self._output_schema = dict(output_schema)
-        self._toolchain_read_roots = _validate_toolchain_roots(toolchain_read_roots)
         self._live: dict[str, _LiveRun] = {}
         self._closed = False
 
@@ -513,7 +512,6 @@ class RunSupervisor:
         prompt: str,
         workspace: Path,
     ) -> str:
-        readable = (str(workspace), *self._toolchain_read_roots)
         return await client.start_turn(
             thread_id,
             prompt,
@@ -521,8 +519,6 @@ class RunSupervisor:
             model=self._model,
             effort=self._effort,
             output_schema=self._output_schema,
-            writable_roots=(str(workspace),),
-            readable_roots=readable,
         )
 
     def _activate(
@@ -979,22 +975,6 @@ def _validate_execution_scope(execution: ExecutionContract) -> Path:
     return workspace
 
 
-def _validate_toolchain_roots(roots: Sequence[str]) -> tuple[str, ...]:
-    codex_state = (Path.home() / ".codex").resolve()
-    validated: list[str] = []
-    for raw_root in roots:
-        root = Path(raw_root).expanduser()
-        if not root.is_absolute():
-            raise ValueError("Toolchain read roots must be absolute")
-        resolved = root.resolve()
-        if _paths_overlap(resolved, codex_state):
-            raise ValueError("Toolchain read roots cannot expose Codex account state")
-        text = str(resolved)
-        if text not in validated:
-            validated.append(text)
-    return tuple(validated)
-
-
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
@@ -1012,7 +992,7 @@ def _session_metadata(
         "platform_os": metadata.platform_os,
         "model": DEFAULT_CODEX_MODEL,
         "effort": DEFAULT_REASONING_EFFORT,
-        "sandbox": "restricted-workspace-write",
+        "sandbox": f"permission-profile:{DEFAULT_PERMISSION_PROFILE}",
         "recovered": recovered,
     }
 

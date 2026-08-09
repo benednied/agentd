@@ -104,6 +104,7 @@ class ScriptedManagedDriver(FakeHarnessDriver):
 class RetainingWorkspaceManager:
     leases: dict[str, WorkspaceLease] = field(default_factory=dict)
     releases: list[str] = field(default_factory=list)
+    commits: list[str] = field(default_factory=list)
 
     def allocate(self, job: Job, base_ref: str = "HEAD") -> WorkspaceLease:
         lease = WorkspaceLease(
@@ -134,6 +135,12 @@ class RetainingWorkspaceManager:
 
     def current_commit(self, lease: WorkspaceLease) -> str:
         return lease.commit or "f" * 40
+
+    def commit_changes(self, lease: WorkspaceLease) -> str:
+        self.commits.append(lease.id)
+        commit = "e" * 40
+        self.leases[lease.id] = replace(lease, commit=commit)
+        return commit
 
 
 @dataclass(slots=True)
@@ -296,6 +303,10 @@ def test_terminal_observation_enters_review_and_releases_execution_capacity(
     assert rig.store.get_reservation(run.reservation_id).consumed == 10_000
     workspace = rig.store.get_workspace(run.workspace_id)
     assert workspace.state is WorkspaceState.LEASED
+    assert workspace.commit == "e" * 40
+    assert rig.store.get_run(run.id).result is not None
+    assert rig.store.get_run(run.id).result.commit == "e" * 40
+    assert rig.workspaces.commits == [workspace.id]
     assert rig.workspaces.releases == []
 
 
@@ -321,6 +332,7 @@ def test_invalid_terminal_telemetry_holds_quota_in_metering_pending(
     assert reservation.state is ReservationState.METERING_PENDING
     assert rig.store.get_quota_pool("default").reserved == reservation.outstanding
     assert rig.store.get_workspace(run.workspace_id).state is WorkspaceState.LEASED
+    assert rig.workspaces.commits == []
 
 
 def test_review_repair_request_starts_same_thread_with_fresh_capacity(

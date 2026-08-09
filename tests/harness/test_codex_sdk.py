@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -126,8 +126,6 @@ class TurnCall:
     model: str
     effort: str
     output_schema: Mapping[str, JsonValue]
-    writable_roots: tuple[str, ...]
-    readable_roots: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -176,8 +174,6 @@ class ScriptedAppServerClient:
         model: str,
         effort: str,
         output_schema: Mapping[str, JsonValue],
-        writable_roots: Sequence[str],
-        readable_roots: Sequence[str],
     ) -> str:
         self.turn_calls.append(
             TurnCall(
@@ -187,8 +183,6 @@ class ScriptedAppServerClient:
                 model=model,
                 effort=effort,
                 output_schema=output_schema,
-                writable_roots=tuple(writable_roots),
-                readable_roots=tuple(readable_roots),
             )
         )
         return self.turn_id
@@ -347,7 +341,6 @@ def test_sdk_driver_streams_usage_commands_and_structured_terminal_result(
         supervisor = RunSupervisor(
             store,
             client_factory=lambda _execution: client,
-            toolchain_read_roots=("/opt/agentd/toolchain",),
         )
         driver = CodexSdkDriver(supervisor)
 
@@ -417,11 +410,6 @@ def test_sdk_driver_streams_usage_commands_and_structured_terminal_result(
         call = client.turn_calls[0]
         assert call.model == "gpt-5.6-terra"
         assert call.effort == "medium"
-        assert call.writable_roots == ("/workspace",)
-        assert call.readable_roots == (
-            "/workspace",
-            "/opt/agentd/toolchain",
-        )
         assert call.output_schema["additionalProperties"] is False
         assert client.closed
 
@@ -675,14 +663,3 @@ def test_supervisor_rejects_workspace_or_read_root_overlapping_codex_state(
 
     asyncio.run(scenario())
     assert not client.started
-
-    try:
-        RunSupervisor(
-            store,
-            client_factory=lambda _execution: client,
-            toolchain_read_roots=(str(codex_state / "skills"),),
-        )
-    except ValueError as error:
-        assert "account state" in str(error)
-    else:
-        raise AssertionError("Codex account state was exposed as a read root")
