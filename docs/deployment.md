@@ -47,6 +47,21 @@ arguments are behind a pointer, so it is the one explicit modern-kernel namespac
 compatibility exception. Capability dropping and `no-new-privileges` remain in
 force inside and outside a nested namespace.
 
+The reviewed HP kernel does not permit an unprivileged nested user namespace to
+create character-device nodes. Codex permission-profile sandboxes ask Bubblewrap
+for `--dev /dev`, which normally creates those nodes and therefore fails before a
+command starts. The image moves Debian's real Bubblewrap ELF to the root-owned,
+mode-`0555` private path `/usr/libexec/agentd/bwrap.real` and installs a compiled,
+root-owned ELF compatibility shim at the exact `/usr/bin/bwrap` path selected by
+Codex. The shim rewrites only one exact `--dev /dev` pair to
+`--dev-bind /dev /dev`, binding the container's already-minimal `/dev`; Compose
+maps no host devices. It rejects alternate device targets, try-style device binds,
+argument-file expansion, explicit `--share-net`, unknown options, and malformed
+invocations before executing the private binary. It neither grants capabilities
+nor injects network isolation. The trusted dependency provisioner can therefore
+retain its deliberate outbound network access, while Codex must still supply its
+own `--unshare-net` for model-generated commands.
+
 The pinned `openai-codex==0.144.4` runtime supports named permission profiles on
 its experimental App Server wire protocol. The dedicated config selects the
 `agentd-workspace` profile: platform/toolchain paths are read-only, the dynamic
@@ -56,13 +71,20 @@ disabled. A more-specific runtime-root rule reopens only the current lease.
 Thread start, resume, and turn requests select that profile and supply the
 leased worktree as their sole `runtimeWorkspaceRoots` entry.
 
-App Server owns and invokes its Linux sandbox directly; it does not rely on a
-PATH-interposed Bubblewrap wrapper. Service startup executes both a direct
-nested Bubblewrap probe and a standalone command through the exact SDK-bundled
-App Server with `permissionProfile=agentd-workspace`. Together they prove that
-`auth.json` and SQLite are unreadable, only the temporary leased worktree is
-writable, and an AF_INET route cannot be selected. Any failure aborts startup
-and therefore activation.
+App Server owns and invokes its Linux sandbox directly, so the compatibility ELF
+occupies the exact system path instead of relying on PATH ordering. During
+service startup, a private nonce makes the shim append a mode-`0600` record below
+the service-only `/run/agentd` tmpfs. Startup executes both a direct nested probe
+and a standalone command through the exact SDK-bundled App Server with
+`permissionProfile=agentd-workspace`, then requires one audited device rewrite
+with `--unshare-net` preserved for each. The App Server command executes a
+temporary mode-`0500` launcher from the read-only uv toolchain root. Together the
+probes prove that `auth.json` and SQLite are unreadable, the uv toolchain is
+executable but not writable, only the temporary leased worktree is writable, and
+an AF_INET route cannot be selected. Unsafe shim-argument probes must also fail
+with the dedicated rejection status. Any missing audit or failed invariant
+aborts startup and therefore activation; the nonce, launcher, and audit record
+are removed after the probe.
 
 ## Prerequisites
 
@@ -213,10 +235,11 @@ The runtime check starts only the local image with a shell override. It invokes
 the pinned local Codex App Server binary but starts no model turn, sends no prompt,
 and calls no LLM API. It verifies UID/GID, zero effective capabilities,
 `NoNewPrivs`, read-only root, absence of Docker sockets and a broad home mount,
-and successful unprivileged user-namespace creation. It then runs the direct and
-App-Server-generated-command sandbox probes described above. The network assertion is
-a UDP route selection to the documentation-only `192.0.2.1` address and sends no
-packet:
+the root-owned compiled shim and private real Bubblewrap ELF, and successful
+unprivileged user-namespace creation. It rejects unsafe shim inputs, then runs
+the audited direct and App-Server-generated-command sandbox probes described
+above. The network assertion is a UDP route selection to the documentation-only
+`192.0.2.1` address and sends no packet:
 
 ```bash
 ./deploy/scripts/check-container-security.sh \
@@ -225,6 +248,6 @@ packet:
 
 The user systemd unit runs this check as a mandatory `ExecStartPre`; it is not an
 optional warning in normal deployment. A missing auth/config/state file, wrong
-ownership or mode, unavailable named profile or nested user namespace, readable
-sensitive file, unwritable lease, or available network route prevents the
-container service from starting.
+ownership or mode, unavailable named profile or nested user namespace, absent or
+malformed rewrite audit, readable sensitive file, writable toolchain, unwritable
+lease, or available network route prevents the container service from starting.

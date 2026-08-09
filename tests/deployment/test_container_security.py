@@ -251,7 +251,12 @@ def test_dockerfile_keeps_runtime_tools_and_never_embeds_credentials() -> None:
     assert "COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv" in dockerfile
     assert 'UV_CACHE_DIR="/home/bened/.cache/uv"' in dockerfile
     assert 'PATH="/opt/agentd/venv/bin:' in dockerfile
-    assert "deploy/container/bwrap" not in dockerfile
+    assert "deploy/container/bwrap_compat.c" in dockerfile
+    assert "FROM ${PYTHON_IMAGE} AS bwrap-compat-builder" in dockerfile
+    assert "-Wl,-z,relro,-z,now" in dockerfile
+    assert "mv /usr/bin/bwrap /usr/libexec/agentd/bwrap.real" in dockerfile
+    assert "/build/bwrap /usr/bin/bwrap" in dockerfile
+    assert "--chown=0:0 --chmod=0555" in dockerfile
     assert "runtime_sandbox_probe.py" in dockerfile
     assert "sandbox_payload.py" in dockerfile
     assert "auth.json" not in dockerfile
@@ -390,10 +395,18 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert "_run_direct_bwrap_probe(worktree)" in preflight
     assert '"--unshare-net"' in preflight
     assert preflight.count('"--tmpfs"') == 2
-    assert '"--dev-bind"' in preflight
+    assert '"--dev"' in preflight
+    assert 'REAL_BWRAP = Path("/usr/libexec/agentd/bwrap.real")' in preflight
+    assert "_run_shim_rejection_probes()" in preflight
+    assert "_require_bwrap_rewrite_audit" in preflight
+    assert 'fields.get("rewrite_dev") == "1"' in preflight
+    assert 'fields.get("unshare_net") != "1"' in preflight
+    assert "secrets.token_hex(16)" in preflight
     assert "_run_codex_generated_command_probe(worktree)" in preflight
-    assert "_require_wrapper_audit" not in preflight
     assert "shutil.copyfile(PAYLOAD, workspace_payload)" in preflight
+    assert "_create_toolchain_launcher(token)" in preflight
+    assert "toolchain_launcher.unlink(missing_ok=True)" in preflight
+    assert '"command": [str(toolchain_launcher), str(workspace_payload)]' in preflight
     assert "result.exit_code != 0" in preflight
     assert "/home/bened/.local/share/agentd/codex-home/auth.json" in payload
     assert "/home/bened/.local/state/agentd/state.sqlite" in payload
@@ -406,6 +419,25 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert "errno.ENETUNREACH" in payload
     assert 'Path("/usr/bin/bwrap")' in preflight
     assert "metadata.st_uid != 0" in preflight
+
+
+def test_bwrap_compatibility_shim_is_narrow_and_fail_closed() -> None:
+    shim = (DEPLOY / "container" / "bwrap_compat.c").read_text(encoding="utf-8")
+
+    assert '#define REAL_BWRAP "/usr/libexec/agentd/bwrap.real"' in shim
+    assert '#define AUDIT_DIRECTORY "/run/agentd"' in shim
+    assert 'strcmp(argument, "--dev") == 0' in shim
+    assert '(char *)"--dev-bind"' in shim
+    assert 'rewritten[output++] = (char *)"--unshare-net"' not in shim
+    assert 'strcmp(argv[index + 1], "/dev") != 0' in shim
+    assert 'strcmp(argument, "--share-net") == 0' in shim
+    assert 'strcmp(argument, "--args") == 0' in shim
+    assert 'strcmp(argument, "--dev-bind-try") == 0' in shim
+    assert "unknown Bubblewrap option rejected" in shim
+    assert "inspection->unshare_net_seen ? 1 : 0" in shim
+    assert "O_NOFOLLOW" in shim
+    assert "metadata.st_uid != 0" in shim
+    assert "fexecve(real_bwrap, rewritten, environ)" in shim
 
 
 def test_user_systemd_unit_uses_versioned_current_release_and_hardening() -> None:

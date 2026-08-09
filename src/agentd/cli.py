@@ -102,10 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     codex_status = commands.add_parser(
         "codex-status",
-        help="refresh and show the authoritative ChatGPT Codex quota bucket",
+        help="refresh and show authoritative ChatGPT Codex quota status",
     )
     codex_status.add_argument("--pool", default="codex")
-    codex_status.add_argument("--bucket", default="codex")
+    codex_status.add_argument(
+        "--bucket",
+        help="show one bucket instead of the most restrictive reported bucket",
+    )
 
     node = commands.add_parser("register-node", help="register or update a node")
     node.add_argument("node_id")

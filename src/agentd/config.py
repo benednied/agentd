@@ -52,6 +52,12 @@ class ServiceConfig:
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
 
+    @property
+    def uv_python_install_directory(self) -> Path:
+        """Exact managed-Python toolchain path inside the dedicated uv cache."""
+
+        return self.uv_cache / "python"
+
     @classmethod
     def from_environment(cls, values: Mapping[str, str]) -> ServiceConfig:
         """Load configuration without consulting global process state directly."""

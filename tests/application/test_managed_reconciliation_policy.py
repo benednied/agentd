@@ -288,6 +288,15 @@ def test_terminal_observation_enters_review_and_releases_execution_capacity(
     _register_capacity(rig)
     run = _dispatch(rig, _job())
     assert run is not None
+    assert "agentd creates the trusted automation commit" in (
+        run.contract.completion_protocol
+    )
+    assert "Do not run Git commit, merge, or push commands" in (
+        run.contract.completion_protocol
+    )
+    assert "trusted Git handoffs outside the model sandbox" in (
+        run.contract.checkpoint_expectations
+    )
     rig.store.apply_usage_sample(_usage(run, 10_000, 1))
     rig.driver.observations[run.id] = _observation(run, terminal=True)
 

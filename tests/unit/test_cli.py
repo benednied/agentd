@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import agentd.cli as cli
-from agentd.cli import main
+from agentd.cli import build_parser, main
 from agentd.domain.enums import QuotaUnit
 from agentd.domain.models import UsageSample
 from agentd.state.sqlite import SQLiteStateStore
@@ -100,6 +100,16 @@ def test_usage_command_prints_run_ledger(tmp_path: Path, capsys) -> None:
     assert main(["--db", str(database), "usage", "--run", "run-1"]) == 0
     output = capsys.readouterr().out
     assert '"run-1": []' in output
+
+
+def test_codex_status_defaults_to_most_restrictive_bucket() -> None:
+    parser = build_parser()
+
+    automatic = parser.parse_args(["codex-status"])
+    explicit = parser.parse_args(["codex-status", "--bucket", "codex"])
+
+    assert automatic.bucket is None
+    assert explicit.bucket == "codex"
 
 
 def test_serve_passes_validated_service_configuration(

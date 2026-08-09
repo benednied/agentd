@@ -18,6 +18,25 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
+FROM ${PYTHON_IMAGE} AS bwrap-compat-builder
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/container/bwrap_compat.c /build/bwrap_compat.c
+RUN cc \
+        -std=c17 \
+        -O2 \
+        -D_FORTIFY_SOURCE=2 \
+        -fPIE \
+        -pie \
+        -Wall \
+        -Wextra \
+        -Werror \
+        -Wl,-z,relro,-z,now \
+        -s \
+        -o /build/bwrap \
+        /build/bwrap_compat.c
+
 FROM ${PYTHON_IMAGE} AS runtime
 ARG SOURCE_SHA=unknown
 LABEL org.opencontainers.image.title="agentd" \
@@ -36,12 +55,18 @@ RUN apt-get update \
     && groupadd --gid 1000 bened \
     && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/bened \
         --shell /usr/sbin/nologin bened \
+    && install -d -o 0 -g 0 -m 0555 /usr/libexec/agentd \
+    && mv /usr/bin/bwrap /usr/libexec/agentd/bwrap.real \
+    && chown 0:0 /usr/libexec/agentd/bwrap.real \
+    && chmod 0555 /usr/libexec/agentd/bwrap.real \
     && install -d -o 1000 -g 1000 -m 0700 \
         /home/bened/.cache/uv \
         /home/bened/.local/state/agentd \
         /home/bened/.local/share/agentd/workspaces \
         /home/bened/.local/share/agentd/codex-home
 
+COPY --from=bwrap-compat-builder --chown=0:0 --chmod=0555 \
+    /build/bwrap /usr/bin/bwrap
 COPY --from=builder /build/.venv /opt/agentd/venv
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node

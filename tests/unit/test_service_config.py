@@ -12,6 +12,7 @@ def test_service_config_has_hardened_hp_defaults() -> None:
     assert config.workspace_root == Path("/home/bened/.local/share/agentd/workspaces")
     assert config.codex_home == Path("/home/bened/.local/share/agentd/codex-home")
     assert config.uv_cache == Path("/home/bened/.cache/uv")
+    assert config.uv_python_install_directory == Path("/home/bened/.cache/uv/python")
     assert config.model == "gpt-5.6-terra"
     assert config.reasoning_effort == "medium"
     assert config.account_poll_seconds == 60
@@ -41,6 +42,7 @@ def test_service_config_parses_explicit_environment() -> None:
     assert config.workspace_root == Path("/workspaces")
     assert config.codex_home == Path("/codex-home")
     assert config.uv_cache == Path("/uv-cache")
+    assert config.uv_python_install_directory == Path("/uv-cache/python")
     assert config.reasoning_effort == "medium"
     assert config.poll_interval_seconds == 2.5
     assert config.account_poll_seconds == 30

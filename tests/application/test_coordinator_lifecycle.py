@@ -62,6 +62,8 @@ def test_checkpoint_suspend_resume_complete_has_exact_durable_history(
         assert first_run is not None
         assert first_run.handle.id == "fake-run-1"
         assert first_run.contract.resume is None
+        assert "commit changes" in first_run.contract.completion_protocol
+        assert "Commit durable handoffs" in first_run.contract.checkpoint_expectations
 
         early_checkpoint = await rig.plane.checkpoint(job.id, early_capsule)
         suspended = await rig.plane.pause(job.id, resume_capsule)

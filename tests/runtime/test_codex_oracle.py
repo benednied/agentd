@@ -165,6 +165,69 @@ def test_codex_oracle_rejects_an_unreported_bucket_and_closes_client() -> None:
     assert client.closed
 
 
+def test_codex_oracle_selects_most_restrictive_reported_bucket() -> None:
+    client = ScriptedAccountClient(
+        {
+            "rateLimitsByLimitId": {
+                "codex-hourly": {
+                    "limitId": "codex-hourly",
+                    "primary": {"usedPercent": 99},
+                    "credits": {"hasCredits": True},
+                },
+                "codex-exhausted": {
+                    "limitId": "codex-exhausted",
+                    "primary": {"usedPercent": 10},
+                    "credits": {"hasCredits": False},
+                },
+                "codex-weekly": {
+                    "limitId": "codex-weekly",
+                    "primary": {"usedPercent": 90},
+                    "credits": {"hasCredits": True},
+                },
+            }
+        }
+    )
+
+    snapshot = asyncio.run(
+        CodexAccountOracle(
+            "subscription",
+            client_factory=lambda: client,
+        ).snapshot()
+    )
+
+    assert snapshot.bucket_id == "codex-exhausted"
+    assert snapshot.primary_used_percent == 10
+    assert snapshot.credits_exhausted is True
+
+
+def test_codex_oracle_explicit_bucket_overrides_automatic_selection() -> None:
+    client = ScriptedAccountClient(
+        {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {"usedPercent": 25},
+                },
+                "codex-weekly": {
+                    "limitId": "codex-weekly",
+                    "primary": {"usedPercent": 90},
+                },
+            }
+        }
+    )
+
+    snapshot = asyncio.run(
+        CodexAccountOracle(
+            "subscription",
+            bucket_id="codex",
+            client_factory=lambda: client,
+        ).snapshot()
+    )
+
+    assert snapshot.bucket_id == "codex"
+    assert snapshot.primary_used_percent == 25
+
+
 def test_codex_oracle_marks_explicit_credit_exhaustion() -> None:
     for credits in (
         {"balance": None, "hasCredits": False, "unlimited": False},

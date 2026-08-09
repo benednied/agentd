@@ -11,6 +11,7 @@ from agentd.domain.models import (
     Job,
     ProviderQuotaSnapshot,
     QuotaBudget,
+    RunCommand,
 )
 
 
@@ -51,9 +52,11 @@ class RecordingOracle:
 class RecordingPlane:
     def __init__(self) -> None:
         self.jobs = [_job("job-1")]
+        self.store = self
         self.snapshots: list[ProviderQuotaSnapshot] = []
         self.reconciled: list[ProviderQuotaSnapshot | None] = []
         self.dispatches = 0
+        self.pending_commands: list[RunCommand] = []
 
     def list_jobs(self, _states=None):
         return list(self.jobs)
@@ -68,6 +71,13 @@ class RecordingPlane:
     async def dispatch_next(self):
         self.dispatches += 1
         return None
+
+    def list_pending_run_commands(self):
+        return list(self.pending_commands)
+
+    @staticmethod
+    def get_run(run_id):
+        return type("Run", (), {"id": run_id, "driver": "codex"})()
 
 
 def test_daemon_refreshes_on_interval_and_before_each_new_admission() -> None:
@@ -90,12 +100,22 @@ def test_daemon_refreshes_on_interval_and_before_each_new_admission() -> None:
         await daemon.tick()
         assert oracle.calls == 2
 
-        now[0] += timedelta(seconds=60)
+        plane.pending_commands.append(
+            RunCommand(
+                id="repair-turn:job-1:1",
+                run_id="run-1",
+                action="repair",
+            )
+        )
         await daemon.tick()
         assert oracle.calls == 3
-        assert plane.snapshots[-1].id == "snapshot-3"
+
+        now[0] += timedelta(seconds=60)
+        await daemon.tick()
+        assert oracle.calls == 4
+        assert plane.snapshots[-1].id == "snapshot-4"
         assert plane.reconciled[-1] == plane.snapshots[-1]
-        assert plane.dispatches == 4
+        assert plane.dispatches == 5
 
     asyncio.run(scenario())
 

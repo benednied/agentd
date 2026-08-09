@@ -269,6 +269,21 @@ leased runtime workspace root writable, exposes reviewed toolchain paths read-on
 explicitly denies the Codex-home and agentd-state roots, and disables command
 network access. The workspace-pool parent is denied; only the more-specific
 runtime lease is reopened for writes.
+
+Before App Server sees a newly leased Goldenage worktree, the trusted provisioner
+runs two direct, shell-free uv operations inside its own Bubblewrap boundary. It
+installs managed Python 3.14 under the exact mounted toolchain path
+`/home/bened/.cache/uv/python` via `UV_PYTHON_INSTALL_DIR`, then runs
+`uv sync --frozen --extra dev --python 3.14`. Repository build hooks can write the
+lease and dedicated uv cache and may use the network for locked dependencies, but
+the service Codex home and agentd state directory are replaced with empty tmpfs
+mounts and credential environment variables are removed. Model commands later see
+the uv cache and managed interpreter read-only, with only their lease writable, so
+the resulting `.venv` console tools and Python symlink remain executable without
+granting package installation or network access. The Codex execution contract
+therefore tells the model not to run Git commit, merge, or push commands; agentd
+creates the automation-authored commit after valid terminal telemetry.
+
 The worker receives the bounded `ExecutionContract`, never account percentages,
 quota scarcity, node details, or policy thresholds.
 
@@ -345,6 +360,9 @@ merges a worker branch into the integration branch.
   and acceptance require an operator or external caller.
 - Invalid terminal telemetry deliberately leaves a job in `METERING_PENDING`; the
   MVP has no automated provider-side reconciliation for that state.
+- The production trusted provisioner currently targets the mounted Goldenage
+  repository's Python 3.14 and `dev` extra; selecting toolchains and extras per
+  arbitrary repository is not yet a public job-level policy.
 - A valid managed Codex completion gets an automation-authored trusted handoff
   commit before `REVIEW`; other paths may still fall back to the workspace's
   current `HEAD`. A handoff commit records the artifact but does not mean an

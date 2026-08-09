@@ -92,7 +92,13 @@ def create_local_runtime(
     if include_fake_driver:
         drivers.register(FakeHarnessDriver())
     if include_codex_driver:
-        codex_environment = {"CODEX_HOME": str(effective_config.codex_home)}
+        python_install_directory = effective_config.uv_python_install_directory
+        codex_environment = {
+            "CODEX_HOME": str(effective_config.codex_home),
+            "UV_CACHE_DIR": str(effective_config.uv_cache),
+            "UV_PYTHON_INSTALL_DIR": str(python_install_directory),
+            "UV_PYTHON_PREFERENCE": "only-managed",
+        }
 
         def client_factory(execution: ExecutionContract) -> OpenAICodexClient:
             return OpenAICodexClient(
@@ -120,6 +126,9 @@ def create_local_runtime(
             state_directory=effective_config.database.parent,
             cache_directory=effective_config.uv_cache,
             provisioning_home=effective_config.workspace_root / ".provision-home",
+            python_install_directory=effective_config.uv_python_install_directory,
+            python_version="3.14",
+            extras=("dev",),
         )
         if trusted_provisioning
         else None

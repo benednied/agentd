@@ -278,6 +278,24 @@ platform and reviewed toolchain paths for reading, explicitly denies Codex accou
 state, agentd SQLite state, and the workspace-pool parent, then reopens only the
 more-specific runtime lease for writes and disables command network access.
 
+Dependency preparation is a separate trusted boundary that runs before the model
+transport starts. With the Codex home and agentd state replaced by empty tmpfs
+mounts, it invokes the pinned uv executable directly to install managed Python
+3.14 at `/home/bened/.cache/uv/python`, selected through
+`UV_PYTHON_INSTALL_DIR` and `UV_PYTHON_PREFERENCE=only-managed`, and then performs
+`uv sync --frozen --extra dev --python 3.14`. This step alone has dependency
+network access. The resulting worktree `.venv/bin/python` points into that exact
+mounted toolchain. The App Server environment inherits the same install path, but
+its permission profile exposes the uv cache read-only and the current lease as the
+only writable root. Thus Ruff, ty, compileall, and pytest can execute from the
+prepared environment without model-command network access or access to service
+credentials; any model-side environment changes remain confined to the lease.
+
+Because common Git metadata is outside that writable lease, the worker contract
+explicitly forbids commit, merge, and push operations. Once a completed turn has
+valid terminal telemetry, the trusted coordinator validates the registered
+worktree, stages nonignored changes, and creates the fixed-identity review commit.
+
 The Python package's generated request models omit the experimental profile
 fields even though the pinned runtime schema supports them. The adapter therefore
 uses raw dictionaries for `permissions` and `runtimeWorkspaceRoots`; it never

@@ -761,6 +761,27 @@ class SchedulerCoordinator:
                 continue
             result = runs[-1].result
             dependency_results[dependency_id] = result.commit or result.summary
+        managed_codex = job.selected_harness == "codex"
+        checkpoint_expectations = (
+            "Return a compact resume capsule at safe boundaries and before "
+            "preemption. Agentd records trusted Git handoffs outside the model "
+            "sandbox."
+            if managed_codex
+            else (
+                "Return a compact resume capsule at safe boundaries and before "
+                "preemption. Commit durable handoffs."
+            )
+        )
+        completion_protocol = (
+            "Satisfy the acceptance criteria and run validation. Do not run Git "
+            "commit, merge, or push commands; after valid terminal telemetry, "
+            "agentd creates the trusted automation commit for explicit review."
+            if managed_codex
+            else (
+                "Satisfy the acceptance criteria, run validation, commit changes, "
+                "and report completion to the control plane. Do not merge."
+            )
+        )
         return ExecutionContract(
             job_id=job.id,
             objective=job.objective,
@@ -769,10 +790,7 @@ class SchedulerCoordinator:
             dependency_results=dependency_results,
             role="implementation worker",
             allowed_filesystem_scope=(workspace.working_directory,),
-            checkpoint_expectations=(
-                "Return a compact resume capsule at safe boundaries and before "
-                "preemption. Commit durable handoffs."
-            ),
+            checkpoint_expectations=checkpoint_expectations,
             coordination_mechanisms=(
                 "get_assignment",
                 "request_refinement",
@@ -781,10 +799,7 @@ class SchedulerCoordinator:
                 "request_review",
                 "complete",
             ),
-            completion_protocol=(
-                "Satisfy the acceptance criteria, run validation, commit changes, "
-                "and report completion to the control plane. Do not merge."
-            ),
+            completion_protocol=completion_protocol,
             working_directory=workspace.working_directory,
             environment=workspace.environment,
             model_class=job.selected_model_class or job.minimum_model_class,

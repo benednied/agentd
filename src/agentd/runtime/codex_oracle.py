@@ -34,13 +34,13 @@ class CodexAccountOracle:
         self,
         pool_id: str,
         *,
-        bucket_id: str = "codex",
+        bucket_id: str | None = None,
         client_factory: Callable[[], AppServerClient] = OpenAICodexClient,
         store: ProviderQuotaStore | None = None,
     ) -> None:
         if not pool_id.strip():
             raise ValueError("A Codex quota oracle requires a pool identifier")
-        if not bucket_id.strip():
+        if bucket_id is not None and not bucket_id.strip():
             raise ValueError("A Codex quota oracle requires a bucket identifier")
         self._pool_id = pool_id
         self._bucket_id = bucket_id
@@ -64,7 +64,7 @@ class CodexAccountOracle:
         payload: Mapping[str, JsonValue],
         client: AppServerClient,
     ) -> ProviderQuotaSnapshot:
-        bucket = _select_bucket(payload, self._bucket_id)
+        bucket_id, bucket = _select_bucket(payload, self._bucket_id)
         primary = _mapping(bucket.get("primary"))
         secondary = _mapping(bucket.get("secondary"))
         reached_type = _optional_string(bucket.get("rateLimitReachedType"))
@@ -74,7 +74,7 @@ class CodexAccountOracle:
         metadata = client.metadata
         return ProviderQuotaSnapshot(
             pool_id=self._pool_id,
-            bucket_id=self._bucket_id,
+            bucket_id=bucket_id,
             primary_used_percent=primary_used,
             primary_window_minutes=_optional_positive_int(
                 primary.get("windowDurationMins")
@@ -102,20 +102,57 @@ class CodexAccountOracle:
 
 
 def _select_bucket(
-    payload: Mapping[str, JsonValue], bucket_id: str
-) -> Mapping[str, JsonValue]:
+    payload: Mapping[str, JsonValue], bucket_id: str | None
+) -> tuple[str, Mapping[str, JsonValue]]:
     buckets = _mapping(payload.get("rateLimitsByLimitId"))
-    selected = _mapping(buckets.get(bucket_id))
-    if selected:
-        return selected
+    if bucket_id is None and buckets:
+        candidates: list[tuple[str, Mapping[str, JsonValue]]] = []
+        for raw_id, raw_bucket in buckets.items():
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                raise ValueError("Codex reported a malformed rate-limit bucket id")
+            selected = _mapping(raw_bucket)
+            if not selected:
+                raise ValueError(f"Codex rate-limit bucket {raw_id!r} is malformed")
+            candidates.append((raw_id, selected))
+        return max(candidates, key=lambda item: _bucket_restriction_key(*item))
+    if bucket_id is not None:
+        selected = _mapping(buckets.get(bucket_id))
+        if selected:
+            return bucket_id, selected
     legacy = _mapping(payload.get("rateLimits"))
-    if legacy and _optional_string(legacy.get("limitId")) in {None, bucket_id}:
-        return legacy
+    legacy_id = _optional_string(legacy.get("limitId"))
+    if legacy and (bucket_id is None or legacy_id in {None, bucket_id}):
+        return legacy_id or bucket_id or "codex", legacy
     available = ", ".join(sorted(str(key) for key in buckets)) or "(none)"
+    if bucket_id is None:
+        raise ValueError(
+            f"Codex reported no rate-limit buckets; available: {available}"
+        )
     raise ValueError(
         f"Codex rate-limit bucket {bucket_id!r} was not reported; "
         f"available: {available}"
     )
+
+
+def _bucket_restriction_key(
+    bucket_id: str,
+    bucket: Mapping[str, JsonValue],
+) -> tuple[bool, float, str]:
+    primary = _mapping(bucket.get("primary"))
+    secondary = _mapping(bucket.get("secondary"))
+    primary_used = _optional_percent(primary.get("usedPercent"))
+    secondary_used = _optional_percent(secondary.get("usedPercent"))
+    values = tuple(
+        value for value in (primary_used, secondary_used) if value is not None
+    )
+    used_percent = max(values) if values else -1.0
+    reached = (
+        _optional_string(bucket.get("rateLimitReachedType")) is not None
+        or primary_used == 100
+        or secondary_used == 100
+        or _credits_exhausted(bucket.get("credits")) is True
+    )
+    return reached, used_percent, bucket_id
 
 
 def _mapping(value: JsonValue) -> Mapping[str, JsonValue]:
