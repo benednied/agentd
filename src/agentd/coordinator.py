@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 from agentd.domain.enums import (
     JobState,
     PreemptionPolicy,
+    QoSClass,
     QuotaMode,
     RunOutcome,
     RunState,
@@ -16,9 +19,13 @@ from agentd.domain.models import (
     Checkpoint,
     ExecutionContract,
     Job,
+    ProviderQuotaSnapshot,
     QuotaReservation,
     ResumeCapsule,
+    RunCommand,
+    RunCommandAck,
     RunHandle,
+    RunObservation,
     RunRecord,
     RunResult,
     WorkspaceLease,
@@ -26,13 +33,31 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.domain.transitions import transition_job
+from agentd.harness.protocol import ManagedHarnessDriver
 from agentd.harness.registry import DriverRegistry
+from agentd.provisioning import RepositoryProvisioner
+from agentd.runtime.accounts import (
+    DEFAULT_ACCOUNT_POLICY,
+    DEFAULT_JOB_USAGE_POLICY,
+    AccountPolicyThresholds,
+    JobUsagePolicy,
+    hard_cap_interrupt_command,
+    maximum_checkpoint_command,
+    provider_allows_qos,
+    provider_checkpoint_command,
+    provider_quota_reached,
+    provider_used_percent,
+    quota_mode_for_snapshot,
+    should_checkpoint_for_maximum,
+    should_top_up,
+    snapshot_is_stale,
+)
 from agentd.runtime.quota import QuotaAdmissionError, QuotaManager
 from agentd.runtime.resources import ResourceManager
 from agentd.scheduling.burn import burn_order_key
 from agentd.scheduling.placement import Placement, compatible_placements
 from agentd.scheduling.readiness import gang_readiness
-from agentd.state.base import StateStore
+from agentd.state.base import ConcurrentStateError, EntityNotFoundError, StateStore
 from agentd.workers.protocol import WorkerBackend
 from agentd.workers.registry import BackendRegistry
 from agentd.workspaces.base import WorkspaceManager, WorkspaceReleaseError
@@ -54,13 +79,25 @@ class SchedulerCoordinator:
         quota_manager: QuotaManager | None = None,
         resource_manager: ResourceManager | None = None,
         backends: BackendRegistry | None = None,
+        provisioner: RepositoryProvisioner | None = None,
+        enforce_codex_account_policy: bool = False,
+        account_policy: AccountPolicyThresholds = DEFAULT_ACCOUNT_POLICY,
+        usage_policy: JobUsagePolicy = DEFAULT_JOB_USAGE_POLICY,
+        hard_cap_grace: timedelta = timedelta(seconds=120),
     ) -> None:
+        if hard_cap_grace <= timedelta(0):
+            raise ValueError("Hard-cap grace must be positive")
         self._store = store
         self._workspaces = workspace_manager
         self._drivers = drivers
         self._quota = quota_manager or QuotaManager(store)
         self._resources = resource_manager or ResourceManager(store)
         self._backends = backends
+        self._provisioner = provisioner
+        self._enforce_codex_account_policy = enforce_codex_account_policy
+        self._account_policy = account_policy
+        self._usage_policy = usage_policy
+        self._hard_cap_grace = hard_cap_grace
 
     async def dispatch_next(self) -> RunRecord | None:
         jobs = self._store.list_jobs(frozenset({JobState.READY}))
@@ -90,6 +127,8 @@ class SchedulerCoordinator:
                 self._store.list_nodes(),
                 capabilities,
             ):
+                if not self._provider_allows_placement(job, placement):
+                    continue
                 backend = self._select_backend(placement.node_id)
                 if self._backends is not None and backend is None:
                     continue
@@ -147,6 +186,9 @@ class SchedulerCoordinator:
                 self._store.save_workspace(workspace)
                 workspace_created = True
 
+            if self._provisioner is not None:
+                await self._provisioner.prepare(workspace)
+
             selected = replace(
                 job,
                 selected_harness=placement.harness,
@@ -179,11 +221,12 @@ class SchedulerCoordinator:
                 state=RunState.STARTING,
             )
             self._store.save_run(run)
-            handle = (
-                await backend.dispatch(driver, contract)
-                if backend is not None
-                else await driver.start(contract)
-            )
+            if isinstance(driver, ManagedHarnessDriver):
+                handle = await driver.start_managed(run.id, contract)
+            elif backend is not None:
+                handle = await backend.dispatch(driver, contract)
+            else:
+                handle = await driver.start(contract)
             # Persist the externally meaningful handle before publishing RUNNING.
             # A reconciler can now identify and stop a process even if the job/run
             # transition below is interrupted.
@@ -246,6 +289,183 @@ class SchedulerCoordinator:
             for cleanup_error in cleanup_errors:
                 error.add_note(f"Cleanup also failed: {cleanup_error}")
             raise
+
+    def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None:
+        """Project provider telemetry into scheduling mode without inventing quota."""
+
+        try:
+            pool = self._store.get_quota_pool(snapshot.pool_id)
+        except LookupError:
+            return
+        for _attempt in range(8):
+            updated = replace(
+                pool,
+                mode=quota_mode_for_snapshot(
+                    snapshot,
+                    policy=self._account_policy,
+                ),
+                reset_at=snapshot.reset_at,
+                reset_confidence=snapshot.confidence,
+                updated_at=utc_now(),
+            )
+            try:
+                self._store.update_quota_pool(pool, updated)
+            except ConcurrentStateError:
+                pool = self._store.get_quota_pool(snapshot.pool_id)
+                continue
+            return
+        raise ConcurrentStateError(
+            f"Could not apply provider snapshot for pool {snapshot.pool_id}"
+        )
+
+    async def recover_managed_runs(self) -> None:
+        """Resume durable SDK threads after the service transport restarts."""
+
+        first_error: BaseException | None = None
+        for run in self._store.list_runs():
+            if run.state not in {
+                RunState.STARTING,
+                RunState.RUNNING,
+                RunState.DRAINING,
+                RunState.CHECKPOINTED,
+            }:
+                continue
+            job = self._store.get_job(run.job_id)
+            if job.state not in {
+                JobState.ADMITTED,
+                JobState.RUNNING,
+                JobState.DRAINING,
+                JobState.CHECKPOINTED,
+            }:
+                continue
+            driver = self._drivers.get(run.driver)
+            if not isinstance(driver, ManagedHarnessDriver):
+                continue
+            repair_request = self._pending_repair(run.id)
+            if repair_request is not None:
+                try:
+                    session = self._store.get_driver_session(run.id)
+                    if session.active:
+                        handle = await driver.recover(
+                            run.id,
+                            run.contract,
+                            "Resume the interrupted repair turn from the durable "
+                            "thread and existing workspace.",
+                        )
+                    else:
+                        continue_turn = getattr(driver, "continue_turn", None)
+                        if not callable(continue_turn):
+                            raise LifecycleError(
+                                f"Driver {run.driver} cannot continue repair turns"
+                            )
+                        instruction = repair_request.payload.get("instruction")
+                        if not isinstance(instruction, str):
+                            raise LifecycleError("Repair instruction is malformed")
+                        handle = await continue_turn(run.id, instruction)
+                    recovered = replace(
+                        run,
+                        handle=handle,
+                        state=RunState.RUNNING,
+                        ended_at=None,
+                        result=None,
+                    )
+                    self._store.save_run(recovered)
+                    self._acknowledge_repair(repair_request, recovered)
+                    continue
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    continue
+            observation = driver.observe(run.id)
+            if observation is not None and observation.terminal:
+                continue
+            try:
+                await driver.recover(
+                    run.id,
+                    run.contract,
+                    "The control-plane transport restarted. Resume the durable "
+                    "thread from the existing workspace and return a structured "
+                    "review handoff at the next safe boundary.",
+                )
+            except (EntityNotFoundError, LookupError) as error:
+                try:
+                    self._abandon_unstarted_intent(job, run)
+                except BaseException as cleanup_error:
+                    error.add_note(f"Intent cleanup also failed: {cleanup_error}")
+                    if first_error is None:
+                        first_error = error
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    async def reconcile_managed_runs(
+        self,
+        snapshot: ProviderQuotaSnapshot | None = None,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[Job, ...]:
+        """Apply streamed observations, policy commands, and terminal handoffs."""
+
+        now = at or utc_now()
+        finalized: list[Job] = []
+        first_error: BaseException | None = None
+        try:
+            await self._start_pending_repairs()
+        except BaseException as error:
+            first_error = error
+        for run in self._store.list_runs():
+            job = self._store.get_job(run.job_id)
+            if job.state not in {
+                JobState.RUNNING,
+                JobState.DRAINING,
+                JobState.CHECKPOINTED,
+            }:
+                continue
+            active_run = self._store.find_active_run(job.id)
+            if active_run is None or active_run.id != run.id:
+                continue
+            driver = self._drivers.get(run.driver)
+            if not isinstance(driver, ManagedHarnessDriver):
+                continue
+            observation = driver.observe(run.id)
+            if observation is None:
+                continue
+            try:
+                if observation.terminal:
+                    finalized.append(
+                        self._finalize_managed_observation(run, observation)
+                    )
+                    continue
+                active_snapshot = snapshot
+                if active_snapshot is None:
+                    reservation = self._store.get_reservation(run.reservation_id)
+                    active_snapshot = self._store.latest_provider_quota_snapshot(
+                        reservation.pool_id
+                    )
+                elif (
+                    active_snapshot.pool_id
+                    != self._store.get_reservation(run.reservation_id).pool_id
+                ):
+                    active_snapshot = self._store.latest_provider_quota_snapshot(
+                        self._store.get_reservation(run.reservation_id).pool_id
+                    )
+                self._enqueue_usage_policy(
+                    job,
+                    run,
+                    active_snapshot,
+                    at=now,
+                )
+                process_pending = getattr(driver, "process_pending", None)
+                if callable(process_pending):
+                    await process_pending(run.id)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        return tuple(finalized)
 
     async def checkpoint(
         self,
@@ -583,7 +803,7 @@ class SchedulerCoordinator:
             runs = self._store.list_runs(dependency_id)
             if runs and runs[-1].result and runs[-1].result.commit:
                 return runs[-1].result.commit
-        return "HEAD"
+        return job.base_ref
 
     def _capsule_with_workspace_commit(
         self,
@@ -668,6 +888,521 @@ class SchedulerCoordinator:
         for cleanup_error in errors:
             error.add_note(str(cleanup_error))
         raise error
+
+    def _provider_allows_placement(self, job: Job, placement: Placement) -> bool:
+        if placement.harness != "codex" or not self._enforce_codex_account_policy:
+            return True
+        snapshot = self._store.latest_provider_quota_snapshot(job.quota_budget.pool_id)
+        if snapshot is None:
+            return job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}
+        return provider_allows_qos(
+            snapshot,
+            job.qos,
+            policy=self._account_policy,
+        )
+
+    async def _start_pending_repairs(self) -> None:
+        for job in self._store.list_jobs(frozenset({JobState.REVIEW})):
+            run = self._store.latest_run(job.id)
+            if run is None:
+                continue
+            request = self._pending_repair(run.id)
+            if request is not None:
+                try:
+                    await self._start_repair(job, run, request)
+                except QuotaAdmissionError:
+                    continue
+
+    async def _start_repair(
+        self,
+        job: Job,
+        run: RunRecord,
+        request: RunCommand,
+    ) -> RunRecord:
+        instruction = request.payload.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise LifecycleError("Repair instruction is malformed")
+        driver = self._drivers.get(run.driver)
+        if not isinstance(driver, ManagedHarnessDriver):
+            raise LifecycleError(f"Driver {run.driver} cannot run durable repairs")
+        continue_turn = getattr(driver, "continue_turn", None)
+        if not callable(continue_turn):
+            raise LifecycleError(f"Driver {run.driver} cannot continue repair turns")
+        session = self._store.get_driver_session(run.id)
+        raw_count = session.metadata.get("continuation_count", 0)
+        continuation_count = (
+            raw_count
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else 0
+        )
+        if continuation_count >= 2:
+            raise LifecycleError("The two-repair-turn limit has been reached")
+
+        capabilities = {item.name: item for item in self._drivers.capabilities()}
+        placements = [
+            placement
+            for placement in compatible_placements(
+                job,
+                self._store.list_nodes(),
+                capabilities,
+            )
+            if placement.harness == run.driver
+            and self._provider_allows_placement(job, placement)
+        ]
+        if not placements:
+            raise QuotaAdmissionError(
+                "No policy-compliant capacity is available for repair"
+            )
+        placement = placements[0]
+
+        maximum = job.quota_budget.maximum
+        if maximum is None:
+            raise LifecycleError("A Codex repair requires a cumulative maximum")
+        consumed = sum(item.consumed for item in self._store.list_reservations(job.id))
+        remaining = maximum - consumed
+        if remaining <= 0:
+            raise LifecycleError("The cumulative job maximum has been reached")
+        expected = min(job.quota_budget.expected_path, remaining)
+        repair_budget = replace(
+            job.quota_budget,
+            implementation=expected,
+            review=0,
+            repair=0,
+            validation=0,
+        )
+        reservation = self._quota.reserve(replace(job, quota_budget=repair_budget))
+        allocation = None
+        handle: RunHandle | None = None
+        running: Job | None = None
+        try:
+            node = self._store.get_node(placement.node_id)
+            allocation = self._resources.allocate(job, node)
+            workspace = self._store.get_workspace(run.workspace_id)
+            if (
+                workspace.state is not WorkspaceState.LEASED
+                or not self._workspaces.is_available(workspace)
+            ):
+                raise LifecycleError("The reviewed workspace is unavailable for repair")
+            if self._provisioner is not None:
+                await self._provisioner.prepare(workspace)
+
+            if run.result is not None:
+                capsule = self._capsule_from_result(run.result)
+                latest = self._store.latest_checkpoint(job.id)
+                if (
+                    latest is None
+                    or latest.run_id != run.id
+                    or latest.capsule != capsule
+                ):
+                    self._store.save_checkpoint(
+                        Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
+                    )
+            contract = self._build_contract(job, workspace)
+            starting = replace(
+                run,
+                node_id=placement.node_id,
+                reservation_id=reservation.id,
+                allocation_id=allocation.id,
+                contract=contract,
+                handle=RunHandle(id=f"pending-{new_id()}", driver=run.driver),
+                state=RunState.STARTING,
+                started_at=utc_now(),
+                ended_at=None,
+                result=None,
+            )
+            running, event = transition_job(
+                job,
+                JobState.RUNNING,
+                f"bounded repair turn {continuation_count + 1} requested",
+            )
+            self._store.save_job_and_run(running, event, starting)
+            handle = await continue_turn(run.id, instruction.strip())
+            active = replace(starting, handle=handle, state=RunState.RUNNING)
+            self._store.save_run(active)
+            self._acknowledge_repair(request, active)
+            return active
+        except BaseException:
+            quiesced = handle is None
+            if handle is not None:
+                try:
+                    await driver.cancel(handle)
+                    await driver.collect(handle)
+                    quiesced = True
+                except BaseException:
+                    quiesced = False
+            if quiesced:
+                if allocation is not None:
+                    self._resources.release(allocation.id)
+                self._quota.release(reservation.id, cancelled=True)
+                if running is not None:
+                    review, event = transition_job(
+                        running,
+                        JobState.REVIEW,
+                        "repair start failed; reviewed handoff restored",
+                    )
+                    self._store.save_job_and_run(review, event, run)
+            raise
+
+    def _pending_repair(self, run_id: str) -> RunCommand | None:
+        return next(
+            (
+                command
+                for command in self._store.list_pending_run_commands(run_id)
+                if command.action == "repair"
+            ),
+            None,
+        )
+
+    def _acknowledge_repair(
+        self,
+        request: RunCommand,
+        run: RunRecord,
+    ) -> None:
+        observation = self._drivers.get(run.driver).observe(run.id)
+        self._store.acknowledge_run_command(
+            RunCommandAck(
+                command_id=request.id,
+                run_id=run.id,
+                detail="repair turn started on the durable Codex thread",
+                observation_cursor=(
+                    observation.cursor if observation is not None else None
+                ),
+            )
+        )
+
+    def _enqueue_usage_policy(
+        self,
+        job: Job,
+        run: RunRecord,
+        snapshot: ProviderQuotaSnapshot | None,
+        *,
+        at: datetime,
+    ) -> None:
+        reservation = self._store.get_reservation(run.reservation_id)
+        consumed = sum(item.consumed for item in self._store.list_reservations(job.id))
+        used_percent = provider_used_percent(snapshot) if snapshot is not None else None
+        provider_has_capacity = (
+            snapshot is None and not self._enforce_codex_account_policy
+        ) or (
+            snapshot is not None
+            and not provider_quota_reached(snapshot)
+            and (
+                not snapshot_is_stale(
+                    snapshot,
+                    at=at,
+                    policy=self._account_policy,
+                )
+                or job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}
+            )
+            and (
+                used_percent is None
+                or used_percent < self._account_policy.urgent_only_used_percent
+                or job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}
+            )
+        )
+        if should_top_up(reservation, self._usage_policy) and provider_has_capacity:
+            prior_consumed = consumed - reservation.consumed
+            maximum_for_attempt = (
+                job.quota_budget.maximum - prior_consumed
+                if job.quota_budget.maximum is not None
+                else reservation.amount + self._usage_policy.top_up_chunk
+            )
+            top_up = min(
+                self._usage_policy.top_up_chunk,
+                max(0, maximum_for_attempt - reservation.amount),
+            )
+            if top_up > 0:
+                # A local capacity race is an admission signal, not a reason
+                # to lose the already-running turn or its telemetry.
+                with suppress(ConcurrentStateError):
+                    self._quota.top_up(reservation.id, top_up)
+
+        maximum_command = maximum_checkpoint_command(
+            job_id=job.id,
+            run_id=run.id,
+            consumed=consumed,
+            maximum=job.quota_budget.maximum,
+            at=at,
+            policy=self._usage_policy,
+        )
+        if maximum_command is not None and not self._job_has_command(
+            job.id,
+            maximum_command.id,
+        ):
+            self._store.enqueue_run_command(maximum_command)
+
+        if snapshot is not None:
+            provider_command = provider_checkpoint_command(
+                snapshot,
+                run_id=run.id,
+                qos=job.qos,
+                at=at,
+                policy=self._account_policy,
+            )
+            if provider_command is not None:
+                self._store.enqueue_run_command(provider_command)
+
+        reached_at = self._first_hard_cap_at(job)
+        if reached_at is not None and at >= reached_at + self._hard_cap_grace:
+            interrupt = hard_cap_interrupt_command(
+                job_id=job.id,
+                run_id=run.id,
+                consumed=consumed,
+                maximum=job.quota_budget.maximum,
+                reached_at=reached_at,
+                grace=self._hard_cap_grace,
+                policy=self._usage_policy,
+            )
+            if interrupt is not None:
+                self._store.enqueue_run_command(interrupt)
+
+    def _first_hard_cap_at(self, job: Job) -> datetime | None:
+        maximum = job.quota_budget.maximum
+        if maximum is None:
+            return None
+        samples = sorted(
+            (
+                sample
+                for run in self._store.list_runs(job.id)
+                for sample in self._store.list_usage_samples(run.id)
+            ),
+            key=lambda sample: (sample.observed_at, sample.id),
+        )
+        cumulative = 0.0
+        for sample in samples:
+            cumulative += sample.delta or 0
+            if cumulative >= maximum:
+                return sample.observed_at
+        return None
+
+    def _finalize_managed_observation(
+        self,
+        run: RunRecord,
+        observation: RunObservation,
+    ) -> Job:
+        job = self._store.get_job(run.job_id)
+        run = self._store.get_run(run.id)
+        if job.state not in {
+            JobState.RUNNING,
+            JobState.DRAINING,
+            JobState.CHECKPOINTED,
+        }:
+            return job
+        if observation.run_id != run.id:
+            raise LifecycleError("Managed observation belongs to another run")
+        result = observation.result
+        if result is None:
+            result = RunResult(
+                outcome=RunOutcome.FAILED,
+                summary="Codex ended without a terminal result",
+                metadata={"telemetry_valid": False},
+            )
+        result = self._trusted_workspace_result(run, result)
+        self._store.save_run(replace(run, result=result))
+
+        allocation = self._store.find_active_allocation(job.id)
+        if allocation is not None:
+            self._resources.release(allocation.id)
+
+        observed_cumulative = observation.normalized_cumulative_quota
+        matching_samples = [
+            sample
+            for sample in self._store.list_usage_samples(run.id)
+            if sample.thread_id == observation.thread_id
+            and sample.turn_id == observation.turn_id
+        ]
+        ledger_valid = observed_cumulative is not None and any(
+            sample.cumulative_quota == observed_cumulative
+            for sample in matching_samples
+        )
+        telemetry_valid = (
+            observation.telemetry_valid
+            and observation.usage is not None
+            and ledger_valid
+        )
+        if not telemetry_valid:
+            final_run = replace(
+                run,
+                state=RunState.SUSPENDED,
+                ended_at=utc_now(),
+                result=result,
+            )
+            self._store.save_run(final_run)
+            self._quota.begin_metering(
+                job.id,
+                reason=(
+                    "Codex turn ended without valid terminal token telemetry; "
+                    "acceptance blocked pending reconciliation"
+                ),
+            )
+            return self._store.get_job(job.id)
+
+        reservation = self._store.get_reservation(run.reservation_id)
+        self._quota.release(
+            reservation.id,
+            consumed=reservation.consumed,
+            cancelled=result.outcome is RunOutcome.CANCELLED,
+        )
+        commands = self._store.list_run_commands(run.id)
+        job_consumed = sum(
+            item.consumed for item in self._store.list_reservations(job.id)
+        )
+        suspension_requested = any(
+            command.action in {"checkpoint", "suspend"} for command in commands
+        ) or should_checkpoint_for_maximum(
+            job_consumed,
+            job.quota_budget.maximum,
+            self._usage_policy,
+        )
+        if suspension_requested:
+            return self._finalize_managed_suspension(job, run, result)
+
+        if result.outcome is RunOutcome.COMPLETED:
+            review, event = transition_job(
+                job,
+                JobState.REVIEW,
+                f"Codex turn {observation.turn_id} is ready for explicit review",
+            )
+            final_run = replace(
+                run,
+                state=RunState.SUSPENDED,
+                ended_at=utc_now(),
+                result=result,
+            )
+            self._store.save_job_and_run(review, event, final_run)
+            return review
+
+        target = (
+            JobState.CANCELLED
+            if result.outcome is RunOutcome.CANCELLED
+            else JobState.FAILED
+        )
+        final, event = transition_job(
+            job,
+            target,
+            f"Codex turn {observation.turn_id} reported {result.outcome.value}",
+        )
+        final_run = replace(
+            run,
+            state=(
+                RunState.CANCELLED
+                if result.outcome is RunOutcome.CANCELLED
+                else RunState.FAILED
+            ),
+            ended_at=utc_now(),
+            result=result,
+        )
+        self._store.save_job_and_run(final, event, final_run)
+        return final
+
+    def _finalize_managed_suspension(
+        self,
+        job: Job,
+        run: RunRecord,
+        result: RunResult,
+    ) -> Job:
+        capsule = self._capsule_from_result(result)
+        latest = self._store.latest_checkpoint(job.id)
+        if latest is None or latest.run_id != run.id or latest.capsule != capsule:
+            self._store.save_checkpoint(
+                Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
+            )
+
+        if job.state is JobState.RUNNING:
+            job, event = transition_job(
+                job,
+                JobState.DRAINING,
+                "Codex stopped at a control-plane safe boundary",
+            )
+            run = replace(run, state=RunState.DRAINING, result=result)
+            self._store.save_job_and_run(job, event, run)
+        if job.state is JobState.DRAINING:
+            job, event = transition_job(
+                job,
+                JobState.CHECKPOINTED,
+                "structured Codex checkpoint capsule persisted",
+            )
+            run = replace(run, state=RunState.CHECKPOINTED, result=result)
+            self._store.save_job_and_run(job, event, run)
+        suspended, event = transition_job(
+            job,
+            JobState.SUSPENDED,
+            "checkpoint complete; workspace retained and execution capacity released",
+        )
+        final_run = replace(
+            run,
+            state=RunState.SUSPENDED,
+            ended_at=utc_now(),
+            result=result,
+        )
+        self._store.save_job_and_run(suspended, event, final_run)
+        return suspended
+
+    def _trusted_workspace_result(
+        self,
+        run: RunRecord,
+        result: RunResult,
+    ) -> RunResult:
+        workspace = self._store.get_workspace(run.workspace_id)
+        current = self._workspaces.current_commit(workspace)
+        if result.commit is None or result.commit == current:
+            return replace(result, commit=current)
+        return replace(
+            result,
+            commit=current,
+            metadata={
+                **result.metadata,
+                "untrusted_reported_commit": result.commit,
+            },
+        )
+
+    @staticmethod
+    def _capsule_from_result(result: RunResult) -> ResumeCapsule:
+        def values(name: str) -> tuple[str, ...]:
+            raw = result.metadata.get(name)
+            if not isinstance(raw, list):
+                return ()
+            return tuple(str(item) for item in raw)
+
+        current = values("current") or ((result.summary,) if result.summary else ())
+        return ResumeCapsule(
+            completed=values("completed"),
+            current=current,
+            next_steps=values("next_steps"),
+            commit=result.commit,
+            known_failures=values("known_failures"),
+            decisions=values("decisions"),
+        )
+
+    def _abandon_unstarted_intent(self, job: Job, run: RunRecord) -> None:
+        result = RunResult(
+            outcome=RunOutcome.CANCELLED,
+            summary="managed driver session was never durably created",
+        )
+        cancelled_run = replace(
+            run,
+            state=RunState.CANCELLED,
+            ended_at=utc_now(),
+            result=result,
+        )
+        self._store.save_run(cancelled_run)
+        self._raise_cleanup_errors(
+            self._cleanup_job_resources(job.id, cancelled_run, completed=False)
+        )
+        target = JobState.READY if job.state is JobState.ADMITTED else JobState.FAILED
+        updated, event = transition_job(
+            job,
+            target,
+            "startup reconciliation found no durable managed-driver session",
+        )
+        self._store.save_job_and_run(updated, event, cancelled_run)
+
+    def _job_has_command(self, job_id: str, command_id: str) -> bool:
+        return any(
+            command.id == command_id
+            for run in self._store.list_runs(job_id)
+            for command in self._store.list_run_commands(run.id)
+        )
 
     def _select_backend(self, node_id: str) -> WorkerBackend | None:
         if self._backends is None:

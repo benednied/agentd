@@ -20,6 +20,7 @@ from agentd.domain.models import (
     WorkspaceLease,
 )
 from agentd.harness import DriverRegistry, FakeHarnessDriver, HarnessDriver
+from agentd.provisioning import RepositoryProvisioner
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 
@@ -83,6 +84,7 @@ def make_application_rig() -> Iterator[Callable[..., ApplicationRig]]:
         *,
         driver: HarnessDriver | None = None,
         workspaces: FakeWorkspaceManager | None = None,
+        provisioner: RepositoryProvisioner | None = None,
     ) -> ApplicationRig:
         store = SQLiteStateStore()
         stores.append(store)
@@ -101,6 +103,7 @@ def make_application_rig() -> Iterator[Callable[..., ApplicationRig]]:
             store,
             workspace_manager,
             DriverRegistry((harness,)),
+            provisioner=provisioner,
         )
         return ApplicationRig(
             store=store,

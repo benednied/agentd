@@ -1,0 +1,80 @@
+#!/usr/local/bin/python3
+"""Fail-closed Bubblewrap launcher for every agentd model-command sandbox."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+REAL_BWRAP = "/usr/bin/bwrap"
+CODEX_HOME = "/home/bened/.local/share/agentd/codex-home"
+STATE_HOME = "/home/bened/.local/state/agentd"
+WORKSPACE_ROOT = Path("/home/bened/.local/share/agentd/workspaces")
+AUDIT_ENV = "AGENTD_BWRAP_AUDIT_FILE"
+AUDIT_NAME = ".agentd-bwrap-invoked"
+AUDIT_VALUE = b"agentd-bwrap-wrapper-v1\n"
+
+
+def _record_preflight_invocation() -> None:
+    raw_path = os.environ.get(AUDIT_ENV)
+    if raw_path is None:
+        return
+    audit_path = Path(raw_path)
+    try:
+        relative = audit_path.relative_to(WORKSPACE_ROOT)
+    except ValueError as exc:
+        raise SystemExit("refusing an audit marker outside the workspace root") from exc
+    if (
+        len(relative.parts) != 2
+        or not relative.parts[0].startswith(".security-lease.")
+        or relative.parts[1] != AUDIT_NAME
+    ):
+        raise SystemExit("refusing an unexpected bwrap audit marker path")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(audit_path, flags, 0o600)
+    try:
+        os.write(descriptor, AUDIT_VALUE)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _wrapped_argv(arguments: list[str]) -> list[str]:
+    try:
+        command_separator = arguments.index("--")
+    except ValueError as exc:
+        raise SystemExit(
+            "agentd bwrap wrapper requires an explicit -- separator"
+        ) from exc
+    if "--share-net" in arguments[:command_separator]:
+        raise SystemExit("agentd bwrap wrapper refuses --share-net")
+    injected = [
+        "--unshare-net",
+        "--tmpfs",
+        CODEX_HOME,
+        "--tmpfs",
+        STATE_HOME,
+    ]
+    return [
+        REAL_BWRAP,
+        *arguments[:command_separator],
+        *injected,
+        *arguments[command_separator:],
+    ]
+
+
+def main() -> int:
+    wrapped_argv = _wrapped_argv(sys.argv[1:])
+    if not os.access(REAL_BWRAP, os.X_OK):
+        raise SystemExit(f"trusted Bubblewrap executable is unavailable: {REAL_BWRAP}")
+
+    _record_preflight_invocation()
+    os.execv(REAL_BWRAP, wrapped_argv)
+    raise AssertionError("os.execv unexpectedly returned")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

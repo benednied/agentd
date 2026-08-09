@@ -22,6 +22,7 @@ from agentd.domain.enums import (
     PreemptionPolicy,
     QoSClass,
     QuotaMode,
+    QuotaUnit,
     ReservationState,
     RunOutcome,
     RunState,
@@ -77,6 +78,9 @@ class EffortEstimate(Serializable):
     unit: str = "agent-minutes"
 
     def __post_init__(self) -> None:
+        values = (self.p50, self.p90, self.p99)
+        if any(value is not None and not isfinite(value) for value in values):
+            raise ValueError("Effort estimates must be finite")
         if self.p50 < 0 or self.p90 < self.p50:
             raise ValueError("Effort must satisfy 0 <= p50 <= p90")
         if self.p99 is not None and self.p99 < self.p90:
@@ -100,6 +104,7 @@ class QuotaBudget(Serializable):
     validation: float = 0
     maximum: float | None = None
     pool_id: str = "default"
+    unit: QuotaUnit = QuotaUnit.ABSTRACT
 
     def __post_init__(self) -> None:
         amounts = (
@@ -108,8 +113,10 @@ class QuotaBudget(Serializable):
             self.repair,
             self.validation,
         )
-        if any(amount < 0 for amount in amounts):
-            raise ValueError("Quota budget components cannot be negative")
+        if any(not isfinite(amount) or amount < 0 for amount in amounts):
+            raise ValueError("Quota budget components must be finite and non-negative")
+        if self.maximum is not None and not isfinite(self.maximum):
+            raise ValueError("Quota maximum must be finite")
         if self.maximum is not None and self.maximum < self.expected_path:
             raise ValueError("Quota maximum cannot be below the expected accepted path")
 
@@ -128,6 +135,147 @@ class QuotaBudget(Serializable):
                 float(data["maximum"]) if data.get("maximum") is not None else None
             ),
             pool_id=str(data.get("pool_id", "default")),
+            unit=QuotaUnit(data.get("unit", QuotaUnit.ABSTRACT)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage(Serializable):
+    """Cumulative token counters reported by a harness or provider.
+
+    Cached input and reasoning output are recorded as informative subsets of the
+    input/output totals and are therefore not added a second time by
+    :attr:`total_tokens`.
+    """
+
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        values = (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise TypeError("Token counters must be integers")
+        if min(values) < 0:
+            raise ValueError("Token counters cannot be negative")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("Cached input tokens cannot exceed input tokens")
+        if self.reasoning_output_tokens > self.output_tokens:
+            raise ValueError("Reasoning output tokens cannot exceed output tokens")
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def dominates(self, previous: TokenUsage) -> bool:
+        """Return whether every cumulative counter is monotonic."""
+
+        return all(
+            current >= prior
+            for current, prior in zip(
+                (
+                    self.input_tokens,
+                    self.cached_input_tokens,
+                    self.output_tokens,
+                    self.reasoning_output_tokens,
+                ),
+                (
+                    previous.input_tokens,
+                    previous.cached_input_tokens,
+                    previous.output_tokens,
+                    previous.reasoning_output_tokens,
+                ),
+                strict=True,
+            )
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TokenUsage:
+        return cls(
+            input_tokens=int(data.get("input_tokens", 0)),
+            cached_input_tokens=int(data.get("cached_input_tokens", 0)),
+            output_tokens=int(data.get("output_tokens", 0)),
+            reasoning_output_tokens=int(
+                data.get("reasoning_output_tokens", data.get("reasoning_tokens", 0))
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UsageSample(Serializable):
+    """Append-only cumulative usage reading for one run and source."""
+
+    run_id: str
+    thread_id: str
+    turn_id: str
+    sequence: int
+    cumulative_quota: float
+    unit: QuotaUnit = QuotaUnit.ABSTRACT
+    source: str = "driver"
+    tokens: TokenUsage | None = None
+    delta: float | None = None
+    id: str = field(default_factory=new_id)
+    observed_at: datetime = field(default_factory=utc_now)
+    provider_epoch: str | None = None
+    final: bool = False
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip():
+            raise ValueError("A usage sample requires a run identifier")
+        if not self.thread_id.strip() or not self.turn_id.strip():
+            raise ValueError("A usage sample requires thread and turn identifiers")
+        if self.sequence < 0:
+            raise ValueError("Usage sequence cannot be negative")
+        if not isfinite(self.cumulative_quota) or self.cumulative_quota < 0:
+            raise ValueError("Cumulative quota must be finite and non-negative")
+        if (
+            self.unit is QuotaUnit.TOKENS
+            and self.tokens is not None
+            and self.cumulative_quota != self.tokens.total_tokens
+        ):
+            raise ValueError(
+                "Token usage counters must equal the cumulative token quota"
+            )
+        if self.delta is not None and (
+            not isfinite(self.delta)
+            or self.delta < 0
+            or (self.delta == 0 and not self.final)
+        ):
+            raise ValueError(
+                "An applied usage delta must be positive, or zero for a final marker"
+            )
+        if not self.source.strip():
+            raise ValueError("A usage sample requires a source")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> UsageSample:
+        tokens = data.get("tokens")
+        return cls(
+            id=str(data["id"]),
+            run_id=str(data["run_id"]),
+            thread_id=str(data["thread_id"]),
+            turn_id=str(data["turn_id"]),
+            sequence=int(data["sequence"]),
+            cumulative_quota=float(data["cumulative_quota"]),
+            unit=QuotaUnit(data.get("unit", QuotaUnit.ABSTRACT)),
+            source=str(data.get("source", "driver")),
+            tokens=TokenUsage.from_dict(tokens) if isinstance(tokens, dict) else None,
+            delta=(float(data["delta"]) if data.get("delta") is not None else None),
+            observed_at=datetime.fromisoformat(str(data["observed_at"])),
+            provider_epoch=(
+                str(data["provider_epoch"]) if data.get("provider_epoch") else None
+            ),
+            final=bool(data.get("final", False)),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
@@ -217,6 +365,7 @@ class Job(Serializable):
     quota_budget: QuotaBudget
     effort: EffortEstimate
     id: str = field(default_factory=new_id)
+    base_ref: str = "HEAD"
     dependencies: tuple[str, ...] = ()
     priority: int = 0
     qos: QoSClass = QoSClass.NORMAL
@@ -241,6 +390,18 @@ class Job(Serializable):
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_ref, str):
+            raise TypeError("A job base ref must be a string")
+        stripped = self.base_ref.strip()
+        if (
+            not stripped
+            or stripped != self.base_ref
+            or stripped.startswith("-")
+            or "\0" in self.base_ref
+        ):
+            raise ValueError("A job base ref must be non-empty and not option-like")
+
     @property
     def terminal(self) -> bool:
         return self.state in {
@@ -256,6 +417,7 @@ class Job(Serializable):
             project=str(data["project"]),
             repository=str(data["repository"]),
             objective=str(data["objective"]),
+            base_ref=str(data.get("base_ref", "HEAD")),
             dependencies=tuple(str(item) for item in data.get("dependencies", [])),
             priority=int(data.get("priority", 0)),
             qos=QoSClass(data.get("qos", QoSClass.NORMAL)),
@@ -370,6 +532,8 @@ class QuotaPool(Serializable):
     provider: str
     remaining: float
     reserved: float = 0
+    debt: float = 0
+    unit: QuotaUnit = QuotaUnit.ABSTRACT
     reset_at: datetime | None = None
     reset_confidence: float = 0
     minimum_interactive_reserve: float = 0
@@ -377,14 +541,20 @@ class QuotaPool(Serializable):
     updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
-        if min(self.remaining, self.reserved, self.minimum_interactive_reserve) < 0:
-            raise ValueError("Quota values cannot be negative")
+        amounts = (
+            self.remaining,
+            self.reserved,
+            self.debt,
+            self.minimum_interactive_reserve,
+        )
+        if any(not isfinite(amount) or amount < 0 for amount in amounts):
+            raise ValueError("Quota values must be finite and non-negative")
         if not 0 <= self.reset_confidence <= 1:
             raise ValueError("Reset confidence must be between zero and one")
 
     @property
     def dispatchable(self) -> float:
-        return max(0, self.remaining - self.reserved)
+        return max(0, self.remaining - self.reserved - self.debt)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> QuotaPool:
@@ -393,6 +563,8 @@ class QuotaPool(Serializable):
             provider=str(data["provider"]),
             remaining=float(data["remaining"]),
             reserved=float(data.get("reserved", 0)),
+            debt=float(data.get("debt", 0)),
+            unit=QuotaUnit(data.get("unit", QuotaUnit.ABSTRACT)),
             reset_at=(
                 datetime.fromisoformat(str(data["reset_at"]))
                 if data.get("reset_at")
@@ -408,6 +580,122 @@ class QuotaPool(Serializable):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderQuotaSnapshot(Serializable):
+    """Raw ChatGPT quota-window observation for one provider limit bucket.
+
+    App Server exposes percentages and reset windows, not convertible token or
+    credit balances. Credits therefore remain opaque JSON and this record never
+    fabricates an absolute ``remaining`` value.
+    """
+
+    pool_id: str
+    bucket_id: str
+    provider: str = "openai-codex-chatgpt"
+    primary_used_percent: float | None = None
+    primary_window_minutes: int | None = None
+    primary_reset_at: datetime | None = None
+    secondary_used_percent: float | None = None
+    secondary_window_minutes: int | None = None
+    secondary_reset_at: datetime | None = None
+    reached: bool = False
+    credits_exhausted: bool | None = None
+    rate_limit_reached_type: str | None = None
+    plan_type: str | None = None
+    credits: JsonValue = None
+    rate_limit_reset_credits: JsonValue = None
+    id: str = field(default_factory=new_id)
+    observed_at: datetime = field(default_factory=utc_now)
+    confidence: float = 1
+    source: str = "codex-app-server"
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.pool_id.strip() or not self.bucket_id.strip():
+            raise ValueError("A provider snapshot requires pool and bucket identifiers")
+        for used_percent in (
+            self.primary_used_percent,
+            self.secondary_used_percent,
+        ):
+            if used_percent is not None and (
+                not isfinite(used_percent) or not 0 <= used_percent <= 100
+            ):
+                raise ValueError("Provider used percentages must be between 0 and 100")
+        for window in (
+            self.primary_window_minutes,
+            self.secondary_window_minutes,
+        ):
+            if window is not None and window <= 0:
+                raise ValueError("Provider window minutes must be positive")
+        if not 0 <= self.confidence <= 1:
+            raise ValueError(
+                "Provider snapshot confidence must be between zero and one"
+            )
+        if not self.source.strip():
+            raise ValueError("A provider snapshot requires a source")
+
+    @property
+    def reset_at(self) -> datetime | None:
+        resets = tuple(
+            reset
+            for reset in (self.primary_reset_at, self.secondary_reset_at)
+            if reset is not None
+        )
+        return min(resets) if resets else None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProviderQuotaSnapshot:
+        def optional_datetime(name: str) -> datetime | None:
+            return datetime.fromisoformat(str(data[name])) if data.get(name) else None
+
+        return cls(
+            id=str(data["id"]),
+            pool_id=str(data["pool_id"]),
+            bucket_id=str(data["bucket_id"]),
+            provider=str(data.get("provider", "openai-codex-chatgpt")),
+            primary_used_percent=(
+                float(data["primary_used_percent"])
+                if data.get("primary_used_percent") is not None
+                else None
+            ),
+            primary_window_minutes=(
+                int(data["primary_window_minutes"])
+                if data.get("primary_window_minutes") is not None
+                else None
+            ),
+            primary_reset_at=optional_datetime("primary_reset_at"),
+            secondary_used_percent=(
+                float(data["secondary_used_percent"])
+                if data.get("secondary_used_percent") is not None
+                else None
+            ),
+            secondary_window_minutes=(
+                int(data["secondary_window_minutes"])
+                if data.get("secondary_window_minutes") is not None
+                else None
+            ),
+            secondary_reset_at=optional_datetime("secondary_reset_at"),
+            reached=bool(data.get("reached", False)),
+            credits_exhausted=(
+                bool(data["credits_exhausted"])
+                if data.get("credits_exhausted") is not None
+                else None
+            ),
+            rate_limit_reached_type=(
+                str(data["rate_limit_reached_type"])
+                if data.get("rate_limit_reached_type")
+                else None
+            ),
+            plan_type=str(data["plan_type"]) if data.get("plan_type") else None,
+            credits=data.get("credits"),
+            rate_limit_reset_credits=data.get("rate_limit_reset_credits"),
+            observed_at=datetime.fromisoformat(str(data["observed_at"])),
+            confidence=float(data.get("confidence", 1)),
+            source=str(data.get("source", "codex-app-server")),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class QuotaReservation(Serializable):
     job_id: str
     pool_id: str
@@ -415,8 +703,21 @@ class QuotaReservation(Serializable):
     id: str = field(default_factory=new_id)
     state: ReservationState = ReservationState.ACTIVE
     consumed: float = 0
+    debt: float = 0
+    unit: QuotaUnit = QuotaUnit.ABSTRACT
     created_at: datetime = field(default_factory=utc_now)
     released_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if any(
+            not isfinite(amount) or amount < 0
+            for amount in (self.amount, self.consumed, self.debt)
+        ):
+            raise ValueError("Reservation amounts must be finite and non-negative")
+
+    @property
+    def outstanding(self) -> float:
+        return max(0, self.amount - self.consumed)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> QuotaReservation:
@@ -427,6 +728,8 @@ class QuotaReservation(Serializable):
             amount=float(data["amount"]),
             state=ReservationState(data.get("state", ReservationState.ACTIVE)),
             consumed=float(data.get("consumed", 0)),
+            debt=float(data.get("debt", 0)),
+            unit=QuotaUnit(data.get("unit", QuotaUnit.ABSTRACT)),
             created_at=datetime.fromisoformat(str(data["created_at"])),
             released_at=(
                 datetime.fromisoformat(str(data["released_at"]))
@@ -434,6 +737,21 @@ class QuotaReservation(Serializable):
                 else None
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class UsageApplication:
+    """Result of atomically applying one cumulative usage sample."""
+
+    sample: UsageSample
+    delta: float
+    duplicate: bool
+    reservation: QuotaReservation
+    pool: QuotaPool
+    job_consumed: float
+    maximum: float | None = None
+    maximum_exceeded: bool = False
+    debt_incurred: float = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,25 +920,141 @@ class RunHandle(Serializable):
 
 
 @dataclass(frozen=True, slots=True)
+class RunObservation(Serializable):
+    """SDK-neutral observation of a live or terminal harness run."""
+
+    run_id: str
+    thread_id: str
+    turn_id: str
+    cursor: str
+    terminal: bool = False
+    telemetry_valid: bool = True
+    usage: TokenUsage | None = None
+    cumulative_quota: float | None = None
+    unit: QuotaUnit = QuotaUnit.ABSTRACT
+    source: str = "driver"
+    run_state: RunState | None = None
+    result: RunResult | None = None
+    provider_epoch: str | None = None
+    observed_at: datetime = field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip():
+            raise ValueError("A run observation requires a run identifier")
+        if not self.thread_id.strip() or not self.turn_id.strip():
+            raise ValueError("A run observation requires thread and turn identifiers")
+        if not self.cursor.strip():
+            raise ValueError("A run observation requires a cursor")
+        if not self.source.strip():
+            raise ValueError("A run observation requires a source")
+        if self.cumulative_quota is not None and (
+            not isfinite(self.cumulative_quota) or self.cumulative_quota < 0
+        ):
+            raise ValueError(
+                "Observed cumulative quota must be finite and non-negative"
+            )
+        if self.result is not None and not self.terminal:
+            raise ValueError("A terminal result requires a terminal observation")
+
+    @property
+    def normalized_cumulative_quota(self) -> float | None:
+        if self.cumulative_quota is not None:
+            return self.cumulative_quota
+        if self.unit is QuotaUnit.TOKENS and self.usage is not None:
+            return float(self.usage.total_tokens)
+        return None
+
+    def to_usage_sample(self, sequence: int) -> UsageSample:
+        if not self.telemetry_valid:
+            raise ValueError("Invalid telemetry cannot become a usage sample")
+        cumulative = self.normalized_cumulative_quota
+        if cumulative is None:
+            raise ValueError("The observation has no normalized cumulative usage")
+        return UsageSample(
+            run_id=self.run_id,
+            thread_id=self.thread_id,
+            turn_id=self.turn_id,
+            sequence=sequence,
+            cumulative_quota=cumulative,
+            unit=self.unit,
+            source=self.source,
+            tokens=self.usage,
+            observed_at=self.observed_at,
+            provider_epoch=self.provider_epoch,
+            final=self.terminal,
+            metadata=self.metadata,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunObservation:
+        usage = data.get("usage")
+        run_state = data.get("run_state")
+        result = data.get("result")
+        return cls(
+            run_id=str(data["run_id"]),
+            thread_id=str(data["thread_id"]),
+            turn_id=str(data["turn_id"]),
+            cursor=str(data["cursor"]),
+            terminal=bool(data.get("terminal", False)),
+            telemetry_valid=bool(data.get("telemetry_valid", True)),
+            usage=TokenUsage.from_dict(usage) if isinstance(usage, dict) else None,
+            cumulative_quota=(
+                float(data["cumulative_quota"])
+                if data.get("cumulative_quota") is not None
+                else None
+            ),
+            unit=QuotaUnit(data.get("unit", QuotaUnit.ABSTRACT)),
+            source=str(data.get("source", "driver")),
+            run_state=RunState(run_state) if run_state is not None else None,
+            result=RunResult.from_dict(result) if isinstance(result, dict) else None,
+            provider_epoch=(
+                str(data["provider_epoch"]) if data.get("provider_epoch") else None
+            ),
+            observed_at=datetime.fromisoformat(str(data["observed_at"])),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult(Serializable):
     outcome: RunOutcome
     summary: str = ""
     commit: str | None = None
     consumed_quota: float = 0
     metadata: dict[str, JsonValue] = field(default_factory=dict)
+    usage: TokenUsage | None = None
 
     def __post_init__(self) -> None:
         if self.consumed_quota < 0 or not isfinite(self.consumed_quota):
             raise ValueError("Consumed quota must be finite and non-negative")
+        if self.usage is None:
+            raw_usage = self.metadata.get("usage")
+            token_keys = {
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "reasoning_output_tokens",
+            }
+            if isinstance(raw_usage, dict) and token_keys.intersection(raw_usage):
+                try:
+                    parsed = TokenUsage.from_dict(raw_usage)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    object.__setattr__(self, "usage", parsed)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunResult:
+        usage = data.get("usage")
         return cls(
             outcome=RunOutcome(data["outcome"]),
             summary=str(data.get("summary", "")),
             commit=str(data["commit"]) if data.get("commit") else None,
             consumed_quota=float(data.get("consumed_quota", 0)),
             metadata=dict(data.get("metadata", {})),
+            usage=TokenUsage.from_dict(usage) if isinstance(usage, dict) else None,
         )
 
 
@@ -672,6 +1106,110 @@ class RunRecord(Serializable):
                 else None
             ),
             result=(RunResult.from_dict(result_data) if result_data else None),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DriverSession(Serializable):
+    """Durable driver identity and observation watermark for one run."""
+
+    run_id: str
+    driver: str
+    id: str = field(default_factory=new_id)
+    external_id: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
+    observation_cursor: str | None = None
+    last_observation: RunObservation | None = None
+    active: bool = True
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip() or not self.driver.strip():
+            raise ValueError("A driver session requires run and driver identifiers")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DriverSession:
+        observation = data.get("last_observation")
+        return cls(
+            id=str(data["id"]),
+            run_id=str(data["run_id"]),
+            driver=str(data["driver"]),
+            external_id=(str(data["external_id"]) if data.get("external_id") else None),
+            thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            observation_cursor=(
+                str(data["observation_cursor"])
+                if data.get("observation_cursor")
+                else None
+            ),
+            last_observation=(
+                RunObservation.from_dict(observation)
+                if isinstance(observation, dict)
+                else None
+            ),
+            active=bool(data.get("active", True)),
+            metadata=dict(data.get("metadata", {})),
+            created_at=datetime.fromisoformat(str(data["created_at"])),
+            updated_at=datetime.fromisoformat(str(data["updated_at"])),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunCommand(Serializable):
+    """Durable scheduler-to-driver command."""
+
+    run_id: str
+    action: str
+    id: str = field(default_factory=new_id)
+    payload: dict[str, JsonValue] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip() or not self.action.strip():
+            raise ValueError("A run command requires run and action identifiers")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunCommand:
+        return cls(
+            id=str(data["id"]),
+            run_id=str(data["run_id"]),
+            action=str(data["action"]),
+            payload=dict(data.get("payload", {})),
+            created_at=datetime.fromisoformat(str(data["created_at"])),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunCommandAck(Serializable):
+    """Append-only acknowledgement for a durable run command."""
+
+    command_id: str
+    run_id: str
+    accepted: bool = True
+    detail: str = ""
+    observation_cursor: str | None = None
+    id: str = field(default_factory=new_id)
+    acknowledged_at: datetime = field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunCommandAck:
+        return cls(
+            id=str(data["id"]),
+            command_id=str(data["command_id"]),
+            run_id=str(data["run_id"]),
+            accepted=bool(data.get("accepted", True)),
+            detail=str(data.get("detail", "")),
+            observation_cursor=(
+                str(data["observation_cursor"])
+                if data.get("observation_cursor")
+                else None
+            ),
+            acknowledged_at=datetime.fromisoformat(str(data["acknowledged_at"])),
+            metadata=dict(data.get("metadata", {})),
         )
 
 

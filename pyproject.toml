@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "agentd contributors" }]
-dependencies = []
+dependencies = [
+    "openai-codex==0.144.4",
+]
 
 [dependency-groups]
 dev = [

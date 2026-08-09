@@ -12,14 +12,16 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
-from agentd.domain.enums import JobState, QoSClass
+from agentd.domain.enums import JobState, QoSClass, QuotaUnit
 from agentd.domain.models import (
     Checkpoint,
     ExecutionContract,
     Job,
+    ProviderQuotaSnapshot,
     QuotaPool,
     QuotaResetEvent,
     ResumeCapsule,
+    RunCommand,
     RunRecord,
     StateTransition,
     WorkerNode,
@@ -57,6 +59,17 @@ class LifecycleCoordinator(Protocol):
 
     async def complete(self, job_id: str) -> Job: ...
 
+    async def recover_managed_runs(self) -> None: ...
+
+    async def reconcile_managed_runs(
+        self,
+        snapshot: ProviderQuotaSnapshot | None = None,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[Job, ...]: ...
+
+    def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None: ...
+
     def execution_contract(self, run_id: str) -> ExecutionContract: ...
 
 
@@ -84,6 +97,11 @@ class ControlPlane:
     def submit(self, job: Job) -> Job:
         if job.state != JobState.BACKLOG:
             raise ValueError("A submitted job must start in BACKLOG")
+        if "codex" in job.allowed_harnesses:
+            if job.quota_budget.maximum is None:
+                raise ValueError("Codex jobs require a cumulative quota maximum")
+            if job.quota_budget.unit is not QuotaUnit.TOKENS:
+                raise ValueError("Codex jobs require a token-denominated quota budget")
         self._store.create_job(job, initial_transition(job))
         target = (
             JobState.PLANNING if job.qos == QoSClass.HORS_CATEGORIE else JobState.READY
@@ -177,6 +195,44 @@ class ControlPlane:
     def inspect_workspace(self, job_id: str) -> WorkspaceLease | None:
         return self._store.find_workspace(job_id)
 
+    def request_repair(self, job_id: str, instruction: str) -> RunCommand:
+        """Durably request one bounded same-thread repair from the daemon."""
+
+        if not instruction.strip():
+            raise ValueError("A repair request requires an instruction")
+        job = self._store.get_job(job_id)
+        if job.state is not JobState.REVIEW:
+            raise ValueError(f"Job {job_id} is not awaiting a repair decision")
+        run = self._store.latest_run(job_id)
+        if run is None:
+            raise ValueError(f"Job {job_id} has no durable run to repair")
+        pending = [
+            command
+            for command in self._store.list_pending_run_commands(run.id)
+            if command.action == "repair"
+        ]
+        if pending:
+            if pending[0].payload.get("instruction") != instruction.strip():
+                raise ValueError("A different repair request is already pending")
+            return pending[0]
+        session = self._store.get_driver_session(run.id)
+        raw_count = session.metadata.get("continuation_count", 0)
+        continuation_count = (
+            raw_count
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else 0
+        )
+        if continuation_count >= 2:
+            raise ValueError("The two-repair-turn limit has been reached")
+        command = RunCommand(
+            id=f"repair-turn:{job.id}:{continuation_count + 1}",
+            run_id=run.id,
+            action="repair",
+            payload={"instruction": instruction.strip()},
+        )
+        self._store.enqueue_run_command(command)
+        return command
+
     def runs(self, job_id: str) -> list[RunRecord]:
         return self._store.list_runs(job_id)
 
@@ -254,7 +310,29 @@ class ControlPlane:
     async def request_review(self, job_id: str) -> Job:
         return await self._lifecycle().request_review(job_id)
 
+    async def recover_managed_runs(self) -> None:
+        await self._lifecycle().recover_managed_runs()
+
+    async def reconcile_managed_runs(
+        self,
+        snapshot: ProviderQuotaSnapshot | None = None,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[Job, ...]:
+        return await self._lifecycle().reconcile_managed_runs(snapshot, at=at)
+
+    def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None:
+        self._lifecycle().apply_provider_snapshot(snapshot)
+
     async def complete(self, job_id: str) -> Job:
+        return await self._lifecycle().complete(job_id)
+
+    async def accept(self, job_id: str) -> Job:
+        """Explicitly accept a result that has already entered human review."""
+
+        job = self._store.get_job(job_id)
+        if job.state is not JobState.REVIEW:
+            raise ValueError(f"Job {job_id} is not awaiting review acceptance")
         return await self._lifecycle().complete(job_id)
 
     def assignment(self, run_id: str) -> ExecutionContract:

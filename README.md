@@ -9,8 +9,9 @@ workspace isolation, preemption, and lifecycle.
 > quota, preemption, and lifecycle.
 
 This repository is an executable local MVP, not a distributed production service.
-The implemented backend is a local process; SSH, containers, Kubernetes, Slurm,
-Claude, OpenClaw, and llama.cpp are extension points rather than current adapters.
+The implemented worker backend is a local process; SSH, container, Kubernetes,
+Slurm, Claude, OpenClaw, and llama.cpp workers are extension points rather than
+current adapters. The control plane itself has a reviewed container deployment.
 
 ## Implemented vertical slice
 
@@ -23,14 +24,17 @@ Claude, OpenClaw, and llama.cpp are extension points rather than current adapter
   interactive reserve and emergency-conservation admission.
 - Bounded reconnaissance child jobs for hors-categorie work and explicit promotion
   after a structured result.
-- Pure tail and reset/burn policies. Tail decisions are exposed through the Python
-  API; there is not yet a usage-monitor loop that applies them automatically.
+- Pure tail and reset/burn policies. Tail decisions remain an explicit Python API,
+  while the daemon now applies live Codex account and cumulative-token policies.
 - Exclusive Git branches/worktrees, lease validation, resume capsules, suspension,
   review, completion, and immutable commit fields for dependency handoffs.
-- Fake and Codex harness drivers behind a capability protocol, plus a local worker
-  backend.
-- A Python control-plane facade, run-scoped model API, administrative CLI, and
-  embeddable dispatch loop.
+- Fake, official Codex SDK/App Server, and legacy Codex CLI harness drivers behind
+  capability protocols, plus a local worker backend.
+- Durable Codex threads, streamed observations and token usage, restart recovery,
+  provider-window snapshots, durable command acknowledgement, and explicit
+  review/repair/acceptance handoffs.
+- A Python control-plane facade, run-scoped model API, operational CLI, and
+  continuously serving local daemon.
 
 The detailed component, lifecycle, and durability boundaries are in
 [docs/architecture.md](docs/architecture.md).
@@ -40,8 +44,16 @@ The detailed component, lifecycle, and durability boundaries are in
 - Python 3.12 or newer
 - [`uv`](https://docs.astral.sh/uv/)
 - Git, including `git worktree`
-- The [`codex` executable](https://learn.chatgpt.com/docs/developer-commands?surface=cli)
-  only when using `CodexDriver`
+- A Codex-authenticated, dedicated `CODEX_HOME` when running real Codex work
+- Bubblewrap and unprivileged user namespaces for the reviewed Linux service profile
+
+The primary `codex` driver uses the official Python SDK and its pinned App Server
+runtime; `uv sync --frozen` installs `openai-codex==0.144.4`, so it does not require
+a separately installed `codex` executable on `PATH`. A PATH-resolved executable is
+needed only for the optional legacy `codex-cli` driver. See the official
+[Codex SDK](https://learn.chatgpt.com/docs/codex-sdk) and
+[App Server](https://learn.chatgpt.com/docs/app-server) documentation for the
+underlying interfaces.
 
 From a checkout:
 
@@ -60,6 +72,11 @@ uv run ruff format --check .
 
 The test suite uses temporary Git repositories, SQLite, fake nodes/quota, and fake
 processes. It does not invoke an LLM or a real Codex process.
+
+The reviewed single-host container, user-systemd, SHA deployment/rollback, and
+security verification profile is documented in
+[docs/deployment.md](docs/deployment.md). Its normal test path is static and never
+contacts a deployment host or copies credentials.
 
 ## Local Python example
 
@@ -89,6 +106,7 @@ async def main() -> None:
         database=repository / ".agentd/state.sqlite",
         workspace_root=repository.parent / ".agentd-workspaces",
         include_codex_driver=False,
+        include_codex_cli_driver=False,
     ) as runtime:
         plane = runtime.control_plane
         plane.register_node(
@@ -149,10 +167,11 @@ attempt from controlling a newer one. Its six worker operations are
 for the same run. Refinement and blocker records are currently bounded in-memory
 records; checkpoints and job transitions are durable.
 
-## Administrative CLI
+## CLI and daemon
 
-The CLI initializes and inspects SQLite state and can submit jobs, nodes, and quota
-pools:
+The CLI initializes and inspects SQLite state, submits jobs, registers capacity,
+runs service preflights, starts the daemon, exposes the usage ledger and provider
+status, and handles review decisions. A fake-only setup is:
 
 ```bash
 uv run agentd --db .agentd/state.sqlite init
@@ -169,11 +188,65 @@ uv run agentd --db .agentd/state.sqlite submit \
 uv run agentd --db .agentd/state.sqlite jobs
 uv run agentd --db .agentd/state.sqlite job JOB_ID
 uv run agentd --db .agentd/state.sqlite history JOB_ID
+uv run agentd --db .agentd/state.sqlite usage --job JOB_ID
 ```
 
-The CLI is administrative only. It does not compose drivers/workspaces and has no
-dispatch, pause, resume, cancel, review, daemon, or reset-event subcommand. Use
-`create_local_runtime()` and `ControlPlane` for those lifecycle operations.
+For real Codex work, register a token-denominated local pool and a compatible node,
+and give every Codex job a cumulative maximum:
+
+```bash
+uv run agentd --db .agentd/state.sqlite register-quota codex \
+  --provider openai-codex-chatgpt --remaining 500000 \
+  --interactive-reserve 50000 --unit tokens
+uv run agentd --db .agentd/state.sqlite register-node local \
+  --cpu 8 --ram-gb 16 --harness codex
+uv run agentd --db .agentd/state.sqlite submit \
+  --project example \
+  --repository /absolute/path/to/a/git/repository \
+  --objective "Implement and validate the bounded change" \
+  --p50 25000 --p90 75000 --p99 100000 \
+  --quota 75000 --quota-maximum 100000 --quota-pool codex \
+  --harness codex --model-class gpt-5.6-terra \
+  --accept "Tests pass"
+```
+
+Run the preflight and continuous service with the same paths. `serve` enables the
+trusted workspace provisioner and Codex account-admission policy, recovers durable
+managed runs at startup, then polls account telemetry, reconciles live runs, and
+dispatches ready work until it receives `SIGINT` or `SIGTERM`:
+
+```bash
+uv run agentd \
+  --db .agentd/state.sqlite \
+  --workspace-root /absolute/path/to/agentd-workspaces \
+  --codex-home /absolute/path/to/dedicated-codex-home \
+  doctor
+uv run agentd \
+  --db .agentd/state.sqlite \
+  --workspace-root /absolute/path/to/agentd-workspaces \
+  --codex-home /absolute/path/to/dedicated-codex-home \
+  serve
+```
+
+Operational inspection and review commands include:
+
+```bash
+CODEX_HOME=/absolute/path/to/dedicated-codex-home \
+  uv run agentd --db .agentd/state.sqlite \
+  codex-status --pool codex --bucket codex
+uv run agentd --db .agentd/state.sqlite usage --run RUN_ID
+uv run agentd --db .agentd/state.sqlite repair JOB_ID \
+  --instruction "Address the review findings and rerun validation"
+uv run agentd --db .agentd/state.sqlite accept JOB_ID
+```
+
+The standalone `codex-status` command uses the process's `CODEX_HOME`; `serve`
+passes its configured `--codex-home` to both the driver and account oracle.
+`repair` durably queues a request for a job in `REVIEW`; the running daemon later
+reacquires policy-compliant quota and node capacity and starts the repair. `accept`
+finalizes an already persisted reviewed result. Pause, resume, cancellation,
+checkpoint creation, reconnaissance promotion, and reset-event injection remain
+Python `ControlPlane` operations rather than CLI subcommands.
 
 ## Fake and Codex drivers
 
@@ -181,32 +254,53 @@ dispatch, pause, resume, cancel, review, daemon, or reset-event subcommand. Use
 `RunResult`, records calls, and is intended for scheduler/application tests and
 safe local demonstrations.
 
-`create_local_runtime()` registers both fake and Codex drivers by default. To run a
-Codex job, the local `codex` binary must be installed, on `PATH`, and already
-authenticated/configured. Register a node with `harnesses={"codex"}` and submit a
-job with both `preferred_harnesses` and `allowed_harnesses` set to `("codex",)`.
+`create_local_runtime()` registers three drivers by default:
 
-`CodexDriver` launches `codex exec --json` without a shell, parses JSONL, and can
-deliver queued steering through `codex exec resume` when a session ID is reported.
-On POSIX, each run owns a new process session; completion, interruption, and
-cancellation terminate the full process group before resources are released.
-The default abstract model class, `standard`, leaves model choice to the user's
-Codex configuration. To opt into an explicit mapping:
+- `fake`: deterministic and in-process, for tests and safe demonstrations;
+- `codex`: the primary `CodexSdkDriver`, backed by the official Python SDK/App
+  Server; and
+- `codex-cli`: the legacy `CodexCliDriver`, backed by `codex exec --json`.
 
-```python
-from agentd.harness import CodexDriver
+The SDK driver is fixed to `gpt-5.6-terra` with reasoning effort `medium`. It starts
+or resumes a durable thread, streams turn and token-usage notifications, requires a
+strict structured review result, and sends steer, checkpoint, suspend, interrupt,
+and cancel commands through App Server. Only the leased worktree is writable;
+network access is disabled and additional toolchain roots are requested read-only.
+The worker receives the bounded `ExecutionContract`, never account percentages,
+quota scarcity, node details, or policy thresholds.
 
-runtime.drivers.register(
-    CodexDriver(
-        models=frozenset({"standard", "premium"}),
-        model_aliases={"premium": "your-codex-model"},
-    ),
-    replace=True,
-)
-```
+The supervisor persists the App Server thread/turn IDs, runtime versions,
+observation cursor, latest observation, usage samples, commands, and command
+acknowledgements. After a service restart it cannot attach to the old stdio
+transport or continue the exact interrupted turn. Instead, it opens a new App
+Server process, resumes the same durable Codex thread in the validated worktree,
+and starts a fresh recovery turn. The legacy `codex-cli` adapter remains
+process-local and does not provide this recovery or live metering path. The old
+`CodexDriver` Python import remains an alias for `CodexCliDriver` for compatibility.
 
-Live driver process/session objects are in memory. Persisted run handles are useful
-for audit, but the MVP cannot reattach to an active Codex process after restart.
+### Usage, account telemetry, and review
+
+App Server reports cumulative thread token totals. Agentd subtracts durable prior
+turn baselines, stores per-turn cumulative samples, and atomically charges only
+positive deltas. Exact event retries are free, and a distinct terminal marker can
+repeat the last reading without charging again. A terminal turn without valid
+matching usage enters `METERING_PENDING`; its reservation stays held and acceptance
+is blocked until metering is reconciled.
+
+Separately, `CodexAccountOracle` reads the App Server account rate-limit bucket and
+persists primary/secondary percentages, window lengths and reset times, reached
+state, plan type, and opaque credit fields. These provider percentages are policy
+signals, not token balances: agentd never converts them into the local pool's
+absolute `remaining` value. By default, fresh telemetry blocks background QoS at
+75% used, admits only interactive/blocker work at 90%, and blocks all new work when
+the limit or credits are exhausted. Stale telemetry admits only urgent work; a
+known reset within 12 hours may enable explicitly eligible pre-reset burn work.
+
+Successful SDK turns enter `REVIEW` after terminal usage is durable and scarce
+capacity is released. An operator can accept the persisted result or request up to
+two bounded repair turns. Each repair validates the retained worktree, reacquires
+capacity, resumes the same durable thread, and returns to `REVIEW`; token usage and
+the cumulative job maximum span the implementation and every repair turn.
 
 ## State ownership
 
@@ -217,28 +311,36 @@ plans automatically: callers create `Job` snapshots and structured reconnaissanc
 results through the Python API.
 
 SQLite owns control-plane execution records: job snapshots and transitions, nodes,
-resource allocations, quota pools/reservations, workspaces, runs/contracts, and
-checkpoints. Git owns source files, worker branches, commits, and uncommitted worker
-output. Agentd never merges a worker branch into the integration branch.
+resource allocations, quota pools/reservations, workspaces, runs/contracts,
+checkpoints, managed-driver sessions and observations, provider snapshots,
+append-only usage samples, and durable run commands/acknowledgements. Git owns
+source files, worker branches, commits, and uncommitted worker output. Agentd never
+merges a worker branch into the integration branch.
 
 ## MVP limitations
 
 - One local process, one SQLite database, one local-process worker backend, and no
-  distributed leader election or outbox/reconciler.
+  distributed leader election or transactional outbox.
 - No HTTP/JSON service, MCP transport, web UI, SSH/container/cloud backend, or
-  external quota-reset watcher.
-- No startup recovery or reattachment for live harness processes. SQLite retains
-  the run record, contract, and checkpoint, but not a usable process object.
-- Process-tree ownership is implemented for the local POSIX Codex path; a Windows
-  job-object implementation remains a future worker-backend concern.
+  general remote worker transport.
+- Startup recovery is specific to the managed SDK driver and resumes a durable
+  thread with a new App Server process and turn; it cannot reattach the previous
+  stdio transport. The legacy CLI adapter remains process-local.
+- The pinned SDK's generated schema does not retain the newer restricted-read
+  sandbox field. The reviewed Linux deployment therefore fails closed unless its
+  outer Bubblewrap wrapper and runtime canary prove auth/state unreadable,
+  worktree-only writes, and no model-command network route.
 - Dependency and gang readiness are implemented, but gang launch is not atomic and
   there is no persisted barrier aggregate.
-- Tail decisions and quota-reset events require an external caller; quota is an
-  abstract numeric estimate rather than live provider metering.
+- Tail-governor decisions and explicit reset events still require a caller. Codex
+  token metering and account-window polling are live, but provider percentages and
+  opaque credits cannot be converted into an absolute token balance.
 - `request_refinement` and `report_blocker` are not durable across process restart.
 - SQLite creates its schema in place; there is no versioned migration system yet.
-- There is no automated reviewer/integrator. `REVIEW` and acceptance are lifecycle
-  operations invoked by a caller.
+- There is no automated reviewer, merge, or integration policy. `REVIEW`, repair,
+  and acceptance require an operator or external caller.
+- Invalid terminal telemetry deliberately leaves a job in `METERING_PENDING`; the
+  MVP has no automated provider-side reconciliation for that state.
 - Commit handoff uses `RunResult.commit` or falls back to the workspace's current
   `HEAD`. That fallback does not prove the worker created a new commit or that an
   integrator accepted it.
@@ -251,10 +353,11 @@ src/agentd/
   scheduling/    pure readiness, priority, placement, tail, burn, reconnaissance
   state/         persistence protocol and SQLite implementation
   workspaces/    workspace protocol and Git worktree leases
-  harness/       driver protocol, fake driver, and Codex adapter
+  harness/       fake, SDK/App Server, legacy CLI drivers and run supervisor
+  runtime/       quota/resources plus account and cumulative-usage policy
   workers/       execution-backend protocol and local backend
   coordinator.py effectful admission, compensation, and lifecycle sequencing
   service.py     transport-independent control-plane facade
   agent_api.py   run-scoped model-facing protocol
-  daemon.py      asynchronous admission/dispatch loop
+  daemon.py      recovery, telemetry, reconciliation and dispatch loop
 ```

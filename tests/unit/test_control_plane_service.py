@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from agentd.domain.enums import JobState, QoSClass, TailAction
+from agentd.domain.enums import JobState, QoSClass, QuotaUnit, TailAction
 from agentd.domain.models import EffortEstimate, Job, QuotaBudget
 from agentd.domain.transitions import transition_job
 from agentd.scheduling.reconnaissance import ReconnaissanceOutcome
@@ -100,3 +100,40 @@ def test_backlog_degradation_and_tail_queries_are_explicit(
     assert degraded.minimum_model_class == "economy"
     assert requeued.state is JobState.READY
     assert plane.evaluate_tail(job.id, 21).action is TailAction.REESTIMATE
+
+
+def test_codex_submission_requires_token_maximum(
+    make_job: Callable[..., Job],
+) -> None:
+    store = SQLiteStateStore()
+    plane = ControlPlane(store)
+
+    with pytest.raises(ValueError, match="cumulative quota maximum"):
+        plane.submit(
+            make_job(
+                id="missing-maximum",
+                allowed_harnesses=("codex",),
+                quota_budget=QuotaBudget(10, unit=QuotaUnit.TOKENS),
+            )
+        )
+    with pytest.raises(ValueError, match="token-denominated"):
+        plane.submit(
+            make_job(
+                id="abstract-maximum",
+                allowed_harnesses=("codex",),
+                quota_budget=QuotaBudget(10, maximum=20),
+            )
+        )
+
+    submitted = plane.submit(
+        make_job(
+            id="valid-codex",
+            allowed_harnesses=("codex",),
+            quota_budget=QuotaBudget(
+                10,
+                maximum=20,
+                unit=QuotaUnit.TOKENS,
+            ),
+        )
+    )
+    assert submitted.state is JobState.READY

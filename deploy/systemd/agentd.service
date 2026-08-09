@@ -1,0 +1,30 @@
+[Unit]
+Description=agentd hardened container control plane
+Documentation=file:///home/bened/.local/share/agentd/current/docs/deployment.md
+After=docker.service
+ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd/current
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/current/deploy --env-file /home/bened/.local/share/agentd/current/release.env --file /home/bened/.local/share/agentd/current/deploy/compose.yaml config --quiet
+ExecStartPre=/home/bened/.local/share/agentd/current/deploy/scripts/check-container-security.sh /home/bened/.local/share/agentd/current/release.env runtime
+ExecStart=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/current/deploy --env-file /home/bened/.local/share/agentd/current/release.env --file /home/bened/.local/share/agentd/current/deploy/compose.yaml up --detach --remove-orphans --wait
+ExecReload=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/current/deploy --env-file /home/bened/.local/share/agentd/current/release.env --file /home/bened/.local/share/agentd/current/deploy/compose.yaml up --detach --remove-orphans --wait
+ExecStop=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/current/deploy --env-file /home/bened/.local/share/agentd/current/release.env --file /home/bened/.local/share/agentd/current/deploy/compose.yaml down --remove-orphans --timeout 45
+TimeoutStartSec=10min
+TimeoutStopSec=2min
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/bened/.local/state/agentd /home/bened/.local/share/agentd
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

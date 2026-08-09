@@ -1,0 +1,13 @@
+# Nonsecret policy for the dedicated agentd Codex home.
+# The runtime preflight verifies the effective sandbox instead of trusting this
+# file alone.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
+exclude_tmpdir_env_var = true
+exclude_slash_tmp = true
+
+[analytics]
+enabled = false

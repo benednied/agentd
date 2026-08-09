@@ -3,14 +3,23 @@
 from dataclasses import replace
 from math import isfinite
 
-from agentd.domain.enums import QoSClass, QuotaMode, ReservationState
+from agentd.domain.enums import (
+    JobState,
+    QoSClass,
+    QuotaMode,
+    QuotaUnit,
+    ReservationState,
+)
 from agentd.domain.models import (
     Job,
     QuotaPool,
     QuotaReservation,
     QuotaResetEvent,
+    UsageApplication,
+    UsageSample,
     utc_now,
 )
+from agentd.domain.transitions import transition_job
 from agentd.state.base import ConcurrentStateError, StateStore
 
 _MAX_OPTIMISTIC_ATTEMPTS = 8
@@ -18,6 +27,17 @@ _MAX_OPTIMISTIC_ATTEMPTS = 8
 
 class QuotaAdmissionError(RuntimeError):
     pass
+
+
+class QuotaMaximumExceeded(RuntimeError):
+    """Raised after a sample is durably charged beyond its cumulative maximum."""
+
+    def __init__(self, application: UsageApplication) -> None:
+        self.application = application
+        super().__init__(
+            f"Cumulative usage {application.job_consumed:g} exceeds maximum "
+            f"{application.maximum:g}"
+        )
 
 
 class QuotaManager:
@@ -39,6 +59,10 @@ class QuotaManager:
                 return existing
 
             pool = self._store.get_quota_pool(job.quota_budget.pool_id)
+            if job.quota_budget.unit is not pool.unit:
+                raise QuotaAdmissionError(
+                    f"Job {job.id} budget unit does not match pool {pool.id}"
+                )
             available = self.available_for(job, pool)
             if pool.mode == QuotaMode.EMERGENCY_CONSERVE and job.qos not in {
                 QoSClass.INTERACTIVE,
@@ -56,6 +80,7 @@ class QuotaManager:
                 job_id=job.id,
                 pool_id=pool.id,
                 amount=required,
+                unit=pool.unit,
             )
             updated_pool = replace(
                 pool,
@@ -93,10 +118,13 @@ class QuotaManager:
         conflict: ConcurrentStateError | None = None
         for _attempt in range(_MAX_OPTIMISTIC_ATTEMPTS):
             reservation = self._store.get_reservation(reservation_id)
-            if reservation.state != ReservationState.ACTIVE:
+            if reservation.state in {
+                ReservationState.RELEASED,
+                ReservationState.CANCELLED,
+            }:
                 return reservation
             pool = self._store.get_quota_pool(reservation.pool_id)
-            unreserved = pool.reserved - reservation.amount
+            unreserved = pool.reserved - reservation.outstanding
             if unreserved < -1e-9:
                 raise ConcurrentStateError(
                     f"Pool {pool.id} reserves less than reservation {reservation.id}"
@@ -105,16 +133,21 @@ class QuotaManager:
                 ReservationState.CANCELLED if cancelled else ReservationState.RELEASED
             )
             now = utc_now()
+            final_consumed = max(consumed, reservation.consumed)
+            delta = final_consumed - reservation.consumed
+            debt_delta = max(0, delta - pool.remaining)
             updated_reservation = replace(
                 reservation,
                 state=state,
-                consumed=consumed,
+                consumed=final_consumed,
+                debt=reservation.debt + debt_delta,
                 released_at=now,
             )
             updated_pool = replace(
                 pool,
-                remaining=max(0, pool.remaining - consumed),
+                remaining=max(0, pool.remaining - delta),
                 reserved=max(0, unreserved),
+                debt=pool.debt + debt_delta,
                 updated_at=now,
             )
             try:
@@ -133,6 +166,95 @@ class QuotaManager:
             f"Could not release reservation {reservation_id} after concurrent updates"
         ) from conflict
 
+    def apply_usage(
+        self,
+        sample: UsageSample,
+        *,
+        maximum: float | None = None,
+    ) -> UsageApplication:
+        """Atomically persist and charge one cumulative run usage sample."""
+
+        run = self._store.get_run(sample.run_id)
+        job = self._store.get_job(run.job_id)
+        effective_maximum = job.quota_budget.maximum if maximum is None else maximum
+        return self._store.apply_usage_sample(
+            sample,
+            maximum=effective_maximum,
+        )
+
+    def apply_codex_usage(self, sample: UsageSample) -> UsageApplication:
+        """Charge Codex token telemetry and enforce the cumulative job maximum.
+
+        The sample is committed before :class:`QuotaMaximumExceeded` is raised so
+        an over-limit turn can never disappear from accounting during shutdown.
+        """
+
+        if sample.unit is not QuotaUnit.TOKENS:
+            raise ValueError("Codex cumulative usage must use token quota units")
+        application = self.apply_usage(sample)
+        if application.maximum_exceeded:
+            raise QuotaMaximumExceeded(application)
+        return application
+
+    def top_up(self, reservation_id: str, amount: float) -> QuotaReservation:
+        """Reserve additional future headroom without charging it as usage."""
+
+        reservation = self._store.get_reservation(reservation_id)
+        job = self._store.get_job(reservation.job_id)
+        pool = self._store.get_quota_pool(reservation.pool_id)
+        minimum_dispatchable = (
+            0
+            if job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}
+            else pool.minimum_interactive_reserve
+        )
+        return self._store.top_up_quota(
+            reservation_id,
+            amount,
+            minimum_dispatchable=minimum_dispatchable,
+        )
+
+    def begin_metering(
+        self,
+        job_id: str,
+        *,
+        reason: str = "run quiesced; final usage reconciliation pending",
+    ) -> QuotaReservation:
+        """Atomically enter the durable job/reservation metering phase."""
+
+        job = self._store.get_job(job_id)
+        if job.state not in {
+            JobState.RUNNING,
+            JobState.DRAINING,
+            JobState.CHECKPOINTED,
+            JobState.REVIEW,
+        }:
+            raise ValueError(f"Job {job_id} cannot begin metering from {job.state}")
+        reservation = self._store.find_active_reservation(job_id)
+        if reservation is None:
+            raise LookupError(f"Job {job_id} has no outstanding reservation")
+        pending, event = transition_job(job, JobState.METERING_PENDING, reason)
+        return self._store.begin_metering(pending, event, reservation.id)
+
+    def settle(
+        self,
+        reservation_id: str,
+        *,
+        final_sample: UsageSample | None = None,
+        cancelled: bool = False,
+        maximum: float | None = None,
+    ) -> QuotaReservation:
+        """Apply optional final telemetry and release unused reserved headroom."""
+
+        reservation = self._store.get_reservation(reservation_id)
+        job = self._store.get_job(reservation.job_id)
+        effective_maximum = job.quota_budget.maximum if maximum is None else maximum
+        return self._store.settle_quota_usage(
+            reservation_id,
+            final_sample=final_sample,
+            cancelled=cancelled,
+            maximum=effective_maximum,
+        )
+
     @staticmethod
     def _validate_existing(
         job: Job,
@@ -143,6 +265,7 @@ class QuotaManager:
             reservation.job_id != job.id
             or reservation.pool_id != job.quota_budget.pool_id
             or reservation.amount != required
+            or reservation.unit is not job.quota_budget.unit
         ):
             raise QuotaAdmissionError(
                 f"Job {job.id} already has an incompatible active reservation"

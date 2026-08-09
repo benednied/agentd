@@ -28,6 +28,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         {
             JobState.DRAINING,
             JobState.CHECKPOINTED,
+            JobState.METERING_PENDING,
             JobState.REVIEW,
             JobState.COMPLETED,
             JobState.FAILED,
@@ -38,6 +39,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         {
             JobState.RUNNING,
             JobState.CHECKPOINTED,
+            JobState.METERING_PENDING,
             JobState.FAILED,
             JobState.CANCELLED,
         }
@@ -45,7 +47,15 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.CHECKPOINTED: frozenset(
         {
             JobState.RUNNING,
+            JobState.METERING_PENDING,
             JobState.SUSPENDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }
+    ),
+    JobState.METERING_PENDING: frozenset(
+        {
+            JobState.REVIEW,
             JobState.FAILED,
             JobState.CANCELLED,
         }
@@ -56,6 +66,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.REVIEW: frozenset(
         {
             JobState.RUNNING,
+            JobState.METERING_PENDING,
             JobState.COMPLETED,
             JobState.FAILED,
             JobState.CANCELLED,

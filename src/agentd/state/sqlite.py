@@ -10,6 +10,7 @@ import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import replace
+from math import isfinite
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -22,15 +23,23 @@ from agentd.domain.enums import (
 )
 from agentd.domain.models import (
     Checkpoint,
+    DriverSession,
     Job,
+    ProviderQuotaSnapshot,
     QuotaPool,
     QuotaReservation,
     ResourceAllocation,
+    RunCommand,
+    RunCommandAck,
+    RunObservation,
     RunRecord,
     Serializable,
     StateTransition,
+    UsageApplication,
+    UsageSample,
     WorkerNode,
     WorkspaceLease,
+    utc_now,
 )
 from agentd.domain.transitions import InvalidStateTransition, can_transition
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
@@ -127,6 +136,67 @@ CREATE INDEX IF NOT EXISTS idx_reservations_job
     ON quota_reservations(job_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_job_active
     ON quota_reservations(job_id) WHERE state = 'ACTIVE';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_job_outstanding
+    ON quota_reservations(job_id)
+    WHERE state IN ('ACTIVE', 'METERING_PENDING');
+
+CREATE TABLE IF NOT EXISTS usage_samples (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    reservation_id TEXT NOT NULL REFERENCES quota_reservations(id),
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    cumulative_quota REAL NOT NULL,
+    delta REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE(run_id, thread_id, turn_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_run
+    ON usage_samples(run_id, observed_at, sequence);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_job
+    ON usage_samples(job_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS driver_sessions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+    driver TEXT NOT NULL,
+    observation_cursor TEXT,
+    active INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_quota_snapshots (
+    id TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL REFERENCES quota_pools(id),
+    bucket_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_snapshots_pool
+    ON provider_quota_snapshots(pool_id, observed_at, id);
+
+CREATE TABLE IF NOT EXISTS run_commands (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    action TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_commands_pending
+    ON run_commands(run_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS run_command_acks (
+    id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL UNIQUE REFERENCES run_commands(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    acknowledged_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
 """
 
 
@@ -552,6 +622,8 @@ class SQLiteStateStore:
                         pool,
                         remaining=current.remaining,
                         reserved=current.reserved,
+                        debt=current.debt,
+                        unit=current.unit,
                         reset_at=current.reset_at,
                         reset_confidence=current.reset_confidence,
                         mode=current.mode,
@@ -577,6 +649,8 @@ class SQLiteStateStore:
 
         if expected_pool.id != updated_pool.id:
             raise ValueError("Quota pool identifiers must agree")
+        if expected_pool.unit is not updated_pool.unit:
+            raise ValueError("A quota pool mutation cannot change units")
         if expected_pool.reserved != updated_pool.reserved:
             raise ValueError("A pool mutation cannot change reserved quota")
         with self._lock:
@@ -630,12 +704,19 @@ class SQLiteStateStore:
         if (
             expected_pool.id != updated_pool.id
             or reservation.pool_id != expected_pool.id
+            or expected_pool.unit is not updated_pool.unit
+            or reservation.unit is not expected_pool.unit
         ):
-            raise ValueError("Reservation and pool identifiers must agree")
+            raise ValueError("Reservation and pool identifiers/units must agree")
         if reservation.state is not ReservationState.ACTIVE:
             raise ValueError("A new quota reservation must be active")
         if updated_pool.reserved != expected_pool.reserved + reservation.amount:
             raise ValueError("Updated pool quota does not match the reservation")
+        if (
+            updated_pool.remaining != expected_pool.remaining
+            or updated_pool.debt != expected_pool.debt
+        ):
+            raise ValueError("Reservation cannot charge or forgive quota")
 
         with self._lock:
             self._begin()
@@ -693,16 +774,35 @@ class SQLiteStateStore:
             or released_reservation.job_id != expected_reservation.job_id
             or released_reservation.pool_id != expected_reservation.pool_id
             or released_reservation.amount != expected_reservation.amount
+            or released_reservation.unit is not expected_reservation.unit
+            or expected_reservation.unit is not expected_pool.unit
+            or updated_pool.unit is not expected_pool.unit
         ):
             raise ValueError("Released reservation must preserve its ownership")
-        if expected_reservation.state is not ReservationState.ACTIVE:
-            raise ValueError("Only an active reservation can be released")
-        if released_reservation.state is ReservationState.ACTIVE:
-            raise ValueError("Released reservation cannot remain active")
+        if expected_reservation.state not in {
+            ReservationState.ACTIVE,
+            ReservationState.METERING_PENDING,
+        }:
+            raise ValueError("Only an outstanding reservation can be released")
+        if released_reservation.state in {
+            ReservationState.ACTIVE,
+            ReservationState.METERING_PENDING,
+        }:
+            raise ValueError("Released reservation cannot remain outstanding")
         if updated_pool.reserved != max(
-            0, expected_pool.reserved - expected_reservation.amount
+            0, expected_pool.reserved - expected_reservation.outstanding
         ):
             raise ValueError("Updated pool quota does not match the release")
+        delta = released_reservation.consumed - expected_reservation.consumed
+        if delta < 0:
+            raise ValueError("Final consumption cannot move backwards")
+        debt_delta = max(0, delta - expected_pool.remaining)
+        if (
+            updated_pool.remaining != max(0, expected_pool.remaining - delta)
+            or updated_pool.debt != expected_pool.debt + debt_delta
+            or released_reservation.debt != expected_reservation.debt + debt_delta
+        ):
+            raise ValueError("Updated pool quota does not match final consumption")
 
         with self._lock:
             self._begin()
@@ -735,10 +835,15 @@ class SQLiteStateStore:
         return _load(row["payload"], QuotaReservation.from_dict)
 
     def find_active_reservation(self, job_id: str) -> QuotaReservation | None:
+        outstanding = (
+            ReservationState.ACTIVE.value,
+            ReservationState.METERING_PENDING.value,
+        )
         rows = self._all(
             "SELECT payload FROM quota_reservations "
-            "WHERE job_id = ? AND state = ? ORDER BY created_at DESC LIMIT 1",
-            (job_id, ReservationState.ACTIVE.value),
+            "WHERE job_id = ? AND state IN (?, ?) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (job_id, *outstanding),
         )
         return _load(rows[0]["payload"], QuotaReservation.from_dict) if rows else None
 
@@ -753,6 +858,370 @@ class SQLiteStateStore:
             _load(row["payload"], QuotaReservation.from_dict)
             for row in self._all(query, args)
         ]
+
+    def apply_usage_sample(
+        self,
+        sample: UsageSample,
+        *,
+        maximum: float | None = None,
+    ) -> UsageApplication:
+        """Append and charge one cumulative sample in the same transaction.
+
+        Event identity is ``(run, thread, turn, sequence)``. Exact retries return
+        the existing application without charging twice; conflicting or
+        non-monotonic readings are rejected.
+        """
+
+        if maximum is not None and (not isfinite(maximum) or maximum < 0):
+            raise ValueError("A usage maximum must be finite and non-negative")
+        with self._lock:
+            self._begin()
+            try:
+                application = self._apply_usage_sample_in_transaction(
+                    sample,
+                    maximum=maximum,
+                )
+                self._commit()
+                return application
+            except BaseException:
+                self._rollback()
+                raise
+
+    def _apply_usage_sample_in_transaction(
+        self,
+        sample: UsageSample,
+        *,
+        maximum: float | None,
+    ) -> UsageApplication:
+        run_row = self._connection.execute(
+            "SELECT job_id, payload FROM runs WHERE id = ?", (sample.run_id,)
+        ).fetchone()
+        if run_row is None:
+            raise EntityNotFoundError(f"Run {sample.run_id} does not exist")
+        run = _load(run_row["payload"], RunRecord.from_dict)
+        job_row = self._connection.execute(
+            "SELECT state, payload FROM jobs WHERE id = ?", (run.job_id,)
+        ).fetchone()
+        if job_row is None:
+            raise EntityNotFoundError(f"Job {run.job_id} does not exist")
+        job = _load(job_row["payload"], Job.from_dict)
+        configured_maximum = job.quota_budget.maximum
+        if configured_maximum is not None and (
+            maximum is None or configured_maximum < maximum
+        ):
+            maximum = configured_maximum
+        duplicate_row = self._connection.execute(
+            "SELECT payload FROM usage_samples WHERE run_id = ? AND thread_id = ? "
+            "AND turn_id = ? AND sequence = ?",
+            (sample.run_id, sample.thread_id, sample.turn_id, sample.sequence),
+        ).fetchone()
+        if duplicate_row is not None:
+            stored = _load(duplicate_row["payload"], UsageSample.from_dict)
+            if not self._same_usage_reading(stored, sample):
+                raise ConcurrentStateError(
+                    "Usage sequence already contains a different reading"
+                )
+            reservation = self._reservation_for_usage(
+                run.reservation_id,
+                run.job_id,
+            )
+            pool = self._pool_for_usage(reservation)
+            job_consumed = self._job_consumed(run.job_id)
+            return UsageApplication(
+                sample=stored,
+                delta=0,
+                duplicate=True,
+                reservation=reservation,
+                pool=pool,
+                job_consumed=job_consumed,
+                maximum=maximum,
+                maximum_exceeded=(maximum is not None and job_consumed >= maximum),
+            )
+        job_state = JobState(job_row["state"])
+        if job_state not in {JobState.RUNNING, JobState.METERING_PENDING}:
+            raise ValueError(
+                f"Job {run.job_id} cannot accept telemetry while {job_state}"
+            )
+
+        reservation = self._reservation_for_usage(run.reservation_id, run.job_id)
+        if reservation.state not in {
+            ReservationState.ACTIVE,
+            ReservationState.METERING_PENDING,
+        }:
+            raise ValueError("Telemetry requires an outstanding quota reservation")
+        pool = self._pool_for_usage(reservation)
+        if sample.unit is not reservation.unit or sample.unit is not pool.unit:
+            raise ValueError("Usage, reservation, and pool quota units must agree")
+
+        previous_row = self._connection.execute(
+            "SELECT payload FROM usage_samples WHERE run_id = ? AND thread_id = ? "
+            "AND turn_id = ? ORDER BY sequence DESC LIMIT 1",
+            (sample.run_id, sample.thread_id, sample.turn_id),
+        ).fetchone()
+        previous = (
+            _load(previous_row["payload"], UsageSample.from_dict)
+            if previous_row is not None
+            else None
+        )
+        if previous is not None and sample.sequence <= previous.sequence:
+            raise ConcurrentStateError("Usage samples must have increasing sequences")
+        previous_cumulative = previous.cumulative_quota if previous is not None else 0
+        delta = sample.cumulative_quota - previous_cumulative
+        if delta < 0 or (delta == 0 and (not sample.final or previous is None)):
+            raise ValueError(
+                "A new usage sample must contribute a positive delta, unless it "
+                "is a final marker for existing cumulative usage"
+            )
+        if (
+            previous is not None
+            and previous.tokens is not None
+            and sample.tokens is not None
+            and not sample.tokens.dominates(previous.tokens)
+        ):
+            raise ValueError("Cumulative token counters cannot move backwards")
+
+        outstanding = reservation.outstanding
+        reserved_charge = min(delta, outstanding)
+        if pool.reserved + 1e-9 < reserved_charge:
+            raise ConcurrentStateError(
+                f"Pool {pool.id} reserves less than usage reservation {reservation.id}"
+            )
+        debt_incurred = max(0, delta - pool.remaining)
+        applied = replace(sample, delta=delta)
+        updated_reservation = replace(
+            reservation,
+            consumed=reservation.consumed + delta,
+            debt=reservation.debt + debt_incurred,
+        )
+        updated_pool = replace(
+            pool,
+            remaining=max(0, pool.remaining - delta),
+            reserved=max(0, pool.reserved - reserved_charge),
+            debt=pool.debt + debt_incurred,
+            updated_at=utc_now(),
+        )
+        self._connection.execute(
+            "INSERT INTO usage_samples("
+            "id, run_id, reservation_id, job_id, thread_id, turn_id, source, "
+            "sequence, cumulative_quota, delta, observed_at, payload"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                applied.id,
+                applied.run_id,
+                reservation.id,
+                reservation.job_id,
+                applied.thread_id,
+                applied.turn_id,
+                applied.source,
+                applied.sequence,
+                applied.cumulative_quota,
+                delta,
+                applied.observed_at.isoformat(),
+                _dump(applied),
+            ),
+        )
+        self._connection.execute(
+            "UPDATE quota_reservations SET payload = ? WHERE id = ?",
+            (_dump(updated_reservation), reservation.id),
+        )
+        self._connection.execute(
+            "UPDATE quota_pools SET payload = ? WHERE id = ?",
+            (_dump(updated_pool), pool.id),
+        )
+        job_consumed = self._job_consumed(
+            run.job_id,
+            replacement=updated_reservation,
+        )
+        return UsageApplication(
+            sample=applied,
+            delta=delta,
+            duplicate=False,
+            reservation=updated_reservation,
+            pool=updated_pool,
+            job_consumed=job_consumed,
+            maximum=maximum,
+            maximum_exceeded=maximum is not None and job_consumed >= maximum,
+            debt_incurred=debt_incurred,
+        )
+
+    def list_usage_samples(self, run_id: str) -> list[UsageSample]:
+        return [
+            _load(row["payload"], UsageSample.from_dict)
+            for row in self._all(
+                "SELECT payload FROM usage_samples WHERE run_id = ? "
+                "ORDER BY observed_at, thread_id, turn_id, sequence",
+                (run_id,),
+            )
+        ]
+
+    def top_up_quota(
+        self,
+        reservation_id: str,
+        amount: float,
+        *,
+        minimum_dispatchable: float = 0,
+    ) -> QuotaReservation:
+        if not isfinite(amount) or amount <= 0:
+            raise ValueError("A reservation top-up must be finite and positive")
+        if not isfinite(minimum_dispatchable) or minimum_dispatchable < 0:
+            raise ValueError(
+                "Minimum dispatchable quota must be finite and non-negative"
+            )
+        with self._lock:
+            self._begin()
+            try:
+                reservation = self._reservation_for_usage(reservation_id)
+                if reservation.state is not ReservationState.ACTIVE:
+                    raise ValueError("Only an active reservation can be topped up")
+                pool = self._pool_for_usage(reservation)
+                updated_reservation = replace(
+                    reservation,
+                    amount=reservation.amount + amount,
+                )
+                additional_outstanding = (
+                    updated_reservation.outstanding - reservation.outstanding
+                )
+                if pool.dispatchable - additional_outstanding < minimum_dispatchable:
+                    raise ConcurrentStateError(
+                        f"Pool {pool.id} has insufficient dispatchable quota"
+                    )
+                updated_pool = replace(
+                    pool,
+                    reserved=pool.reserved + additional_outstanding,
+                    updated_at=utc_now(),
+                )
+                self._connection.execute(
+                    "UPDATE quota_reservations SET payload = ? WHERE id = ?",
+                    (_dump(updated_reservation), reservation.id),
+                )
+                self._connection.execute(
+                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                    (_dump(updated_pool), pool.id),
+                )
+                self._commit()
+                return updated_reservation
+            except BaseException:
+                self._rollback()
+                raise
+
+    def begin_metering(
+        self,
+        job: Job,
+        transition: StateTransition,
+        reservation_id: str,
+    ) -> QuotaReservation:
+        if job.state is not JobState.METERING_PENDING:
+            raise ValueError("Metering must transition the job to METERING_PENDING")
+        with self._lock:
+            self._begin()
+            try:
+                reservation = self._reservation_for_usage(reservation_id, job.id)
+                if reservation.state is not ReservationState.ACTIVE:
+                    raise ValueError("Only an active reservation can begin metering")
+                self._save_job_in_transaction(job, transition)
+                pending = replace(
+                    reservation,
+                    state=ReservationState.METERING_PENDING,
+                )
+                self._connection.execute(
+                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                    (pending.state.value, _dump(pending), pending.id),
+                )
+                self._commit()
+                return pending
+            except BaseException:
+                self._rollback()
+                raise
+
+    def settle_quota_usage(
+        self,
+        reservation_id: str,
+        *,
+        final_sample: UsageSample | None = None,
+        cancelled: bool = False,
+        maximum: float | None = None,
+    ) -> QuotaReservation:
+        if maximum is not None and (not isfinite(maximum) or maximum < 0):
+            raise ValueError("A usage maximum must be finite and non-negative")
+        if final_sample is not None and not final_sample.final:
+            raise ValueError("A final settlement sample must be marked final")
+        with self._lock:
+            self._begin()
+            try:
+                reservation = self._reservation_for_usage(reservation_id)
+                if reservation.state in {
+                    ReservationState.RELEASED,
+                    ReservationState.CANCELLED,
+                }:
+                    self._commit()
+                    return reservation
+                if reservation.state is not ReservationState.METERING_PENDING:
+                    raise ValueError("Final settlement requires METERING_PENDING")
+                job_row = self._connection.execute(
+                    "SELECT state FROM jobs WHERE id = ?", (reservation.job_id,)
+                ).fetchone()
+                if job_row is None:
+                    raise EntityNotFoundError(
+                        f"Job {reservation.job_id} does not exist"
+                    )
+                if JobState(job_row["state"]) is not JobState.METERING_PENDING:
+                    raise ValueError("Final telemetry requires a metering-pending job")
+                if final_sample is not None:
+                    run = self._connection.execute(
+                        "SELECT payload FROM runs WHERE id = ?", (final_sample.run_id,)
+                    ).fetchone()
+                    if run is None:
+                        raise EntityNotFoundError(
+                            f"Run {final_sample.run_id} does not exist"
+                        )
+                    if (
+                        _load(run["payload"], RunRecord.from_dict).reservation_id
+                        != reservation.id
+                    ):
+                        raise ValueError(
+                            "Final sample belongs to another quota reservation"
+                        )
+                    self._apply_usage_sample_in_transaction(
+                        final_sample,
+                        maximum=maximum,
+                    )
+                    reservation = self._reservation_for_usage(reservation_id)
+
+                pool = self._pool_for_usage(reservation)
+                outstanding = reservation.outstanding
+                if pool.reserved + 1e-9 < outstanding:
+                    raise ConcurrentStateError(
+                        f"Pool {pool.id} reserves less than reservation "
+                        f"{reservation.id}"
+                    )
+                state = (
+                    ReservationState.CANCELLED
+                    if cancelled
+                    else ReservationState.RELEASED
+                )
+                settled = replace(
+                    reservation,
+                    state=state,
+                    released_at=utc_now(),
+                )
+                updated_pool = replace(
+                    pool,
+                    reserved=max(0, pool.reserved - outstanding),
+                    updated_at=utc_now(),
+                )
+                self._connection.execute(
+                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                    (settled.state.value, _dump(settled), settled.id),
+                )
+                self._connection.execute(
+                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                    (_dump(updated_pool), pool.id),
+                )
+                self._commit()
+                return settled
+            except BaseException:
+                self._rollback()
+                raise
 
     def save_workspace(self, workspace: WorkspaceLease) -> None:
         self._upsert(
@@ -904,6 +1373,345 @@ class SQLiteStateStore:
             _load(row["payload"], RunRecord.from_dict) for row in self._all(query, args)
         ]
 
+    def save_driver_session(self, session: DriverSession) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                run_row = self._connection.execute(
+                    "SELECT payload FROM runs WHERE id = ?", (session.run_id,)
+                ).fetchone()
+                if run_row is None:
+                    raise EntityNotFoundError(f"Run {session.run_id} does not exist")
+                run = _load(run_row["payload"], RunRecord.from_dict)
+                if run.driver != session.driver:
+                    raise ValueError("Driver session belongs to another driver")
+                existing_row = self._connection.execute(
+                    "SELECT payload FROM driver_sessions WHERE run_id = ?",
+                    (session.run_id,),
+                ).fetchone()
+                registered = session
+                if existing_row is not None:
+                    existing = _load(existing_row["payload"], DriverSession.from_dict)
+                    if existing.driver != session.driver:
+                        raise ValueError("Driver session cannot change ownership")
+                    registered = replace(
+                        session,
+                        id=existing.id,
+                        created_at=existing.created_at,
+                    )
+                self._execute_upsert(
+                    "driver_sessions",
+                    registered.id,
+                    (
+                        "run_id",
+                        "driver",
+                        "observation_cursor",
+                        "active",
+                        "updated_at",
+                        "payload",
+                    ),
+                    (
+                        registered.run_id,
+                        registered.driver,
+                        registered.observation_cursor,
+                        int(registered.active),
+                        registered.updated_at.isoformat(),
+                        _dump(registered),
+                    ),
+                    immutable_columns=("run_id", "driver"),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def get_driver_session(self, run_id: str) -> DriverSession:
+        row = self._one(
+            "SELECT payload FROM driver_sessions WHERE run_id = ?",
+            (run_id,),
+            "Driver session for run",
+        )
+        return _load(row["payload"], DriverSession.from_dict)
+
+    def list_driver_sessions(
+        self,
+        active: bool | None = None,
+    ) -> list[DriverSession]:
+        query = "SELECT payload FROM driver_sessions"
+        args: tuple[object, ...] = ()
+        if active is not None:
+            query += " WHERE active = ?"
+            args = (int(active),)
+        query += " ORDER BY updated_at, id"
+        return [
+            _load(row["payload"], DriverSession.from_dict)
+            for row in self._all(query, args)
+        ]
+
+    def update_observation_cursor(
+        self,
+        run_id: str,
+        expected_cursor: str | None,
+        cursor: str,
+        observation: RunObservation | None = None,
+    ) -> DriverSession:
+        if not cursor.strip():
+            raise ValueError("An observation cursor cannot be empty")
+        if observation is not None and (
+            observation.run_id != run_id or observation.cursor != cursor
+        ):
+            raise ValueError("Observation cursor and run identifiers must agree")
+        with self._lock:
+            self._begin()
+            try:
+                row = self._connection.execute(
+                    "SELECT payload FROM driver_sessions WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is None:
+                    raise EntityNotFoundError(
+                        f"Driver session for run {run_id} does not exist"
+                    )
+                session = _load(row["payload"], DriverSession.from_dict)
+                if session.observation_cursor != expected_cursor:
+                    raise ConcurrentStateError(
+                        f"Observation cursor for run {run_id} changed concurrently"
+                    )
+                updated = replace(
+                    session,
+                    observation_cursor=cursor,
+                    thread_id=(
+                        observation.thread_id
+                        if observation is not None
+                        else session.thread_id
+                    ),
+                    turn_id=(
+                        observation.turn_id
+                        if observation is not None
+                        else session.turn_id
+                    ),
+                    last_observation=observation or session.last_observation,
+                    active=(
+                        not observation.terminal
+                        if observation is not None
+                        else session.active
+                    ),
+                    updated_at=utc_now(),
+                )
+                self._connection.execute(
+                    "UPDATE driver_sessions SET observation_cursor = ?, active = ?, "
+                    "updated_at = ?, payload = ? WHERE run_id = ?",
+                    (
+                        updated.observation_cursor,
+                        int(updated.active),
+                        updated.updated_at.isoformat(),
+                        _dump(updated),
+                        run_id,
+                    ),
+                )
+                self._commit()
+                return updated
+            except BaseException:
+                self._rollback()
+                raise
+
+    def append_provider_quota_snapshot(
+        self,
+        snapshot: ProviderQuotaSnapshot,
+    ) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM quota_pools WHERE id = ?", (snapshot.pool_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise EntityNotFoundError(
+                        f"Quota pool {snapshot.pool_id} does not exist"
+                    )
+                existing = self._connection.execute(
+                    "SELECT payload FROM provider_quota_snapshots WHERE id = ?",
+                    (snapshot.id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        _load(existing["payload"], ProviderQuotaSnapshot.from_dict)
+                        != snapshot
+                    ):
+                        raise ConcurrentStateError(
+                            f"Provider snapshot {snapshot.id} already differs"
+                        )
+                    self._commit()
+                    return
+                self._connection.execute(
+                    "INSERT INTO provider_quota_snapshots("
+                    "id, pool_id, bucket_id, observed_at, payload"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        snapshot.id,
+                        snapshot.pool_id,
+                        snapshot.bucket_id,
+                        snapshot.observed_at.isoformat(),
+                        _dump(snapshot),
+                    ),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def latest_provider_quota_snapshot(
+        self,
+        pool_id: str,
+        bucket_id: str | None = None,
+    ) -> ProviderQuotaSnapshot | None:
+        snapshots = self.list_provider_quota_snapshots(pool_id, bucket_id)
+        return snapshots[-1] if snapshots else None
+
+    def list_provider_quota_snapshots(
+        self,
+        pool_id: str,
+        bucket_id: str | None = None,
+    ) -> list[ProviderQuotaSnapshot]:
+        query = "SELECT payload FROM provider_quota_snapshots WHERE pool_id = ?"
+        args: tuple[object, ...] = (pool_id,)
+        if bucket_id is not None:
+            query += " AND bucket_id = ?"
+            args = (pool_id, bucket_id)
+        query += " ORDER BY observed_at, id"
+        return [
+            _load(row["payload"], ProviderQuotaSnapshot.from_dict)
+            for row in self._all(query, args)
+        ]
+
+    def enqueue_run_command(self, command: RunCommand) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM runs WHERE id = ?", (command.run_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise EntityNotFoundError(f"Run {command.run_id} does not exist")
+                existing = self._connection.execute(
+                    "SELECT payload FROM run_commands WHERE id = ?", (command.id,)
+                ).fetchone()
+                if existing is not None:
+                    if not self._same_run_command(
+                        _load(existing["payload"], RunCommand.from_dict),
+                        command,
+                    ):
+                        raise ConcurrentStateError(
+                            f"Run command {command.id} already differs"
+                        )
+                    self._commit()
+                    return
+                self._connection.execute(
+                    "INSERT INTO run_commands(id, run_id, action, created_at, payload) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        command.id,
+                        command.run_id,
+                        command.action,
+                        command.created_at.isoformat(),
+                        _dump(command),
+                    ),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def list_run_commands(self, run_id: str) -> list[RunCommand]:
+        return [
+            _load(row["payload"], RunCommand.from_dict)
+            for row in self._all(
+                "SELECT payload FROM run_commands WHERE run_id = ? "
+                "ORDER BY created_at, id",
+                (run_id,),
+            )
+        ]
+
+    def list_pending_run_commands(
+        self,
+        run_id: str | None = None,
+    ) -> list[RunCommand]:
+        query = (
+            "SELECT commands.payload FROM run_commands AS commands "
+            "LEFT JOIN run_command_acks AS acks ON acks.command_id = commands.id "
+            "WHERE acks.command_id IS NULL"
+        )
+        args: tuple[object, ...] = ()
+        if run_id is not None:
+            query += " AND commands.run_id = ?"
+            args = (run_id,)
+        query += (
+            " ORDER BY CASE commands.action "
+            "WHEN 'checkpoint' THEN 0 WHEN 'suspend' THEN 1 "
+            "WHEN 'steer' THEN 2 WHEN 'repair' THEN 3 "
+            "WHEN 'interrupt' THEN 4 WHEN 'cancel' THEN 5 ELSE 6 END, "
+            "commands.created_at, commands.id"
+        )
+        return [
+            _load(row["payload"], RunCommand.from_dict)
+            for row in self._all(query, args)
+        ]
+
+    def acknowledge_run_command(self, acknowledgement: RunCommandAck) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                command_row = self._connection.execute(
+                    "SELECT run_id FROM run_commands WHERE id = ?",
+                    (acknowledgement.command_id,),
+                ).fetchone()
+                if command_row is None:
+                    raise EntityNotFoundError(
+                        f"Run command {acknowledgement.command_id} does not exist"
+                    )
+                if command_row["run_id"] != acknowledgement.run_id:
+                    raise ValueError("Command acknowledgement belongs to another run")
+                existing = self._connection.execute(
+                    "SELECT payload FROM run_command_acks WHERE command_id = ?",
+                    (acknowledgement.command_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        _load(existing["payload"], RunCommandAck.from_dict)
+                        != acknowledgement
+                    ):
+                        raise ConcurrentStateError(
+                            "Run command already has a different acknowledgement"
+                        )
+                    self._commit()
+                    return
+                self._connection.execute(
+                    "INSERT INTO run_command_acks("
+                    "id, command_id, run_id, acknowledged_at, payload"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        acknowledgement.id,
+                        acknowledgement.command_id,
+                        acknowledgement.run_id,
+                        acknowledgement.acknowledged_at.isoformat(),
+                        _dump(acknowledgement),
+                    ),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def get_run_command_ack(self, command_id: str) -> RunCommandAck | None:
+        rows = self._all(
+            "SELECT payload FROM run_command_acks WHERE command_id = ?",
+            (command_id,),
+        )
+        return _load(rows[0]["payload"], RunCommandAck.from_dict) if rows else None
+
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         with self._lock:
             self._begin()
@@ -1037,6 +1845,85 @@ class SQLiteStateStore:
             raise ConcurrentStateError(
                 f"Reservation {expected.id} changed concurrently"
             )
+
+    def _reservation_for_usage(
+        self,
+        reservation_id: str,
+        job_id: str | None = None,
+    ) -> QuotaReservation:
+        row = self._connection.execute(
+            "SELECT payload FROM quota_reservations WHERE id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise EntityNotFoundError(
+                f"Quota reservation {reservation_id} does not exist"
+            )
+        reservation = _load(row["payload"], QuotaReservation.from_dict)
+        if job_id is not None and reservation.job_id != job_id:
+            raise ValueError("Quota reservation belongs to another job")
+        return reservation
+
+    def _pool_for_usage(self, reservation: QuotaReservation) -> QuotaPool:
+        row = self._connection.execute(
+            "SELECT payload FROM quota_pools WHERE id = ?",
+            (reservation.pool_id,),
+        ).fetchone()
+        if row is None:
+            raise EntityNotFoundError(
+                f"Quota pool {reservation.pool_id} does not exist"
+            )
+        pool = _load(row["payload"], QuotaPool.from_dict)
+        if pool.unit is not reservation.unit:
+            raise ValueError("Quota pool and reservation units do not agree")
+        return pool
+
+    @staticmethod
+    def _same_usage_reading(stored: UsageSample, incoming: UsageSample) -> bool:
+        return (
+            stored.run_id == incoming.run_id
+            and stored.thread_id == incoming.thread_id
+            and stored.turn_id == incoming.turn_id
+            and stored.sequence == incoming.sequence
+            and stored.cumulative_quota == incoming.cumulative_quota
+            and stored.unit is incoming.unit
+            and stored.source == incoming.source
+            and stored.tokens == incoming.tokens
+            and stored.provider_epoch == incoming.provider_epoch
+            and stored.final == incoming.final
+            and stored.metadata == incoming.metadata
+        )
+
+    @staticmethod
+    def _same_run_command(stored: RunCommand, incoming: RunCommand) -> bool:
+        return (
+            stored.id == incoming.id
+            and stored.run_id == incoming.run_id
+            and stored.action == incoming.action
+            and stored.payload == incoming.payload
+        )
+
+    def _job_consumed(
+        self,
+        job_id: str,
+        *,
+        replacement: QuotaReservation | None = None,
+    ) -> float:
+        rows = self._connection.execute(
+            "SELECT payload FROM quota_reservations WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        total = 0.0
+        replaced = False
+        for row in rows:
+            reservation = _load(row["payload"], QuotaReservation.from_dict)
+            if replacement is not None and reservation.id == replacement.id:
+                reservation = replacement
+                replaced = True
+            total += reservation.consumed
+        if replacement is not None and not replaced:
+            total += replacement.consumed
+        return total
 
     def _one(
         self, query: str, args: tuple[object, ...], entity_name: str

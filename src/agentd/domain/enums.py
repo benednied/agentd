@@ -25,6 +25,7 @@ class JobState(StrEnum):
     RUNNING = "RUNNING"
     DRAINING = "DRAINING"
     CHECKPOINTED = "CHECKPOINTED"
+    METERING_PENDING = "METERING_PENDING"
     SUSPENDED = "SUSPENDED"
     REVIEW = "REVIEW"
     COMPLETED = "COMPLETED"
@@ -65,8 +66,16 @@ class QuotaMode(StrEnum):
 
 class ReservationState(StrEnum):
     ACTIVE = "ACTIVE"
+    METERING_PENDING = "METERING_PENDING"
     RELEASED = "RELEASED"
     CANCELLED = "CANCELLED"
+
+
+class QuotaUnit(StrEnum):
+    """Dimension used by a quota pool and its normalized usage samples."""
+
+    ABSTRACT = "abstract"
+    TOKENS = "tokens"
 
 
 class WorkspaceState(StrEnum):

@@ -90,7 +90,7 @@ class _CodexRun:
     collect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-class CodexDriver:
+class CodexCliDriver:
     """Run execution contracts through ``codex exec`` without a shell."""
 
     def __init__(
@@ -136,7 +136,7 @@ class CodexDriver:
         if self._process_group_signals and os.name != "posix":
             raise ValueError("Process-group signalling requires a POSIX platform")
         self._capabilities = HarnessCapabilities(
-            name="codex",
+            name="codex-cli",
             models=models,
             features=frozenset(
                 {
@@ -450,7 +450,8 @@ class CodexDriver:
     def _state(self, run: RunHandle) -> _CodexRun:
         if run.driver != self._capabilities.name:
             raise UnknownRunError(
-                f"Run {run.id!r} belongs to driver {run.driver!r}, not 'codex'"
+                f"Run {run.id!r} belongs to driver {run.driver!r}, not "
+                f"{self._capabilities.name!r}"
             )
         try:
             return self._runs[run.id]
@@ -577,3 +578,8 @@ def _merge_usage(
             target[key] = previous + value
         elif isinstance(value, (str, int, float, bool)) or value is None:
             target[key] = value
+
+
+# Keep the original import working while reserving the ``codex`` capability
+# name for the SDK/App Server driver.
+CodexDriver = CodexCliDriver

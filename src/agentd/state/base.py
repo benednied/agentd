@@ -5,12 +5,19 @@ from typing import Protocol
 from agentd.domain.enums import JobState
 from agentd.domain.models import (
     Checkpoint,
+    DriverSession,
     Job,
+    ProviderQuotaSnapshot,
     QuotaPool,
     QuotaReservation,
     ResourceAllocation,
+    RunCommand,
+    RunCommandAck,
+    RunObservation,
     RunRecord,
     StateTransition,
+    UsageApplication,
+    UsageSample,
     WorkerNode,
     WorkspaceLease,
 )
@@ -118,6 +125,39 @@ class StateStore(Protocol):
         self, job_id: str | None = None
     ) -> list[QuotaReservation]: ...
 
+    def apply_usage_sample(
+        self,
+        sample: UsageSample,
+        *,
+        maximum: float | None = None,
+    ) -> UsageApplication: ...
+
+    def list_usage_samples(self, run_id: str) -> list[UsageSample]: ...
+
+    def top_up_quota(
+        self,
+        reservation_id: str,
+        amount: float,
+        *,
+        minimum_dispatchable: float = 0,
+    ) -> QuotaReservation: ...
+
+    def begin_metering(
+        self,
+        job: Job,
+        transition: StateTransition,
+        reservation_id: str,
+    ) -> QuotaReservation: ...
+
+    def settle_quota_usage(
+        self,
+        reservation_id: str,
+        *,
+        final_sample: UsageSample | None = None,
+        cancelled: bool = False,
+        maximum: float | None = None,
+    ) -> QuotaReservation: ...
+
     def save_workspace(self, workspace: WorkspaceLease) -> None: ...
 
     def get_workspace(self, workspace_id: str) -> WorkspaceLease: ...
@@ -135,6 +175,50 @@ class StateStore(Protocol):
     def latest_run(self, job_id: str) -> RunRecord | None: ...
 
     def list_runs(self, job_id: str | None = None) -> list[RunRecord]: ...
+
+    def save_driver_session(self, session: DriverSession) -> None: ...
+
+    def get_driver_session(self, run_id: str) -> DriverSession: ...
+
+    def list_driver_sessions(
+        self, active: bool | None = None
+    ) -> list[DriverSession]: ...
+
+    def update_observation_cursor(
+        self,
+        run_id: str,
+        expected_cursor: str | None,
+        cursor: str,
+        observation: RunObservation | None = None,
+    ) -> DriverSession: ...
+
+    def append_provider_quota_snapshot(
+        self, snapshot: ProviderQuotaSnapshot
+    ) -> None: ...
+
+    def latest_provider_quota_snapshot(
+        self,
+        pool_id: str,
+        bucket_id: str | None = None,
+    ) -> ProviderQuotaSnapshot | None: ...
+
+    def list_provider_quota_snapshots(
+        self,
+        pool_id: str,
+        bucket_id: str | None = None,
+    ) -> list[ProviderQuotaSnapshot]: ...
+
+    def enqueue_run_command(self, command: RunCommand) -> None: ...
+
+    def list_run_commands(self, run_id: str) -> list[RunCommand]: ...
+
+    def list_pending_run_commands(
+        self, run_id: str | None = None
+    ) -> list[RunCommand]: ...
+
+    def acknowledge_run_command(self, acknowledgement: RunCommandAck) -> None: ...
+
+    def get_run_command_ack(self, command_id: str) -> RunCommandAck | None: ...
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None: ...
 

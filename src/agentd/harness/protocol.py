@@ -6,6 +6,7 @@ from agentd.domain.models import (
     ExecutionContract,
     HarnessCapabilities,
     RunHandle,
+    RunObservation,
     RunResult,
 )
 
@@ -25,3 +26,23 @@ class HarnessDriver(Protocol):
     async def collect(self, run: RunHandle) -> RunResult: ...
 
     async def cancel(self, run: RunHandle) -> None: ...
+
+
+@runtime_checkable
+class ManagedHarnessDriver(HarnessDriver, Protocol):
+    """Durable, observable driver used by restartable service runtimes."""
+
+    async def start_managed(
+        self,
+        run_id: str,
+        execution: ExecutionContract,
+    ) -> RunHandle: ...
+
+    async def recover(
+        self,
+        run_id: str,
+        execution: ExecutionContract,
+        recovery_instruction: str = "Resume from the durable thread and workspace.",
+    ) -> RunHandle: ...
+
+    def observe(self, run_id: str) -> RunObservation | None: ...
