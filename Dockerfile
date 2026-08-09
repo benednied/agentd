@@ -13,6 +13,7 @@ RUN npm install --global --omit=dev "@openai/codex@${CODEX_VERSION}" \
 
 FROM ${PYTHON_IMAGE} AS builder
 COPY --from=uv-runtime /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/opt/agentd/venv
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
@@ -67,7 +68,7 @@ RUN apt-get update \
 
 COPY --from=bwrap-compat-builder --chown=0:0 --chmod=0555 \
     /build/bwrap /usr/bin/bwrap
-COPY --from=builder /build/.venv /opt/agentd/venv
+COPY --from=builder /opt/agentd/venv /opt/agentd/venv
 RUN ln -s \
         /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
         /usr/libexec/agentd/codex-linux-sandbox \

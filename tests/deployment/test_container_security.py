@@ -248,6 +248,8 @@ def test_dockerfile_keeps_runtime_tools_and_never_embeds_credentials() -> None:
     assert "uidmap" in dockerfile
     assert "FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-runtime" in dockerfile
     assert "COPY --from=uv-runtime /uv /usr/local/bin/uv" in dockerfile
+    assert "ENV UV_PROJECT_ENVIRONMENT=/opt/agentd/venv" in dockerfile
+    assert "COPY --from=builder /opt/agentd/venv /opt/agentd/venv" in dockerfile
     assert "COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv" in dockerfile
     assert 'UV_CACHE_DIR="/home/bened/.cache/uv"' in dockerfile
     assert 'PATH="/opt/agentd/venv/bin:' in dockerfile
@@ -418,6 +420,9 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert "require_helper_rewrite=True" in preflight
     assert "allow_additional_device_rewrites=True" in preflight
     assert "CODEX_HELPER_ALIASES" in preflight
+    assert 'AGENTD_ENTRYPOINT = Path("/opt/agentd/venv/bin/agentd")' in preflight
+    assert 'b"#!/opt/agentd/venv/bin/python"' in preflight
+    assert 'b"#!/opt/agentd/venv/bin/python3"' in preflight
     assert "secrets.token_hex(16)" in preflight
     assert "_run_codex_generated_command_probe(worktree)" in preflight
     assert "shutil.copyfile(PAYLOAD, workspace_payload)" in preflight

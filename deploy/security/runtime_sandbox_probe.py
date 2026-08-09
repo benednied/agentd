@@ -34,6 +34,7 @@ BWRAP_AUDIT_TOKEN_ENV = "AGENTD_BWRAP_AUDIT_TOKEN"
 PAYLOAD = Path("/opt/agentd/security/sandbox_payload.py")
 EXPECTED_CONFIG = Path("/opt/agentd/security/config.toml")
 PERMISSION_PROFILE = "agentd-workspace"
+AGENTD_ENTRYPOINT = Path("/opt/agentd/venv/bin/agentd")
 CODEX_HELPER_ALIASES = tuple(
     Path("/usr/libexec/agentd") / name
     for name in (
@@ -57,6 +58,7 @@ def _require_runtime_layout() -> None:
         (BWRAP_AUDIT_DIRECTORY, "bubblewrap audit directory"),
         (PAYLOAD, "sandbox probe payload"),
         (EXPECTED_CONFIG, "image-pinned Codex config.toml"),
+        (AGENTD_ENTRYPOINT, "agentd service entrypoint"),
     ):
         if not path.exists():
             raise RuntimeError(f"missing {description}: {path}")
@@ -82,7 +84,7 @@ def _require_runtime_layout() -> None:
         raise RuntimeError(
             "dedicated Codex config.toml differs from the image-pinned policy"
         )
-    for path in (BWRAP, REAL_BWRAP, PAYLOAD, EXPECTED_CONFIG):
+    for path in (BWRAP, REAL_BWRAP, PAYLOAD, EXPECTED_CONFIG, AGENTD_ENTRYPOINT):
         metadata = path.stat()
         if metadata.st_uid != 0 or metadata.st_gid != 0:
             raise RuntimeError(f"image security artifact has unexpected owner: {path}")
@@ -99,6 +101,13 @@ def _require_runtime_layout() -> None:
             raise RuntimeError(f"security executable is not executable: {executable}")
     if BWRAP.samefile(REAL_BWRAP):
         raise RuntimeError("bubblewrap compatibility shim aliases the real binary")
+    if AGENTD_ENTRYPOINT.read_bytes().splitlines()[0] not in {
+        b"#!/opt/agentd/venv/bin/python",
+        b"#!/opt/agentd/venv/bin/python3",
+    }:
+        raise RuntimeError(
+            "agentd entrypoint does not use the final runtime interpreter"
+        )
     runtime = bundled_codex_path()
     for alias in CODEX_HELPER_ALIASES:
         metadata = alias.lstat()
