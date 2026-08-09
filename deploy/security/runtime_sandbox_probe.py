@@ -153,6 +153,7 @@ def _require_bwrap_rewrite_audit(
     description: str,
     *,
     require_helper_rewrite: bool,
+    allow_additional_device_rewrites: bool = False,
 ) -> None:
     if not BWRAP_AUDIT_FILE.is_file() or BWRAP_AUDIT_FILE.is_symlink():
         raise RuntimeError(f"{description} did not create a regular bwrap audit record")
@@ -187,10 +188,21 @@ def _require_bwrap_rewrite_audit(
                 )
         if fields.get("rewrite_helper") == "1":
             helper_rewrites += 1
-    if matching_rewrites != 1:
+            if fields.get("rewrite_dev") != "1" or fields.get("unshare_net") != "1":
+                raise RuntimeError(
+                    f"{description} rewrote a helper outside the isolated "
+                    "device/network invocation"
+                )
+    if matching_rewrites < 1 or (
+        matching_rewrites != 1 and not allow_additional_device_rewrites
+    ):
         raise RuntimeError(
             f"{description} applied {matching_rewrites} audited /dev rewrites; "
-            "expected 1"
+            + (
+                "expected at least 1"
+                if allow_additional_device_rewrites
+                else "expected 1"
+            )
         )
     expected_helper_rewrites = 1 if require_helper_rewrite else 0
     if helper_rewrites != expected_helper_rewrites:
@@ -360,6 +372,7 @@ def _run_codex_generated_command_probe(worktree: Path) -> None:
             token,
             "pinned Codex generated-command probe",
             require_helper_rewrite=True,
+            allow_additional_device_rewrites=True,
         )
     finally:
         toolchain_launcher.unlink(missing_ok=True)

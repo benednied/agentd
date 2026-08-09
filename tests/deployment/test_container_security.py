@@ -416,6 +416,7 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert 'fields.get("rewrite_helper") == "1"' in preflight
     assert 'fields.get("unshare_net") != "1"' in preflight
     assert "require_helper_rewrite=True" in preflight
+    assert "allow_additional_device_rewrites=True" in preflight
     assert "CODEX_HELPER_ALIASES" in preflight
     assert "secrets.token_hex(16)" in preflight
     assert "_run_codex_generated_command_probe(worktree)" in preflight

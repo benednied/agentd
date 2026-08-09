@@ -86,8 +86,9 @@ service startup, a private nonce makes the shim append a mode-`0600` record belo
 the service-only `/run/agentd` tmpfs. Startup executes both a direct nested probe
 and a standalone command through the exact SDK-bundled App Server with
 `permissionProfile=agentd-workspace`, then requires one audited device rewrite
-with `--unshare-net` preserved for each, plus one helper-path rewrite on the real
-App Server command. The App Server command executes a temporary mode-`0500`
+for the direct probe and at least one for App Server, with `--unshare-net`
+preserved on every device-bearing invocation, plus exactly one helper-path
+rewrite on the real App Server command. The App Server command executes a temporary mode-`0500`
 launcher from the read-only uv toolchain root. Together the probes prove that
 root-owned alias dispatch succeeds, the Codex home is neither readable nor
 writable, SQLite is unreadable, the uv toolchain is executable but not writable,
