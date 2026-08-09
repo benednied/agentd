@@ -431,6 +431,7 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert 'REPOSITORY_ROOT = Path("/home/bened/goldenage")' in payload
     assert 'UV_CACHE_ROOT = Path("/home/bened/.cache/uv")' in payload
     assert "AUTH_FILE.parent" in payload
+    assert "STATE_DATABASE.parent" in payload
     assert 'for helper in ("apply_patch", "applypatch")' in payload
     assert "_exercise_patch_helper(worktree, helper)" in payload
     assert "_unexpectedly_writable" in payload

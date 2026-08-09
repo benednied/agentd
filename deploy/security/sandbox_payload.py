@@ -98,6 +98,7 @@ def main() -> int:
         return 41
     for directory in (
         AUTH_FILE.parent,
+        STATE_DATABASE.parent,
         REPOSITORY_ROOT,
         WORKSPACE_ROOT,
         UV_CACHE_ROOT,
