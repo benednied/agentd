@@ -424,7 +424,7 @@ def test_user_systemd_unit_uses_versioned_current_release_and_hardening() -> Non
     assert "NoNewPrivileges=yes" in unit
     assert "ProtectSystem=strict" in unit
     assert "ProtectHome=read-only" in unit
-    assert "PrivateDevices=yes" in unit
+    assert "PrivateDevices=yes" not in unit
     assert "--remove-orphans --wait" in unit
     assert "check-container-security.sh" in unit
     assert "runtime" in unit

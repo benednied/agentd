@@ -18,7 +18,6 @@ TimeoutStartSec=10min
 TimeoutStopSec=2min
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/bened/.local/state/agentd /home/bened/.local/share/agentd

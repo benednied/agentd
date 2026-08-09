@@ -12,6 +12,13 @@ capabilities dropped, `no-new-privileges`, a 512 PID ceiling, 6 CPUs, and 12 GiB
 memory. There are no published ports, privileged mode, Docker socket mount, or
 broad `/`, `/home`, `/home/bened`, or `/root` bind mounts.
 
+The user-systemd wrapper also applies `NoNewPrivileges`, `PrivateTmp`, strict
+system/home protection, address-family restriction, and personality/SUID controls.
+It deliberately does not request `PrivateDevices`: the reviewed HP user manager
+cannot apply that directive without capabilities. Device isolation remains at the
+Compose boundary, which defines no device mappings, runs non-privileged, and drops
+all capabilities.
+
 Only these five writable bind mounts are permitted, with the same narrow paths on
 the host and in the container:
 
