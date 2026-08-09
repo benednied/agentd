@@ -1,0 +1,143 @@
+"""Persistence interface for control-plane execution state."""
+
+from typing import Protocol
+
+from agentd.domain.enums import JobState
+from agentd.domain.models import (
+    Checkpoint,
+    Job,
+    QuotaPool,
+    QuotaReservation,
+    ResourceAllocation,
+    RunRecord,
+    StateTransition,
+    WorkerNode,
+    WorkspaceLease,
+)
+
+
+class EntityNotFoundError(LookupError):
+    pass
+
+
+class ConcurrentStateError(RuntimeError):
+    pass
+
+
+class StateStore(Protocol):
+    def initialize(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def create_job(self, job: Job, transition: StateTransition) -> None: ...
+
+    def save_job(self, job: Job, transition: StateTransition | None = None) -> None: ...
+
+    def save_job_and_run(
+        self,
+        job: Job,
+        transition: StateTransition,
+        run: RunRecord,
+    ) -> None: ...
+
+    def get_job(self, job_id: str) -> Job: ...
+
+    def list_jobs(self, states: frozenset[JobState] | None = None) -> list[Job]: ...
+
+    def list_transitions(self, job_id: str) -> list[StateTransition]: ...
+
+    def save_node(self, node: WorkerNode) -> None: ...
+
+    def register_node(self, node: WorkerNode) -> WorkerNode: ...
+
+    def get_node(self, node_id: str) -> WorkerNode: ...
+
+    def list_nodes(self) -> list[WorkerNode]: ...
+
+    def save_allocation(self, allocation: ResourceAllocation) -> None: ...
+
+    def allocate_resources(
+        self,
+        expected_node: WorkerNode,
+        updated_node: WorkerNode,
+        allocation: ResourceAllocation,
+    ) -> None: ...
+
+    def release_resources(
+        self,
+        expected_node: WorkerNode,
+        updated_node: WorkerNode,
+        expected_allocation: ResourceAllocation,
+        released_allocation: ResourceAllocation,
+    ) -> None: ...
+
+    def get_allocation(self, allocation_id: str) -> ResourceAllocation: ...
+
+    def find_active_allocation(self, job_id: str) -> ResourceAllocation | None: ...
+
+    def list_allocations(
+        self, job_id: str | None = None
+    ) -> list[ResourceAllocation]: ...
+
+    def save_quota_pool(self, pool: QuotaPool) -> None: ...
+
+    def register_quota_pool(self, pool: QuotaPool) -> QuotaPool: ...
+
+    def update_quota_pool(
+        self,
+        expected_pool: QuotaPool,
+        updated_pool: QuotaPool,
+    ) -> None: ...
+
+    def get_quota_pool(self, pool_id: str) -> QuotaPool: ...
+
+    def list_quota_pools(self) -> list[QuotaPool]: ...
+
+    def save_reservation(self, reservation: QuotaReservation) -> None: ...
+
+    def reserve_quota(
+        self,
+        expected_pool: QuotaPool,
+        updated_pool: QuotaPool,
+        reservation: QuotaReservation,
+    ) -> None: ...
+
+    def release_quota(
+        self,
+        expected_pool: QuotaPool,
+        updated_pool: QuotaPool,
+        expected_reservation: QuotaReservation,
+        released_reservation: QuotaReservation,
+    ) -> None: ...
+
+    def get_reservation(self, reservation_id: str) -> QuotaReservation: ...
+
+    def find_active_reservation(self, job_id: str) -> QuotaReservation | None: ...
+
+    def list_reservations(
+        self, job_id: str | None = None
+    ) -> list[QuotaReservation]: ...
+
+    def save_workspace(self, workspace: WorkspaceLease) -> None: ...
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceLease: ...
+
+    def find_workspace(self, job_id: str) -> WorkspaceLease | None: ...
+
+    def list_workspaces(self, job_id: str | None = None) -> list[WorkspaceLease]: ...
+
+    def save_run(self, run: RunRecord) -> None: ...
+
+    def get_run(self, run_id: str) -> RunRecord: ...
+
+    def find_active_run(self, job_id: str) -> RunRecord | None: ...
+
+    def latest_run(self, job_id: str) -> RunRecord | None: ...
+
+    def list_runs(self, job_id: str | None = None) -> list[RunRecord]: ...
+
+    def save_checkpoint(self, checkpoint: Checkpoint) -> None: ...
+
+    def latest_checkpoint(self, job_id: str) -> Checkpoint | None: ...
+
+    def list_checkpoints(self, job_id: str) -> list[Checkpoint]: ...
