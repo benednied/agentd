@@ -206,6 +206,7 @@ def test_seccomp_is_default_deny_with_narrow_user_namespace_escape() -> None:
         "setns",
         "mount",
         "mknod",
+        "rmdir",
         "umount2",
         "signalfd4",
     } <= allowed
