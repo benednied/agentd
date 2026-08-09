@@ -17,6 +17,7 @@
       "cap_drop": ["ALL"],
       "security_opt": [
         "no-new-privileges:true",
+        "apparmor=lxc-usernsexec",
         "seccomp=./container/seccomp-agentd.json"
       ],
       "environment": {

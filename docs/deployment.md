@@ -69,6 +69,12 @@ deployment.
 
 - Linux with unprivileged user namespaces enabled and
   `user.max_user_namespaces > 0`.
+- The host-provided `lxc-usernsexec` AppArmor profile loaded. On the reviewed HP,
+  this is the existing unconfined execution profile with an explicit `userns`
+  grant; Docker's default profile blocks nested mount propagation. Agentd still
+  drops every container capability, enables `no-new-privileges`, and applies its
+  own default-deny seccomp profile. Deployment fails closed if the named profile
+  is absent or nested Bubblewrap cannot start.
 - A local account whose UID and GID are both 1000 and whose home is
   `/home/bened`.
 - Goldenage already checked out at `/home/bened/goldenage`, owned by UID/GID 1000.

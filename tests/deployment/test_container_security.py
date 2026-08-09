@@ -70,6 +70,7 @@ def test_compose_enforces_resource_and_privilege_boundary() -> None:
     assert service["working_dir"] == "/home/bened/goldenage"
     assert service["init"] is True
     assert "no-new-privileges:true" in service["security_opt"]
+    assert "apparmor=lxc-usernsexec" in service["security_opt"]
     assert "seccomp=./container/seccomp-agentd.json" in service["security_opt"]
     assert "ports" not in service
 
@@ -198,7 +199,16 @@ def test_seccomp_is_default_deny_with_narrow_user_namespace_escape() -> None:
         for name in rule["names"]
     }
 
-    assert {"clone", "clone3", "unshare", "setns", "mount", "umount2"} <= allowed
+    assert {
+        "clone",
+        "clone3",
+        "unshare",
+        "setns",
+        "mount",
+        "mknod",
+        "umount2",
+        "signalfd4",
+    } <= allowed
     assert {
         "add_key",
         "bpf",
@@ -400,6 +410,7 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert '"writableRoots": [str(worktree)]' in preflight
     assert '"networkAccess": False' in preflight
     assert "_run_direct_bwrap_probe(worktree, audit_file)" in preflight
+    assert '"--dev-bind"' in preflight
     assert "_run_codex_generated_command_probe(worktree, audit_file)" in preflight
     assert "_require_wrapper_audit" in preflight
     assert "result.exit_code != 0" in preflight

@@ -114,8 +114,16 @@ def validate_service(service: dict[str, Any]) -> None:
         "no-new-privileges must be enabled",
     )
     require(
+        "apparmor=lxc-usernsexec" in security_options,
+        "the reviewed user-namespace AppArmor profile must be selected",
+    )
+    require(
         any(option.endswith("seccomp-agentd.json") for option in security_options),
         "reviewed seccomp profile must be selected",
+    )
+    require(
+        len(security_options) == 3,
+        "service security options contain an unreviewed value",
     )
 
     environment = _environment_map(service.get("environment", {}))
