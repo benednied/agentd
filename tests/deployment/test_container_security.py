@@ -240,6 +240,8 @@ def test_dockerfile_keeps_runtime_tools_and_never_embeds_credentials() -> None:
     assert 'CMD ["serve"]' in dockerfile
     assert "bubblewrap" in dockerfile
     assert "uidmap" in dockerfile
+    assert "FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-runtime" in dockerfile
+    assert "COPY --from=uv-runtime /uv /usr/local/bin/uv" in dockerfile
     assert "COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv" in dockerfile
     assert 'UV_CACHE_DIR="/home/bened/.cache/uv"' in dockerfile
     assert 'PATH="/usr/local/libexec/agentd:' in dockerfile

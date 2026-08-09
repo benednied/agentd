@@ -2,6 +2,9 @@
 
 ARG PYTHON_IMAGE=python:3.12.12-slim-bookworm
 ARG NODE_IMAGE=node:24.13.0-bookworm-slim
+ARG UV_VERSION=0.11.6
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-runtime
 
 FROM ${NODE_IMAGE} AS codex-cli
 ARG CODEX_VERSION=0.146.0
@@ -9,8 +12,7 @@ RUN npm install --global --omit=dev "@openai/codex@${CODEX_VERSION}" \
     && codex --version
 
 FROM ${PYTHON_IMAGE} AS builder
-ARG UV_VERSION=0.11.6
-COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /usr/local/bin/uv
+COPY --from=uv-runtime /uv /usr/local/bin/uv
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
