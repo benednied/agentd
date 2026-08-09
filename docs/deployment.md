@@ -39,7 +39,10 @@ explicit nonsecret service `config.toml`, the explicitly provisioned
 The seccomp profile is default-deny. It admits ordinary Python, Git, SQLite,
 network, and process syscalls plus the namespace and mount operations needed by a
 nested unprivileged Bubblewrap sandbox. The image includes `bubblewrap`, `uidmap`,
-and the same pinned `uv` executable used at build time. `clone` and `unshare` are
+and the same pinned `uv` executable used at build time. Standard user extended-
+attribute syscalls remain available because Python packaging uses them while
+copying metadata; dropped capabilities still prevent privileged security
+attributes. `clone` and `unshare` are
 mask-filtered to reject UTS, cgroup, and time namespace creation while admitting
 the user, mount, IPC, PID, and network namespaces Bubblewrap needs; `setns` is
 restricted to user namespaces. `clone3` cannot be flag-filtered by classic seccomp because its

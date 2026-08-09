@@ -206,6 +206,20 @@ def test_seccomp_is_default_deny_with_narrow_user_namespace_escape() -> None:
         "signalfd4",
     } <= allowed
     assert {
+        "fgetxattr",
+        "flistxattr",
+        "fremovexattr",
+        "fsetxattr",
+        "getxattr",
+        "lgetxattr",
+        "listxattr",
+        "llistxattr",
+        "lremovexattr",
+        "lsetxattr",
+        "removexattr",
+        "setxattr",
+    } <= allowed
+    assert {
         "add_key",
         "bpf",
         "delete_module",

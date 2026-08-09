@@ -70,6 +70,14 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
         "--die-with-parent",
         "--new-session",
     )
+    assert "--unshare-user" in install_arguments
+    assert "--unshare-user" in sync_arguments
+    proc_index = install_arguments.index("--ro-bind", 10)
+    assert install_arguments[proc_index : proc_index + 3] == (
+        "--ro-bind",
+        "/proc",
+        "/proc",
+    )
     tmpfs_index = install_arguments.index("--tmpfs")
     assert install_arguments[tmpfs_index : tmpfs_index + 2] == (
         "--tmpfs",
