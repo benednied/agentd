@@ -10,10 +10,14 @@ _MAX_OPTIMISTIC_ATTEMPTS = 8
 
 
 class ResourceAllocationError(RuntimeError):
+    """Raised when worker capacity cannot be allocated consistently."""
+
     pass
 
 
 class ResourceManager:
+    """Reserve and release worker capacity through atomic store operations."""
+
     def __init__(self, store: StateStore) -> None:
         self._store = store
 

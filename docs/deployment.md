@@ -5,6 +5,17 @@ deliberately local: none of the scripts use SSH, copy files to another machine, 
 contact a host named HP. Build and service commands run only where the operator
 invokes them.
 
+## Operational logging
+
+The service writes structured Loguru events to stderr. Production defaults to
+newline-delimited JSON (`AGENTD_LOG_FORMAT=json`) at `INFO` level; use
+`AGENTD_LOG_FORMAT=text` for interactive diagnosis and `AGENTD_LOG_LEVEL` to select
+a Loguru level. Events carry operational identifiers such as `job_id`, `run_id`,
+`workspace_id`, and `reservation_id`. The context binder accepts only an explicit
+field allow-list: prompts, repair instructions, credentials, token values, worker
+output, and exception messages are not logged. Container or systemd log retention
+and access controls therefore remain part of the deployment policy.
+
 ## Security boundary
 
 The container runs as UID/GID `1000:1000`, with a read-only root filesystem, all

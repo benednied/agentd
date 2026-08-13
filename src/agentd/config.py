@@ -35,12 +35,10 @@ class ServiceConfig:
     account_stale_seconds: float = 300.0
     quota_top_up_tokens: float = 25_000.0
     hard_cap_grace_seconds: float = 120.0
+    log_level: str = "INFO"
+    log_json: bool = True
 
     def __post_init__(self) -> None:
-        if self.model != "gpt-5.6-terra":
-            raise ValueError("Production Codex model is fixed to gpt-5.6-terra")
-        if self.reasoning_effort != "medium":
-            raise ValueError("Production Codex reasoning effort is fixed to medium")
         numeric = {
             "poll_interval_seconds": self.poll_interval_seconds,
             "account_poll_seconds": self.account_poll_seconds,
@@ -51,6 +49,16 @@ class ServiceConfig:
         for name, value in numeric.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.log_level.upper() not in {
+            "TRACE",
+            "DEBUG",
+            "INFO",
+            "SUCCESS",
+            "WARNING",
+            "ERROR",
+            "CRITICAL",
+        }:
+            raise ValueError("AGENTD_LOG_LEVEL is not a supported Loguru level")
 
     @property
     def uv_python_install_directory(self) -> Path:
@@ -62,27 +70,40 @@ class ServiceConfig:
     def from_environment(cls, values: Mapping[str, str]) -> ServiceConfig:
         """Load configuration without consulting global process state directly."""
 
+        log_format = values.get("AGENTD_LOG_FORMAT", "json").lower()
+        if log_format not in {"json", "text"}:
+            raise ValueError("AGENTD_LOG_FORMAT must be 'json' or 'text'")
+        home = Path(values.get("HOME", str(Path.home()))).expanduser()
+        state_home = Path(
+            values.get("XDG_STATE_HOME", str(home / ".local" / "state"))
+        ).expanduser()
+        data_home = Path(
+            values.get("XDG_DATA_HOME", str(home / ".local" / "share"))
+        ).expanduser()
+        cache_home = Path(
+            values.get("XDG_CACHE_HOME", str(home / ".cache"))
+        ).expanduser()
         return cls(
             database=Path(
                 values.get(
                     "AGENTD_DB",
-                    "/home/bened/.local/state/agentd/state.sqlite",
+                    str(state_home / "agentd" / "state.sqlite"),
                 )
             ).expanduser(),
             workspace_root=Path(
                 values.get(
                     "AGENTD_WORKSPACE_ROOT",
-                    "/home/bened/.local/share/agentd/workspaces",
+                    str(data_home / "agentd" / "workspaces"),
                 )
             ).expanduser(),
             codex_home=Path(
                 values.get(
                     "AGENTD_CODEX_HOME",
-                    "/home/bened/.local/share/agentd/codex-home",
+                    str(data_home / "agentd" / "codex-home"),
                 )
             ).expanduser(),
             uv_cache=Path(
-                values.get("UV_CACHE_DIR", "/home/bened/.cache/uv")
+                values.get("UV_CACHE_DIR", str(cache_home / "uv"))
             ).expanduser(),
             model=values.get("AGENTD_CODEX_MODEL", "gpt-5.6-terra"),
             reasoning_effort=values.get(
@@ -114,4 +135,6 @@ class ServiceConfig:
                 "AGENTD_HARD_CAP_GRACE_SECONDS",
                 120.0,
             ),
+            log_level=values.get("AGENTD_LOG_LEVEL", "INFO"),
+            log_json=log_format == "json",
         )

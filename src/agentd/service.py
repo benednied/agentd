@@ -41,10 +41,14 @@ from agentd.state.base import StateStore
 
 
 class ControlPlaneNotConfiguredError(RuntimeError):
+    """Raised when a lifecycle command lacks an injected coordinator."""
+
     pass
 
 
 class LifecycleCoordinator(Protocol):
+    """Effectful lifecycle surface required by the application facade."""
+
     async def dispatch_next(self) -> RunRecord | None: ...
 
     async def checkpoint(self, job_id: str, capsule: ResumeCapsule) -> Checkpoint: ...

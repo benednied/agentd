@@ -33,8 +33,13 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.domain.transitions import transition_job
-from agentd.harness.protocol import ManagedHarnessDriver
+from agentd.harness.protocol import (
+    ContinuingManagedHarnessDriver,
+    ManagedHarnessDriver,
+    PendingCommandHarnessDriver,
+)
 from agentd.harness.registry import DriverRegistry
+from agentd.observability import event_logger
 from agentd.provisioning import RepositoryProvisioner
 from agentd.runtime.accounts import (
     DEFAULT_ACCOUNT_POLICY,
@@ -161,6 +166,14 @@ class SchedulerCoordinator:
         handle: RunHandle | None = None
         run: RunRecord | None = None
         driver = self._drivers.get(placement.harness)
+        log = event_logger(
+            component="coordinator",
+            operation="dispatch",
+            job_id=job.id,
+            node_id=placement.node_id,
+            harness=placement.harness,
+        )
+        log.info("dispatch_started")
 
         try:
             reservation = self._quota.reserve(job)
@@ -239,8 +252,10 @@ class SchedulerCoordinator:
                 f"harness run {run.id} started",
             )
             self._store.save_job_and_run(running, running_event, run)
+            log.bind(run_id=run.id).info("dispatch_succeeded")
             return run
         except BaseException as error:
+            log.bind(error_type=type(error).__name__).error("dispatch_failed")
             cleanup_errors: list[BaseException] = []
             quiesced = handle is None
             if handle is not None:
@@ -288,6 +303,12 @@ class SchedulerCoordinator:
                     self._store.save_job(ready, event)
             for cleanup_error in cleanup_errors:
                 error.add_note(f"Cleanup also failed: {cleanup_error}")
+            if cleanup_errors:
+                log.bind(cleanup_error_count=len(cleanup_errors)).error(
+                    "dispatch_compensation_incomplete"
+                )
+            elif quiesced:
+                log.info("dispatch_compensated")
             raise
 
     def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None:
@@ -341,6 +362,13 @@ class SchedulerCoordinator:
             driver = self._drivers.get(run.driver)
             if not isinstance(driver, ManagedHarnessDriver):
                 continue
+            log = event_logger(
+                component="coordinator",
+                operation="recovery",
+                job_id=job.id,
+                run_id=run.id,
+                driver=run.driver,
+            )
             repair_request = self._pending_repair(run.id)
             if repair_request is not None:
                 try:
@@ -353,15 +381,14 @@ class SchedulerCoordinator:
                             "thread and existing workspace.",
                         )
                     else:
-                        continue_turn = getattr(driver, "continue_turn", None)
-                        if not callable(continue_turn):
+                        if not isinstance(driver, ContinuingManagedHarnessDriver):
                             raise LifecycleError(
                                 f"Driver {run.driver} cannot continue repair turns"
                             )
                         instruction = repair_request.payload.get("instruction")
                         if not isinstance(instruction, str):
                             raise LifecycleError("Repair instruction is malformed")
-                        handle = await continue_turn(run.id, instruction)
+                        handle = await driver.continue_turn(run.id, instruction)
                     recovered = replace(
                         run,
                         handle=handle,
@@ -371,8 +398,12 @@ class SchedulerCoordinator:
                     )
                     self._store.save_run(recovered)
                     self._acknowledge_repair(repair_request, recovered)
+                    log.info("repair_recovered")
                     continue
                 except BaseException as error:
+                    log.bind(error_type=type(error).__name__).error(
+                        "repair_recovery_failed"
+                    )
                     if first_error is None:
                         first_error = error
                     continue
@@ -387,6 +418,7 @@ class SchedulerCoordinator:
                     "thread from the existing workspace and return a structured "
                     "review handoff at the next safe boundary.",
                 )
+                log.info("managed_run_recovered")
             except (EntityNotFoundError, LookupError) as error:
                 try:
                     self._abandon_unstarted_intent(job, run)
@@ -395,6 +427,9 @@ class SchedulerCoordinator:
                     if first_error is None:
                         first_error = error
             except BaseException as error:
+                log.bind(error_type=type(error).__name__).error(
+                    "managed_run_recovery_failed"
+                )
                 if first_error is None:
                     first_error = error
         if first_error is not None:
@@ -434,9 +469,19 @@ class SchedulerCoordinator:
                 continue
             try:
                 if observation.terminal:
-                    finalized.append(
-                        self._finalize_managed_observation(run, observation)
-                    )
+                    finalized_job = self._finalize_managed_observation(run, observation)
+                    finalized.append(finalized_job)
+                    event_logger(
+                        component="coordinator",
+                        operation="reconcile",
+                        job_id=job.id,
+                        run_id=run.id,
+                        outcome=(
+                            observation.result.outcome.value
+                            if observation.result is not None
+                            else "unknown"
+                        ),
+                    ).info("managed_run_finalized")
                     continue
                 active_snapshot = snapshot
                 if active_snapshot is None:
@@ -457,9 +502,8 @@ class SchedulerCoordinator:
                     active_snapshot,
                     at=now,
                 )
-                process_pending = getattr(driver, "process_pending", None)
-                if callable(process_pending):
-                    await process_pending(run.id)
+                if isinstance(driver, PendingCommandHarnessDriver):
+                    await driver.process_pending(run.id)
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -967,8 +1011,7 @@ class SchedulerCoordinator:
         driver = self._drivers.get(run.driver)
         if not isinstance(driver, ManagedHarnessDriver):
             raise LifecycleError(f"Driver {run.driver} cannot run durable repairs")
-        continue_turn = getattr(driver, "continue_turn", None)
-        if not callable(continue_turn):
+        if not isinstance(driver, ContinuingManagedHarnessDriver):
             raise LifecycleError(f"Driver {run.driver} cannot continue repair turns")
         session = self._store.get_driver_session(run.id)
         raw_count = session.metadata.get("continuation_count", 0)
@@ -1013,6 +1056,14 @@ class SchedulerCoordinator:
             validation=0,
         )
         reservation = self._quota.reserve(replace(job, quota_budget=repair_budget))
+        log = event_logger(
+            component="coordinator",
+            operation="repair",
+            job_id=job.id,
+            run_id=run.id,
+            repair_turn=continuation_count + 1,
+        )
+        log.info("repair_started")
         allocation = None
         handle: RunHandle | None = None
         running: Job | None = None
@@ -1058,7 +1109,7 @@ class SchedulerCoordinator:
                 f"bounded repair turn {continuation_count + 1} requested",
             )
             self._store.save_job_and_run(running, event, starting)
-            handle = await continue_turn(run.id, instruction.strip())
+            handle = await driver.continue_turn(run.id, instruction.strip())
             active = replace(starting, handle=handle, state=RunState.RUNNING)
             self._store.save_run(active)
             self._acknowledge_repair(request, active)

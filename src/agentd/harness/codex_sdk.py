@@ -28,6 +28,7 @@ class CodexSdkDriver:
         self,
         supervisor: RunSupervisor,
         *,
+        model: str = DEFAULT_CODEX_MODEL,
         id_factory: Callable[[], str] = new_id,
     ) -> None:
         self._supervisor = supervisor
@@ -36,7 +37,7 @@ class CodexSdkDriver:
             name=CODEX_DRIVER_NAME,
             # ``standard`` remains the scheduler's abstract compatibility
             # class; every dispatched turn uses the concrete model below.
-            models=frozenset({"standard", DEFAULT_CODEX_MODEL}),
+            models=frozenset({"standard", model}),
             features=frozenset(
                 {
                     "checkpointing",

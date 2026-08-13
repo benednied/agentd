@@ -36,6 +36,7 @@ from agentd.harness.app_server import (
 )
 from agentd.harness.codex import render_execution_contract
 from agentd.harness.errors import RunNotActiveError, UnknownRunError
+from agentd.observability import event_logger
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
 CODEX_DRIVER_NAME = "codex"
@@ -148,15 +149,6 @@ class RunSupervisor:
         effort: str = DEFAULT_REASONING_EFFORT,
         output_schema: Mapping[str, JsonValue] = CODEX_RESULT_SCHEMA,
     ) -> None:
-        if model != DEFAULT_CODEX_MODEL:
-            raise ValueError(
-                f"Codex SDK driver model is fixed to {DEFAULT_CODEX_MODEL!r}"
-            )
-        if effort != DEFAULT_REASONING_EFFORT:
-            raise ValueError(
-                "Codex SDK driver reasoning effort is fixed to "
-                f"{DEFAULT_REASONING_EFFORT!r}"
-            )
         self._store = store
         self._client_factory = client_factory
         self._model = model
@@ -173,6 +165,8 @@ class RunSupervisor:
         """Start and durably identify a new SDK thread and streamed turn."""
 
         self._require_open()
+        log = event_logger(component="harness", operation="start", run_id=run_id)
+        log.info("managed_run_starting")
         if not run_id.strip():
             raise ValueError("A managed Codex run requires a run identifier")
         try:
@@ -215,14 +209,16 @@ class RunSupervisor:
                 turn_id,
                 session,
             )
-        except BaseException:
+        except BaseException as error:
             await client.close()
+            log.bind(error_type=type(error).__name__).error("managed_run_start_failed")
             raise
 
         live.task = asyncio.create_task(
             self._consume(run_id, live),
             name=f"agentd-codex-{run_id}",
         )
+        log.info("managed_run_started")
         return RunHandle(
             id=run_id,
             driver=CODEX_DRIVER_NAME,

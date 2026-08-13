@@ -46,3 +46,17 @@ class ManagedHarnessDriver(HarnessDriver, Protocol):
     ) -> RunHandle: ...
 
     def observe(self, run_id: str) -> RunObservation | None: ...
+
+
+@runtime_checkable
+class PendingCommandHarnessDriver(ManagedHarnessDriver, Protocol):
+    """Managed driver capable of processing durable queued commands."""
+
+    async def process_pending(self, run_id: str) -> None: ...
+
+
+@runtime_checkable
+class ContinuingManagedHarnessDriver(ManagedHarnessDriver, Protocol):
+    """Managed driver capable of same-thread repair continuation."""
+
+    async def continue_turn(self, run_id: str, instruction: str) -> RunHandle: ...

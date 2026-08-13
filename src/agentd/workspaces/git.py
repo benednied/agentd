@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from agentd.domain.enums import WorkspaceState
 from agentd.domain.models import Job, WorkspaceLease
+from agentd.observability import event_logger
 from agentd.workspaces.base import (
     WorkspaceAllocationError,
     WorkspaceCommitError,
@@ -134,7 +135,7 @@ class GitWorkspaceManager:
             self._add_worktree(repository, working_directory, branch)
             self._assert_expected_worktree(repository, working_directory, branch)
             commit = self._commit_at_path(working_directory)
-            return WorkspaceLease(
+            lease = WorkspaceLease(
                 id=lease_id,
                 job_id=job.id,
                 repository=str(repository),
@@ -143,6 +144,13 @@ class GitWorkspaceManager:
                 base_ref=base_ref,
                 commit=commit,
             )
+            event_logger(
+                component="workspace",
+                operation="allocate",
+                job_id=job.id,
+                workspace_id=lease.id,
+            ).info("workspace_allocated")
+            return lease
         except WorkspaceAllocationError:
             self._rollback_allocation(
                 repository,
@@ -165,6 +173,12 @@ class GitWorkspaceManager:
                 if rollback_errors
                 else ""
             )
+            event_logger(
+                component="workspace",
+                operation="allocate",
+                job_id=job.id,
+                error_type=type(exc).__name__,
+            ).error("workspace_allocation_failed")
             raise WorkspaceAllocationError(
                 f"Could not allocate a Git workspace for job {job.id}: {exc}.{suffix}"
             ) from exc
@@ -237,13 +251,27 @@ class GitWorkspaceManager:
                 commit = self._commit_for_missing_worktree(repository, lease)
 
             self._run_git(repository, "worktree", "prune")
-            return replace(
+            released = replace(
                 lease,
                 commit=commit,
                 state=WorkspaceState.RELEASED,
                 released_at=datetime.now(UTC),
             )
+            event_logger(
+                component="workspace",
+                operation="release",
+                job_id=lease.job_id,
+                workspace_id=lease.id,
+            ).info("workspace_released")
+            return released
         except (OSError, _GitCommandError, WorkspaceError) as exc:
+            event_logger(
+                component="workspace",
+                operation="release",
+                job_id=lease.job_id,
+                workspace_id=lease.id,
+                error_type=type(exc).__name__,
+            ).error("workspace_release_failed")
             raise WorkspaceReleaseError(
                 f"Could not release workspace lease {lease.id}: {exc}"
             ) from exc

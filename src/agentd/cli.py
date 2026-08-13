@@ -8,7 +8,6 @@ import json
 import os
 import platform
 import signal
-import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +23,8 @@ from agentd.domain.models import (
     Serializable,
     WorkerNode,
 )
+from agentd.observability import configure_logging, event_logger
+from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 
 
@@ -38,6 +39,8 @@ def _store(path: str) -> SQLiteStateStore:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the stable administrative command-line interface."""
+
     defaults = ServiceConfig.from_environment(os.environ)
     parser = argparse.ArgumentParser(
         prog="agentd",
@@ -145,63 +148,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _service_config(args: argparse.Namespace) -> ServiceConfig:
+    values = dict(os.environ)
+    values.update(
+        AGENTD_DB=args.db,
+        AGENTD_WORKSPACE_ROOT=args.workspace_root,
+        AGENTD_CODEX_HOME=args.codex_home,
+    )
+    return ServiceConfig.from_environment(values)
+
+
+def _lifecycle_plane(
+    args: argparse.Namespace,
+    store: SQLiteStateStore,
+) -> ControlPlane:
+    from agentd.coordinator import SchedulerCoordinator
+    from agentd.harness.registry import DriverRegistry
+    from agentd.workspaces.git import GitWorkspaceManager
+
+    coordinator = SchedulerCoordinator(
+        store,
+        GitWorkspaceManager(args.workspace_root),
+        DriverRegistry(),
+    )
+    return ControlPlane(store, coordinator=coordinator)
+
+
+def _run_process_command(
+    args: argparse.Namespace,
+    config: ServiceConfig,
+) -> int | None:
     if args.command == "serve":
-        values = dict(os.environ)
-        values.update(
-            AGENTD_DB=args.db,
-            AGENTD_WORKSPACE_ROOT=args.workspace_root,
-            AGENTD_CODEX_HOME=args.codex_home,
-        )
-        return asyncio.run(_serve_service(ServiceConfig.from_environment(values)))
+        return asyncio.run(_serve_service(config))
     if args.command == "doctor":
         from agentd.doctor import run_doctor
 
-        values = dict(os.environ)
-        values.update(
-            AGENTD_DB=args.db,
-            AGENTD_WORKSPACE_ROOT=args.workspace_root,
-            AGENTD_CODEX_HOME=args.codex_home,
-        )
-        report = run_doctor(ServiceConfig.from_environment(values))
+        report = run_doctor(config)
         print(json.dumps([asdict(check) for check in report.checks], indent=2))
         return 0 if report.healthy else 1
-    if args.command == "accept":
-        from agentd.coordinator import SchedulerCoordinator
-        from agentd.harness.registry import DriverRegistry
-        from agentd.service import ControlPlane
-        from agentd.workspaces.git import GitWorkspaceManager
-
-        with _store(args.db) as store:
-            coordinator = SchedulerCoordinator(
-                store,
-                GitWorkspaceManager(args.workspace_root),
-                DriverRegistry(),
-            )
-            accepted = asyncio.run(
-                ControlPlane(store, coordinator=coordinator).accept(args.job_id)
-            )
-            _print_model(accepted)
-        return 0
-    if args.command == "review":
-        from agentd.coordinator import SchedulerCoordinator
-        from agentd.harness.registry import DriverRegistry
-        from agentd.service import ControlPlane
-        from agentd.workspaces.git import GitWorkspaceManager
-
-        with _store(args.db) as store:
-            coordinator = SchedulerCoordinator(
-                store,
-                GitWorkspaceManager(args.workspace_root),
-                DriverRegistry(),
-            )
-            _print_model(
-                ControlPlane(
-                    store, coordinator=coordinator
-                ).promote_suspended_to_review(args.job_id)
-            )
-        return 0
     if args.command == "codex-status":
         from agentd.runtime.codex_oracle import CodexAccountOracle
 
@@ -215,128 +199,206 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _print_model(snapshot)
         return 0
-    if args.command == "repair":
-        from agentd.service import ControlPlane
+    return None
 
-        with _store(args.db) as store:
-            _print_model(
-                ControlPlane(store).request_repair(args.job_id, args.instruction)
-            )
-        return 0
+
+def _run_lifecycle_command(args: argparse.Namespace) -> int | None:
+    if args.command not in {"accept", "review", "repair"}:
+        return None
     with _store(args.db) as store:
-        from agentd.service import ControlPlane
+        if args.command == "repair":
+            result = ControlPlane(store).request_repair(
+                args.job_id,
+                args.instruction,
+            )
+        else:
+            plane = _lifecycle_plane(args, store)
+            if args.command == "accept":
+                result = asyncio.run(plane.accept(args.job_id))
+            else:
+                result = plane.promote_suspended_to_review(args.job_id)
+        _print_model(result)
+    return 0
 
+
+def _submit(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    harnesses = tuple(args.harness or ["fake"])
+    model_class = args.model_class or (
+        "gpt-5.6-terra" if "codex" in harnesses else "standard"
+    )
+    job = Job(
+        project=args.project,
+        repository=args.repository,
+        objective=args.objective,
+        base_ref=args.base_ref,
+        dependencies=tuple(args.depends_on),
+        priority=args.priority,
+        qos=QoSClass(args.qos),
+        preferred_harnesses=harnesses,
+        allowed_harnesses=harnesses,
+        preferred_model_class=model_class,
+        minimum_model_class=model_class,
+        effort=EffortEstimate(args.p50, args.p90, args.p99),
+        quota_budget=QuotaBudget(
+            implementation=args.quota,
+            maximum=args.quota_maximum,
+            pool_id=args.quota_pool,
+            unit=(QuotaUnit.TOKENS if "codex" in harnesses else QuotaUnit.ABSTRACT),
+        ),
+        acceptance_criteria=tuple(args.accept),
+    )
+    _print_model(plane.submit(job))
+
+
+def _print_jobs(
+    _args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    print(
+        json.dumps(
+            [job.to_dict() for job in plane.list_jobs()],
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _print_history(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    print(
+        json.dumps(
+            [event.to_dict() for event in plane.history(args.job_id)],
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _print_usage(
+    args: argparse.Namespace,
+    _plane: ControlPlane,
+    store: SQLiteStateStore,
+) -> None:
+    run_ids = (
+        [args.usage_run_id]
+        if args.usage_run_id is not None
+        else [run.id for run in store.list_runs(args.usage_job_id)]
+    )
+    print(
+        json.dumps(
+            {
+                run_id: [
+                    sample.to_dict() for sample in store.list_usage_samples(run_id)
+                ]
+                for run_id in run_ids
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _register_node(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    _print_model(
+        plane.register_node(
+            WorkerNode(
+                id=args.node_id,
+                labels={"os": args.os, "arch": args.arch},
+                capacity=ResourceVector(
+                    cpu=args.cpu,
+                    ram_gb=args.ram_gb,
+                    gpu_count=args.gpu_count,
+                    vram_gb=args.vram_gb,
+                ),
+                harnesses=frozenset(args.harness),
+                capabilities=frozenset(args.capability),
+            )
+        )
+    )
+
+
+def _print_nodes(
+    _args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    print(
+        json.dumps(
+            [node.to_dict() for node in plane.list_nodes()],
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _register_quota(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    _store: SQLiteStateStore,
+) -> None:
+    _print_model(
+        plane.register_quota_pool(
+            QuotaPool(
+                id=args.pool_id,
+                provider=args.provider,
+                remaining=args.remaining,
+                unit=QuotaUnit(args.unit),
+                minimum_interactive_reserve=args.interactive_reserve,
+            )
+        )
+    )
+
+
+def _run_store_command(args: argparse.Namespace) -> int:
+    with _store(args.db) as store:
         plane = ControlPlane(store)
         if args.command == "init":
             print(f"Initialized agentd state at {Path(args.db).expanduser()}")
-        elif args.command == "submit":
-            harnesses = tuple(args.harness or ["fake"])
-            model_class = args.model_class or (
-                "gpt-5.6-terra" if "codex" in harnesses else "standard"
-            )
-            job = Job(
-                project=args.project,
-                repository=args.repository,
-                objective=args.objective,
-                base_ref=args.base_ref,
-                dependencies=tuple(args.depends_on),
-                priority=args.priority,
-                qos=QoSClass(args.qos),
-                preferred_harnesses=harnesses,
-                allowed_harnesses=harnesses,
-                preferred_model_class=model_class,
-                minimum_model_class=model_class,
-                effort=EffortEstimate(args.p50, args.p90, args.p99),
-                quota_budget=QuotaBudget(
-                    implementation=args.quota,
-                    maximum=args.quota_maximum,
-                    pool_id=args.quota_pool,
-                    unit=(
-                        QuotaUnit.TOKENS if "codex" in harnesses else QuotaUnit.ABSTRACT
-                    ),
-                ),
-                acceptance_criteria=tuple(args.accept),
-            )
-            _print_model(plane.submit(job))
-        elif args.command == "job":
-            _print_model(plane.inspect_job(args.job_id))
-        elif args.command == "jobs":
-            print(
-                json.dumps(
-                    [job.to_dict() for job in plane.list_jobs()],
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "history":
-            print(
-                json.dumps(
-                    [event.to_dict() for event in plane.history(args.job_id)],
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "usage":
-            run_ids = (
-                [args.usage_run_id]
-                if args.usage_run_id is not None
-                else [run.id for run in store.list_runs(args.usage_job_id)]
-            )
-            print(
-                json.dumps(
-                    {
-                        run_id: [
-                            sample.to_dict()
-                            for sample in store.list_usage_samples(run_id)
-                        ]
-                        for run_id in run_ids
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "register-node":
-            _print_model(
-                plane.register_node(
-                    WorkerNode(
-                        id=args.node_id,
-                        labels={"os": args.os, "arch": args.arch},
-                        capacity=ResourceVector(
-                            cpu=args.cpu,
-                            ram_gb=args.ram_gb,
-                            gpu_count=args.gpu_count,
-                            vram_gb=args.vram_gb,
-                        ),
-                        harnesses=frozenset(args.harness),
-                        capabilities=frozenset(args.capability),
-                    )
-                )
-            )
-        elif args.command == "nodes":
-            print(
-                json.dumps(
-                    [node.to_dict() for node in plane.list_nodes()],
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        elif args.command == "register-quota":
-            _print_model(
-                plane.register_quota_pool(
-                    QuotaPool(
-                        id=args.pool_id,
-                        provider=args.provider,
-                        remaining=args.remaining,
-                        unit=QuotaUnit(args.unit),
-                        minimum_interactive_reserve=args.interactive_reserve,
-                    )
-                )
-            )
-        elif args.command == "quota":
-            _print_model(plane.inspect_quota(args.pool_id))
-        else:  # pragma: no cover - argparse enforces known subcommands
-            raise AssertionError(f"Unhandled command {args.command}")
+            return 0
+        handlers = {
+            "submit": _submit,
+            "job": lambda item, api, state: _print_model(api.inspect_job(item.job_id)),
+            "jobs": _print_jobs,
+            "history": _print_history,
+            "usage": _print_usage,
+            "register-node": _register_node,
+            "nodes": _print_nodes,
+            "register-quota": _register_quota,
+            "quota": lambda item, api, state: _print_model(
+                api.inspect_quota(item.pool_id)
+            ),
+        }
+        try:
+            handler = handlers[args.command]
+        except KeyError as error:  # pragma: no cover - argparse owns validation
+            raise AssertionError(f"Unhandled command {args.command}") from error
+        handler(args, plane, store)
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse one administrative command and delegate it to a focused handler."""
+
+    args = build_parser().parse_args(argv)
+    config = _service_config(args)
+    configure_logging(level=config.log_level, json_output=config.log_json)
+    result = _run_process_command(args, config)
+    if result is not None:
+        return result
+    result = _run_lifecycle_command(args)
+    return result if result is not None else _run_store_command(args)
 
 
 async def _serve_service(config: ServiceConfig) -> int:
@@ -355,20 +417,18 @@ async def _serve_service(config: ServiceConfig) -> int:
     for received in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(received, stop.set)
 
-    def report(error: Exception) -> None:
-        print(f"agentd: {error}", file=sys.stderr, flush=True)
-
     daemon = AgentDaemon(
         runtime.control_plane,
         poll_interval=config.poll_interval_seconds,
         account_oracle=runtime.account_oracle,
         account_poll_seconds=config.account_poll_seconds,
-        on_error=report,
     )
+    event_logger(component="daemon").info("service_started")
     try:
         await daemon.serve(stop)
     finally:
         await runtime.aclose()
+        event_logger(component="daemon").info("service_stopped")
     return 0
 
 

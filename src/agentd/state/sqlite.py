@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from math import isfinite
 from pathlib import Path
@@ -199,6 +200,8 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
+SCHEMA_VERSION = 1
+
 
 def _dump(model: Serializable) -> str:
     return json.dumps(model.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -214,8 +217,16 @@ def _load[T](payload: str, factory: Callable[[dict[str, Any]], T]) -> T:
 class SQLiteStateStore:
     """A small repository implementation suitable for a local control-plane daemon."""
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        busy_timeout_ms: int = 5_000,
+    ) -> None:
+        if busy_timeout_ms < 0:
+            raise ValueError("busy_timeout_ms must be non-negative")
         self.path = str(path)
+        self._busy_timeout_ms = busy_timeout_ms
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -223,24 +234,65 @@ class SQLiteStateStore:
         )
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
-        self.initialize()
+        try:
+            self.initialize()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def initialize(self) -> None:
         with self._lock:
             self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             if self.path != ":memory:":
                 self._connection.execute("PRAGMA journal_mode = WAL")
-            self._connection.executescript(SCHEMA)
+            row = self._connection.execute("PRAGMA user_version").fetchone()
+            version = int(row[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {version} is newer than supported "
+                    f"version {SCHEMA_VERSION}"
+                )
+            if version == 0:
+                self._connection.executescript(SCHEMA)
+                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    @property
+    def schema_version(self) -> int:
+        """Return the version of the durable schema opened by this store."""
+
+        with self._lock:
+            return int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+
+    @property
+    def busy_timeout_ms(self) -> int:
+        """Return this connection's lock-contention wait in milliseconds."""
+
+        with self._lock:
+            return int(self._connection.execute("PRAGMA busy_timeout").fetchone()[0])
 
     def __enter__(self) -> SQLiteStateStore:
         return self
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Commit one immediate transaction or reliably roll it back."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     def _begin(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
@@ -256,35 +308,23 @@ class SQLiteStateStore:
             raise ValueError("A job's initial transition must start from no state")
         if transition.to_state != job.state:
             raise ValueError("Initial transition does not match the job state")
-        with self._lock:
-            self._begin()
-            try:
-                self._connection.execute(
-                    "INSERT INTO jobs(id, project, state, created_at, payload) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        job.id,
-                        job.project,
-                        job.state.value,
-                        job.created_at.isoformat(),
-                        _dump(job),
-                    ),
-                )
-                self._insert_transition(transition)
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO jobs(id, project, state, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    job.id,
+                    job.project,
+                    job.state.value,
+                    job.created_at.isoformat(),
+                    _dump(job),
+                ),
+            )
+            self._insert_transition(transition)
 
     def save_job(self, job: Job, transition: StateTransition | None = None) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                self._save_job_in_transaction(job, transition)
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._save_job_in_transaction(job, transition)
 
     def save_job_and_run(
         self,
@@ -296,15 +336,9 @@ class SQLiteStateStore:
 
         if run.job_id != job.id:
             raise ValueError("The run must belong to the transitioned job")
-        with self._lock:
-            self._begin()
-            try:
-                self._save_job_in_transaction(job, transition)
-                self._save_run_in_transaction(run)
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._save_job_in_transaction(job, transition)
+            self._save_run_in_transaction(run)
 
     def _save_job_in_transaction(
         self,
@@ -409,31 +443,25 @@ class SQLiteStateStore:
     def register_node(self, node: WorkerNode) -> WorkerNode:
         """Atomically apply topology metadata without overwriting live usage."""
 
-        with self._lock:
-            self._begin()
-            try:
-                row = self._connection.execute(
-                    "SELECT payload FROM nodes WHERE id = ?", (node.id,)
-                ).fetchone()
-                registered = (
-                    replace(
-                        node,
-                        allocated=_load(row["payload"], WorkerNode.from_dict).allocated,
-                    )
-                    if row is not None
-                    else node
+        with self._lock, self._transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM nodes WHERE id = ?", (node.id,)
+            ).fetchone()
+            registered = (
+                replace(
+                    node,
+                    allocated=_load(row["payload"], WorkerNode.from_dict).allocated,
                 )
-                self._execute_upsert(
-                    "nodes",
-                    registered.id,
-                    ("state", "payload"),
-                    (registered.state.value, _dump(registered)),
-                )
-                self._commit()
-                return registered
-            except BaseException:
-                self._rollback()
-                raise
+                if row is not None
+                else node
+            )
+            self._execute_upsert(
+                "nodes",
+                registered.id,
+                ("state", "payload"),
+                (registered.state.value, _dump(registered)),
+            )
+            return registered
 
     def get_node(self, node_id: str) -> WorkerNode:
         row = self._one("SELECT payload FROM nodes WHERE id = ?", (node_id,), "Node")
@@ -547,32 +575,25 @@ class SQLiteStateStore:
         ):
             raise ValueError("Updated node resources do not match the release")
 
-        with self._lock:
-            self._begin()
-            try:
-                self._expect_node(expected_node)
-                self._expect_allocation(expected_allocation)
-                self._connection.execute(
-                    "UPDATE nodes SET state = ?, payload = ? WHERE id = ?",
-                    (
-                        updated_node.state.value,
-                        _dump(updated_node),
-                        expected_node.id,
-                    ),
-                )
-                self._connection.execute(
-                    "UPDATE resource_allocations SET state = ?, payload = ? "
-                    "WHERE id = ?",
-                    (
-                        released_allocation.state.value,
-                        _dump(released_allocation),
-                        expected_allocation.id,
-                    ),
-                )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._expect_node(expected_node)
+            self._expect_allocation(expected_allocation)
+            self._connection.execute(
+                "UPDATE nodes SET state = ?, payload = ? WHERE id = ?",
+                (
+                    updated_node.state.value,
+                    _dump(updated_node),
+                    expected_node.id,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE resource_allocations SET state = ?, payload = ? WHERE id = ?",
+                (
+                    released_allocation.state.value,
+                    _dump(released_allocation),
+                    expected_allocation.id,
+                ),
+            )
 
     def get_allocation(self, allocation_id: str) -> ResourceAllocation:
         row = self._one(
@@ -608,37 +629,31 @@ class SQLiteStateStore:
     def register_quota_pool(self, pool: QuotaPool) -> QuotaPool:
         """Atomically apply pool configuration while preserving live counters."""
 
-        with self._lock:
-            self._begin()
-            try:
-                row = self._connection.execute(
-                    "SELECT payload FROM quota_pools WHERE id = ?", (pool.id,)
-                ).fetchone()
-                if row is None:
-                    registered = pool
-                else:
-                    current = _load(row["payload"], QuotaPool.from_dict)
-                    registered = replace(
-                        pool,
-                        remaining=current.remaining,
-                        reserved=current.reserved,
-                        debt=current.debt,
-                        unit=current.unit,
-                        reset_at=current.reset_at,
-                        reset_confidence=current.reset_confidence,
-                        mode=current.mode,
-                    )
-                self._execute_upsert(
-                    "quota_pools",
-                    registered.id,
-                    ("payload",),
-                    (_dump(registered),),
+        with self._lock, self._transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM quota_pools WHERE id = ?", (pool.id,)
+            ).fetchone()
+            if row is None:
+                registered = pool
+            else:
+                current = _load(row["payload"], QuotaPool.from_dict)
+                registered = replace(
+                    pool,
+                    remaining=current.remaining,
+                    reserved=current.reserved,
+                    debt=current.debt,
+                    unit=current.unit,
+                    reset_at=current.reset_at,
+                    reset_confidence=current.reset_confidence,
+                    mode=current.mode,
                 )
-                self._commit()
-                return registered
-            except BaseException:
-                self._rollback()
-                raise
+            self._execute_upsert(
+                "quota_pools",
+                registered.id,
+                ("payload",),
+                (_dump(registered),),
+            )
+            return registered
 
     def update_quota_pool(
         self,
@@ -653,18 +668,12 @@ class SQLiteStateStore:
             raise ValueError("A quota pool mutation cannot change units")
         if expected_pool.reserved != updated_pool.reserved:
             raise ValueError("A pool mutation cannot change reserved quota")
-        with self._lock:
-            self._begin()
-            try:
-                self._expect_quota_pool(expected_pool)
-                self._connection.execute(
-                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
-                    (_dump(updated_pool), expected_pool.id),
-                )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._expect_quota_pool(expected_pool)
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated_pool), expected_pool.id),
+            )
 
     def get_quota_pool(self, pool_id: str) -> QuotaPool:
         row = self._one(
@@ -804,27 +813,21 @@ class SQLiteStateStore:
         ):
             raise ValueError("Updated pool quota does not match final consumption")
 
-        with self._lock:
-            self._begin()
-            try:
-                self._expect_quota_pool(expected_pool)
-                self._expect_reservation(expected_reservation)
-                self._connection.execute(
-                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
-                    (_dump(updated_pool), expected_pool.id),
-                )
-                self._connection.execute(
-                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
-                    (
-                        released_reservation.state.value,
-                        _dump(released_reservation),
-                        expected_reservation.id,
-                    ),
-                )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._expect_quota_pool(expected_pool)
+            self._expect_reservation(expected_reservation)
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated_pool), expected_pool.id),
+            )
+            self._connection.execute(
+                "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                (
+                    released_reservation.state.value,
+                    _dump(released_reservation),
+                    expected_reservation.id,
+                ),
+            )
 
     def get_reservation(self, reservation_id: str) -> QuotaReservation:
         row = self._one(
@@ -874,18 +877,12 @@ class SQLiteStateStore:
 
         if maximum is not None and (not isfinite(maximum) or maximum < 0):
             raise ValueError("A usage maximum must be finite and non-negative")
-        with self._lock:
-            self._begin()
-            try:
-                application = self._apply_usage_sample_in_transaction(
-                    sample,
-                    maximum=maximum,
-                )
-                self._commit()
-                return application
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            application = self._apply_usage_sample_in_transaction(
+                sample,
+                maximum=maximum,
+            )
+            return application
 
     def _apply_usage_sample_in_transaction(
         self,
@@ -1067,42 +1064,36 @@ class SQLiteStateStore:
             raise ValueError(
                 "Minimum dispatchable quota must be finite and non-negative"
             )
-        with self._lock:
-            self._begin()
-            try:
-                reservation = self._reservation_for_usage(reservation_id)
-                if reservation.state is not ReservationState.ACTIVE:
-                    raise ValueError("Only an active reservation can be topped up")
-                pool = self._pool_for_usage(reservation)
-                updated_reservation = replace(
-                    reservation,
-                    amount=reservation.amount + amount,
+        with self._lock, self._transaction():
+            reservation = self._reservation_for_usage(reservation_id)
+            if reservation.state is not ReservationState.ACTIVE:
+                raise ValueError("Only an active reservation can be topped up")
+            pool = self._pool_for_usage(reservation)
+            updated_reservation = replace(
+                reservation,
+                amount=reservation.amount + amount,
+            )
+            additional_outstanding = (
+                updated_reservation.outstanding - reservation.outstanding
+            )
+            if pool.dispatchable - additional_outstanding < minimum_dispatchable:
+                raise ConcurrentStateError(
+                    f"Pool {pool.id} has insufficient dispatchable quota"
                 )
-                additional_outstanding = (
-                    updated_reservation.outstanding - reservation.outstanding
-                )
-                if pool.dispatchable - additional_outstanding < minimum_dispatchable:
-                    raise ConcurrentStateError(
-                        f"Pool {pool.id} has insufficient dispatchable quota"
-                    )
-                updated_pool = replace(
-                    pool,
-                    reserved=pool.reserved + additional_outstanding,
-                    updated_at=utc_now(),
-                )
-                self._connection.execute(
-                    "UPDATE quota_reservations SET payload = ? WHERE id = ?",
-                    (_dump(updated_reservation), reservation.id),
-                )
-                self._connection.execute(
-                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
-                    (_dump(updated_pool), pool.id),
-                )
-                self._commit()
-                return updated_reservation
-            except BaseException:
-                self._rollback()
-                raise
+            updated_pool = replace(
+                pool,
+                reserved=pool.reserved + additional_outstanding,
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "UPDATE quota_reservations SET payload = ? WHERE id = ?",
+                (_dump(updated_reservation), reservation.id),
+            )
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated_pool), pool.id),
+            )
+            return updated_reservation
 
     def begin_metering(
         self,
@@ -1112,26 +1103,20 @@ class SQLiteStateStore:
     ) -> QuotaReservation:
         if job.state is not JobState.METERING_PENDING:
             raise ValueError("Metering must transition the job to METERING_PENDING")
-        with self._lock:
-            self._begin()
-            try:
-                reservation = self._reservation_for_usage(reservation_id, job.id)
-                if reservation.state is not ReservationState.ACTIVE:
-                    raise ValueError("Only an active reservation can begin metering")
-                self._save_job_in_transaction(job, transition)
-                pending = replace(
-                    reservation,
-                    state=ReservationState.METERING_PENDING,
-                )
-                self._connection.execute(
-                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
-                    (pending.state.value, _dump(pending), pending.id),
-                )
-                self._commit()
-                return pending
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            reservation = self._reservation_for_usage(reservation_id, job.id)
+            if reservation.state is not ReservationState.ACTIVE:
+                raise ValueError("Only an active reservation can begin metering")
+            self._save_job_in_transaction(job, transition)
+            pending = replace(
+                reservation,
+                state=ReservationState.METERING_PENDING,
+            )
+            self._connection.execute(
+                "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                (pending.state.value, _dump(pending), pending.id),
+            )
+            return pending
 
     def settle_quota_usage(
         self,
@@ -1145,83 +1130,71 @@ class SQLiteStateStore:
             raise ValueError("A usage maximum must be finite and non-negative")
         if final_sample is not None and not final_sample.final:
             raise ValueError("A final settlement sample must be marked final")
-        with self._lock:
-            self._begin()
-            try:
-                reservation = self._reservation_for_usage(reservation_id)
-                if reservation.state in {
-                    ReservationState.RELEASED,
-                    ReservationState.CANCELLED,
-                }:
-                    self._commit()
-                    return reservation
-                if reservation.state is not ReservationState.METERING_PENDING:
-                    raise ValueError("Final settlement requires METERING_PENDING")
-                job_row = self._connection.execute(
-                    "SELECT state FROM jobs WHERE id = ?", (reservation.job_id,)
+        with self._lock, self._transaction():
+            reservation = self._reservation_for_usage(reservation_id)
+            if reservation.state in {
+                ReservationState.RELEASED,
+                ReservationState.CANCELLED,
+            }:
+                return reservation
+            if reservation.state is not ReservationState.METERING_PENDING:
+                raise ValueError("Final settlement requires METERING_PENDING")
+            job_row = self._connection.execute(
+                "SELECT state FROM jobs WHERE id = ?", (reservation.job_id,)
+            ).fetchone()
+            if job_row is None:
+                raise EntityNotFoundError(f"Job {reservation.job_id} does not exist")
+            if JobState(job_row["state"]) is not JobState.METERING_PENDING:
+                raise ValueError("Final telemetry requires a metering-pending job")
+            if final_sample is not None:
+                run = self._connection.execute(
+                    "SELECT payload FROM runs WHERE id = ?", (final_sample.run_id,)
                 ).fetchone()
-                if job_row is None:
+                if run is None:
                     raise EntityNotFoundError(
-                        f"Job {reservation.job_id} does not exist"
+                        f"Run {final_sample.run_id} does not exist"
                     )
-                if JobState(job_row["state"]) is not JobState.METERING_PENDING:
-                    raise ValueError("Final telemetry requires a metering-pending job")
-                if final_sample is not None:
-                    run = self._connection.execute(
-                        "SELECT payload FROM runs WHERE id = ?", (final_sample.run_id,)
-                    ).fetchone()
-                    if run is None:
-                        raise EntityNotFoundError(
-                            f"Run {final_sample.run_id} does not exist"
-                        )
-                    if (
-                        _load(run["payload"], RunRecord.from_dict).reservation_id
-                        != reservation.id
-                    ):
-                        raise ValueError(
-                            "Final sample belongs to another quota reservation"
-                        )
-                    self._apply_usage_sample_in_transaction(
-                        final_sample,
-                        maximum=maximum,
+                if (
+                    _load(run["payload"], RunRecord.from_dict).reservation_id
+                    != reservation.id
+                ):
+                    raise ValueError(
+                        "Final sample belongs to another quota reservation"
                     )
-                    reservation = self._reservation_for_usage(reservation_id)
+                self._apply_usage_sample_in_transaction(
+                    final_sample,
+                    maximum=maximum,
+                )
+                reservation = self._reservation_for_usage(reservation_id)
 
-                pool = self._pool_for_usage(reservation)
-                outstanding = reservation.outstanding
-                if pool.reserved + 1e-9 < outstanding:
-                    raise ConcurrentStateError(
-                        f"Pool {pool.id} reserves less than reservation "
-                        f"{reservation.id}"
-                    )
-                state = (
-                    ReservationState.CANCELLED
-                    if cancelled
-                    else ReservationState.RELEASED
+            pool = self._pool_for_usage(reservation)
+            outstanding = reservation.outstanding
+            if pool.reserved + 1e-9 < outstanding:
+                raise ConcurrentStateError(
+                    f"Pool {pool.id} reserves less than reservation {reservation.id}"
                 )
-                settled = replace(
-                    reservation,
-                    state=state,
-                    released_at=utc_now(),
-                )
-                updated_pool = replace(
-                    pool,
-                    reserved=max(0, pool.reserved - outstanding),
-                    updated_at=utc_now(),
-                )
-                self._connection.execute(
-                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
-                    (settled.state.value, _dump(settled), settled.id),
-                )
-                self._connection.execute(
-                    "UPDATE quota_pools SET payload = ? WHERE id = ?",
-                    (_dump(updated_pool), pool.id),
-                )
-                self._commit()
-                return settled
-            except BaseException:
-                self._rollback()
-                raise
+            state = (
+                ReservationState.CANCELLED if cancelled else ReservationState.RELEASED
+            )
+            settled = replace(
+                reservation,
+                state=state,
+                released_at=utc_now(),
+            )
+            updated_pool = replace(
+                pool,
+                reserved=max(0, pool.reserved - outstanding),
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                (settled.state.value, _dump(settled), settled.id),
+            )
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated_pool), pool.id),
+            )
+            return settled
 
     def save_workspace(self, workspace: WorkspaceLease) -> None:
         self._upsert(
@@ -1266,14 +1239,8 @@ class SQLiteStateStore:
         ]
 
     def save_run(self, run: RunRecord) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                self._save_run_in_transaction(run)
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+        with self._lock, self._transaction():
+            self._save_run_in_transaction(run)
 
     def _save_run_in_transaction(self, run: RunRecord) -> None:
         self._validate_run_links(run)
@@ -1374,56 +1341,50 @@ class SQLiteStateStore:
         ]
 
     def save_driver_session(self, session: DriverSession) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                run_row = self._connection.execute(
-                    "SELECT payload FROM runs WHERE id = ?", (session.run_id,)
-                ).fetchone()
-                if run_row is None:
-                    raise EntityNotFoundError(f"Run {session.run_id} does not exist")
-                run = _load(run_row["payload"], RunRecord.from_dict)
-                if run.driver != session.driver:
-                    raise ValueError("Driver session belongs to another driver")
-                existing_row = self._connection.execute(
-                    "SELECT payload FROM driver_sessions WHERE run_id = ?",
-                    (session.run_id,),
-                ).fetchone()
-                registered = session
-                if existing_row is not None:
-                    existing = _load(existing_row["payload"], DriverSession.from_dict)
-                    if existing.driver != session.driver:
-                        raise ValueError("Driver session cannot change ownership")
-                    registered = replace(
-                        session,
-                        id=existing.id,
-                        created_at=existing.created_at,
-                    )
-                self._execute_upsert(
-                    "driver_sessions",
-                    registered.id,
-                    (
-                        "run_id",
-                        "driver",
-                        "observation_cursor",
-                        "active",
-                        "updated_at",
-                        "payload",
-                    ),
-                    (
-                        registered.run_id,
-                        registered.driver,
-                        registered.observation_cursor,
-                        int(registered.active),
-                        registered.updated_at.isoformat(),
-                        _dump(registered),
-                    ),
-                    immutable_columns=("run_id", "driver"),
+        with self._lock, self._transaction():
+            run_row = self._connection.execute(
+                "SELECT payload FROM runs WHERE id = ?", (session.run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise EntityNotFoundError(f"Run {session.run_id} does not exist")
+            run = _load(run_row["payload"], RunRecord.from_dict)
+            if run.driver != session.driver:
+                raise ValueError("Driver session belongs to another driver")
+            existing_row = self._connection.execute(
+                "SELECT payload FROM driver_sessions WHERE run_id = ?",
+                (session.run_id,),
+            ).fetchone()
+            registered = session
+            if existing_row is not None:
+                existing = _load(existing_row["payload"], DriverSession.from_dict)
+                if existing.driver != session.driver:
+                    raise ValueError("Driver session cannot change ownership")
+                registered = replace(
+                    session,
+                    id=existing.id,
+                    created_at=existing.created_at,
                 )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+            self._execute_upsert(
+                "driver_sessions",
+                registered.id,
+                (
+                    "run_id",
+                    "driver",
+                    "observation_cursor",
+                    "active",
+                    "updated_at",
+                    "payload",
+                ),
+                (
+                    registered.run_id,
+                    registered.driver,
+                    registered.observation_cursor,
+                    int(registered.active),
+                    registered.updated_at.isoformat(),
+                    _dump(registered),
+                ),
+                immutable_columns=("run_id", "driver"),
+            )
 
     def get_driver_session(self, run_id: str) -> DriverSession:
         row = self._one(
@@ -1461,105 +1422,90 @@ class SQLiteStateStore:
             observation.run_id != run_id or observation.cursor != cursor
         ):
             raise ValueError("Observation cursor and run identifiers must agree")
-        with self._lock:
-            self._begin()
-            try:
-                row = self._connection.execute(
-                    "SELECT payload FROM driver_sessions WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                if row is None:
-                    raise EntityNotFoundError(
-                        f"Driver session for run {run_id} does not exist"
-                    )
-                session = _load(row["payload"], DriverSession.from_dict)
-                if session.observation_cursor != expected_cursor:
-                    raise ConcurrentStateError(
-                        f"Observation cursor for run {run_id} changed concurrently"
-                    )
-                updated = replace(
-                    session,
-                    observation_cursor=cursor,
-                    thread_id=(
-                        observation.thread_id
-                        if observation is not None
-                        else session.thread_id
-                    ),
-                    turn_id=(
-                        observation.turn_id
-                        if observation is not None
-                        else session.turn_id
-                    ),
-                    last_observation=observation or session.last_observation,
-                    active=(
-                        not observation.terminal
-                        if observation is not None
-                        else session.active
-                    ),
-                    updated_at=utc_now(),
+        with self._lock, self._transaction():
+            row = self._connection.execute(
+                "SELECT payload FROM driver_sessions WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise EntityNotFoundError(
+                    f"Driver session for run {run_id} does not exist"
                 )
-                self._connection.execute(
-                    "UPDATE driver_sessions SET observation_cursor = ?, active = ?, "
-                    "updated_at = ?, payload = ? WHERE run_id = ?",
-                    (
-                        updated.observation_cursor,
-                        int(updated.active),
-                        updated.updated_at.isoformat(),
-                        _dump(updated),
-                        run_id,
-                    ),
+            session = _load(row["payload"], DriverSession.from_dict)
+            if session.observation_cursor != expected_cursor:
+                raise ConcurrentStateError(
+                    f"Observation cursor for run {run_id} changed concurrently"
                 )
-                self._commit()
-                return updated
-            except BaseException:
-                self._rollback()
-                raise
+            updated = replace(
+                session,
+                observation_cursor=cursor,
+                thread_id=(
+                    observation.thread_id
+                    if observation is not None
+                    else session.thread_id
+                ),
+                turn_id=(
+                    observation.turn_id if observation is not None else session.turn_id
+                ),
+                last_observation=observation or session.last_observation,
+                active=(
+                    not observation.terminal
+                    if observation is not None
+                    else session.active
+                ),
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "UPDATE driver_sessions SET observation_cursor = ?, active = ?, "
+                "updated_at = ?, payload = ? WHERE run_id = ?",
+                (
+                    updated.observation_cursor,
+                    int(updated.active),
+                    updated.updated_at.isoformat(),
+                    _dump(updated),
+                    run_id,
+                ),
+            )
+            return updated
 
     def append_provider_quota_snapshot(
         self,
         snapshot: ProviderQuotaSnapshot,
     ) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                if (
-                    self._connection.execute(
-                        "SELECT 1 FROM quota_pools WHERE id = ?", (snapshot.pool_id,)
-                    ).fetchone()
-                    is None
-                ):
-                    raise EntityNotFoundError(
-                        f"Quota pool {snapshot.pool_id} does not exist"
-                    )
-                existing = self._connection.execute(
-                    "SELECT payload FROM provider_quota_snapshots WHERE id = ?",
-                    (snapshot.id,),
-                ).fetchone()
-                if existing is not None:
-                    if (
-                        _load(existing["payload"], ProviderQuotaSnapshot.from_dict)
-                        != snapshot
-                    ):
-                        raise ConcurrentStateError(
-                            f"Provider snapshot {snapshot.id} already differs"
-                        )
-                    self._commit()
-                    return
+        with self._lock, self._transaction():
+            if (
                 self._connection.execute(
-                    "INSERT INTO provider_quota_snapshots("
-                    "id, pool_id, bucket_id, observed_at, payload"
-                    ") VALUES (?, ?, ?, ?, ?)",
-                    (
-                        snapshot.id,
-                        snapshot.pool_id,
-                        snapshot.bucket_id,
-                        snapshot.observed_at.isoformat(),
-                        _dump(snapshot),
-                    ),
+                    "SELECT 1 FROM quota_pools WHERE id = ?", (snapshot.pool_id,)
+                ).fetchone()
+                is None
+            ):
+                raise EntityNotFoundError(
+                    f"Quota pool {snapshot.pool_id} does not exist"
                 )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+            existing = self._connection.execute(
+                "SELECT payload FROM provider_quota_snapshots WHERE id = ?",
+                (snapshot.id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    _load(existing["payload"], ProviderQuotaSnapshot.from_dict)
+                    != snapshot
+                ):
+                    raise ConcurrentStateError(
+                        f"Provider snapshot {snapshot.id} already differs"
+                    )
+                return
+            self._connection.execute(
+                "INSERT INTO provider_quota_snapshots("
+                "id, pool_id, bucket_id, observed_at, payload"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    snapshot.id,
+                    snapshot.pool_id,
+                    snapshot.bucket_id,
+                    snapshot.observed_at.isoformat(),
+                    _dump(snapshot),
+                ),
+            )
 
     def latest_provider_quota_snapshot(
         self,
@@ -1586,44 +1532,37 @@ class SQLiteStateStore:
         ]
 
     def enqueue_run_command(self, command: RunCommand) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                if (
-                    self._connection.execute(
-                        "SELECT 1 FROM runs WHERE id = ?", (command.run_id,)
-                    ).fetchone()
-                    is None
-                ):
-                    raise EntityNotFoundError(f"Run {command.run_id} does not exist")
-                existing = self._connection.execute(
-                    "SELECT payload FROM run_commands WHERE id = ?", (command.id,)
-                ).fetchone()
-                if existing is not None:
-                    if not self._same_run_command(
-                        _load(existing["payload"], RunCommand.from_dict),
-                        command,
-                    ):
-                        raise ConcurrentStateError(
-                            f"Run command {command.id} already differs"
-                        )
-                    self._commit()
-                    return
+        with self._lock, self._transaction():
+            if (
                 self._connection.execute(
-                    "INSERT INTO run_commands(id, run_id, action, created_at, payload) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        command.id,
-                        command.run_id,
-                        command.action,
-                        command.created_at.isoformat(),
-                        _dump(command),
-                    ),
-                )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+                    "SELECT 1 FROM runs WHERE id = ?", (command.run_id,)
+                ).fetchone()
+                is None
+            ):
+                raise EntityNotFoundError(f"Run {command.run_id} does not exist")
+            existing = self._connection.execute(
+                "SELECT payload FROM run_commands WHERE id = ?", (command.id,)
+            ).fetchone()
+            if existing is not None:
+                if not self._same_run_command(
+                    _load(existing["payload"], RunCommand.from_dict),
+                    command,
+                ):
+                    raise ConcurrentStateError(
+                        f"Run command {command.id} already differs"
+                    )
+                return
+            self._connection.execute(
+                "INSERT INTO run_commands(id, run_id, action, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    command.id,
+                    command.run_id,
+                    command.action,
+                    command.created_at.isoformat(),
+                    _dump(command),
+                ),
+            )
 
     def list_run_commands(self, run_id: str) -> list[RunCommand]:
         return [
@@ -1661,49 +1600,42 @@ class SQLiteStateStore:
         ]
 
     def acknowledge_run_command(self, acknowledgement: RunCommandAck) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                command_row = self._connection.execute(
-                    "SELECT run_id FROM run_commands WHERE id = ?",
-                    (acknowledgement.command_id,),
-                ).fetchone()
-                if command_row is None:
-                    raise EntityNotFoundError(
-                        f"Run command {acknowledgement.command_id} does not exist"
-                    )
-                if command_row["run_id"] != acknowledgement.run_id:
-                    raise ValueError("Command acknowledgement belongs to another run")
-                existing = self._connection.execute(
-                    "SELECT payload FROM run_command_acks WHERE command_id = ?",
-                    (acknowledgement.command_id,),
-                ).fetchone()
-                if existing is not None:
-                    if (
-                        _load(existing["payload"], RunCommandAck.from_dict)
-                        != acknowledgement
-                    ):
-                        raise ConcurrentStateError(
-                            "Run command already has a different acknowledgement"
-                        )
-                    self._commit()
-                    return
-                self._connection.execute(
-                    "INSERT INTO run_command_acks("
-                    "id, command_id, run_id, acknowledged_at, payload"
-                    ") VALUES (?, ?, ?, ?, ?)",
-                    (
-                        acknowledgement.id,
-                        acknowledgement.command_id,
-                        acknowledgement.run_id,
-                        acknowledgement.acknowledged_at.isoformat(),
-                        _dump(acknowledgement),
-                    ),
+        with self._lock, self._transaction():
+            command_row = self._connection.execute(
+                "SELECT run_id FROM run_commands WHERE id = ?",
+                (acknowledgement.command_id,),
+            ).fetchone()
+            if command_row is None:
+                raise EntityNotFoundError(
+                    f"Run command {acknowledgement.command_id} does not exist"
                 )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+            if command_row["run_id"] != acknowledgement.run_id:
+                raise ValueError("Command acknowledgement belongs to another run")
+            existing = self._connection.execute(
+                "SELECT payload FROM run_command_acks WHERE command_id = ?",
+                (acknowledgement.command_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    _load(existing["payload"], RunCommandAck.from_dict)
+                    != acknowledgement
+                ):
+                    raise ConcurrentStateError(
+                        "Run command already has a different acknowledgement"
+                    )
+                return
+            self._connection.execute(
+                "INSERT INTO run_command_acks("
+                "id, command_id, run_id, acknowledged_at, payload"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    acknowledgement.id,
+                    acknowledgement.command_id,
+                    acknowledgement.run_id,
+                    acknowledgement.acknowledged_at.isoformat(),
+                    _dump(acknowledgement),
+                ),
+            )
 
     def get_run_command_ack(self, command_id: str) -> RunCommandAck | None:
         rows = self._all(
@@ -1713,37 +1645,31 @@ class SQLiteStateStore:
         return _load(rows[0]["payload"], RunCommandAck.from_dict) if rows else None
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
-        with self._lock:
-            self._begin()
-            try:
-                run = self._connection.execute(
-                    "SELECT job_id FROM runs WHERE id = ?", (checkpoint.run_id,)
-                ).fetchone()
-                if run is None:
-                    raise EntityNotFoundError(
-                        f"Run {checkpoint.run_id} does not exist for checkpoint "
-                        f"{checkpoint.id}"
-                    )
-                if run["job_id"] != checkpoint.job_id:
-                    raise ValueError(
-                        f"Checkpoint {checkpoint.id} belongs to another run's job"
-                    )
-                self._execute_upsert(
-                    "checkpoints",
-                    checkpoint.id,
-                    ("job_id", "run_id", "created_at", "payload"),
-                    (
-                        checkpoint.job_id,
-                        checkpoint.run_id,
-                        checkpoint.created_at.isoformat(),
-                        _dump(checkpoint),
-                    ),
-                    immutable_columns=("job_id", "run_id"),
+        with self._lock, self._transaction():
+            run = self._connection.execute(
+                "SELECT job_id FROM runs WHERE id = ?", (checkpoint.run_id,)
+            ).fetchone()
+            if run is None:
+                raise EntityNotFoundError(
+                    f"Run {checkpoint.run_id} does not exist for checkpoint "
+                    f"{checkpoint.id}"
                 )
-                self._commit()
-            except BaseException:
-                self._rollback()
-                raise
+            if run["job_id"] != checkpoint.job_id:
+                raise ValueError(
+                    f"Checkpoint {checkpoint.id} belongs to another run's job"
+                )
+            self._execute_upsert(
+                "checkpoints",
+                checkpoint.id,
+                ("job_id", "run_id", "created_at", "payload"),
+                (
+                    checkpoint.job_id,
+                    checkpoint.run_id,
+                    checkpoint.created_at.isoformat(),
+                    _dump(checkpoint),
+                ),
+                immutable_columns=("job_id", "run_id"),
+            )
 
     def latest_checkpoint(self, job_id: str) -> Checkpoint | None:
         rows = self._all(

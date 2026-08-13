@@ -20,12 +20,15 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.domain.transitions import transition_job
+from agentd.observability import event_logger
 from agentd.state.base import ConcurrentStateError, StateStore
 
 _MAX_OPTIMISTIC_ATTEMPTS = 8
 
 
 class QuotaAdmissionError(RuntimeError):
+    """Raised when a job cannot reserve its required schedulable quota."""
+
     pass
 
 
@@ -92,6 +95,14 @@ class QuotaManager:
             except ConcurrentStateError as error:
                 conflict = error
                 continue
+            event_logger(
+                component="quota",
+                operation="reserve",
+                job_id=job.id,
+                reservation_id=reservation.id,
+                pool_id=pool.id,
+                unit=pool.unit.value,
+            ).info("quota_reserved")
             return reservation
 
         raise ConcurrentStateError(
@@ -160,6 +171,14 @@ class QuotaManager:
             except ConcurrentStateError as error:
                 conflict = error
                 continue
+            event_logger(
+                component="quota",
+                operation="release",
+                job_id=reservation.job_id,
+                reservation_id=reservation.id,
+                pool_id=reservation.pool_id,
+                cancelled=cancelled,
+            ).info("quota_released")
             return updated_reservation
 
         raise ConcurrentStateError(

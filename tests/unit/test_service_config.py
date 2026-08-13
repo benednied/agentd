@@ -5,14 +5,16 @@ import pytest
 from agentd.config import ServiceConfig
 
 
-def test_service_config_has_hardened_hp_defaults() -> None:
-    config = ServiceConfig.from_environment({})
+def test_service_config_has_portable_xdg_defaults() -> None:
+    config = ServiceConfig.from_environment({"HOME": "/home/operator"})
 
-    assert config.database == Path("/home/bened/.local/state/agentd/state.sqlite")
-    assert config.workspace_root == Path("/home/bened/.local/share/agentd/workspaces")
-    assert config.codex_home == Path("/home/bened/.local/share/agentd/codex-home")
-    assert config.uv_cache == Path("/home/bened/.cache/uv")
-    assert config.uv_python_install_directory == Path("/home/bened/.cache/uv/python")
+    assert config.database == Path("/home/operator/.local/state/agentd/state.sqlite")
+    assert config.workspace_root == Path(
+        "/home/operator/.local/share/agentd/workspaces"
+    )
+    assert config.codex_home == Path("/home/operator/.local/share/agentd/codex-home")
+    assert config.uv_cache == Path("/home/operator/.cache/uv")
+    assert config.uv_python_install_directory == Path("/home/operator/.cache/uv/python")
     assert config.model == "gpt-5.6-terra"
     assert config.reasoning_effort == "medium"
     assert config.account_poll_seconds == 60
@@ -35,6 +37,8 @@ def test_service_config_parses_explicit_environment() -> None:
             "AGENTD_ACCOUNT_STALE_SECONDS": "120",
             "AGENTD_QUOTA_TOP_UP_TOKENS": "50000",
             "AGENTD_HARD_CAP_GRACE_SECONDS": "90",
+            "AGENTD_LOG_LEVEL": "DEBUG",
+            "AGENTD_LOG_FORMAT": "text",
         }
     )
 
@@ -49,6 +53,8 @@ def test_service_config_parses_explicit_environment() -> None:
     assert config.account_stale_seconds == 120
     assert config.quota_top_up_tokens == 50_000
     assert config.hard_cap_grace_seconds == 90
+    assert config.log_level == "DEBUG"
+    assert not config.log_json
 
 
 @pytest.mark.parametrize(
@@ -66,11 +72,28 @@ def test_service_config_rejects_nonpositive_controls(name: str) -> None:
         ServiceConfig.from_environment({name: "0"})
 
 
-def test_service_config_rejects_nonproduction_effort() -> None:
-    with pytest.raises(ValueError, match="fixed to medium"):
-        ServiceConfig.from_environment({"AGENTD_CODEX_REASONING_EFFORT": "high"})
+def test_service_config_represents_nonproduction_model_policy() -> None:
+    config = ServiceConfig.from_environment(
+        {
+            "AGENTD_CODEX_MODEL": "gpt-5.6-sol",
+            "AGENTD_CODEX_REASONING_EFFORT": "high",
+        }
+    )
+
+    assert config.model == "gpt-5.6-sol"
+    assert config.reasoning_effort == "high"
 
 
-def test_service_config_rejects_nonproduction_model() -> None:
-    with pytest.raises(ValueError, match=r"fixed to gpt-5\.6-terra"):
-        ServiceConfig.from_environment({"AGENTD_CODEX_MODEL": "gpt-5.6-sol"})
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"AGENTD_LOG_LEVEL": "verbose"}, "AGENTD_LOG_LEVEL"),
+        ({"AGENTD_LOG_FORMAT": "xml"}, "AGENTD_LOG_FORMAT"),
+    ],
+)
+def test_service_config_rejects_unknown_logging_controls(
+    values: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ServiceConfig.from_environment(values)

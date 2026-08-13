@@ -3,14 +3,42 @@
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import Protocol, runtime_checkable
 
 from agentd.domain.enums import JobState
-from agentd.domain.models import ProviderQuotaSnapshot, RunRecord, utc_now
+from agentd.domain.models import Job, ProviderQuotaSnapshot, RunRecord, utc_now
+from agentd.observability import event_logger
 from agentd.runtime.codex_oracle import AccountOracle
 from agentd.service import ControlPlane
+from agentd.state.base import StateStore
+
+
+@runtime_checkable
+class _RecoverableControlPlane(Protocol):
+    async def recover_managed_runs(self) -> None: ...
+
+
+@runtime_checkable
+class _ReconcilableControlPlane(Protocol):
+    async def reconcile_managed_runs(
+        self,
+        snapshot: ProviderQuotaSnapshot | None = None,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[object, ...]: ...
+
+
+@runtime_checkable
+class _AdmissionInspectableControlPlane(Protocol):
+    @property
+    def store(self) -> StateStore: ...
+
+    def list_jobs(self, states: frozenset[JobState] | None = None) -> list[Job]: ...
 
 
 class AgentDaemon:
+    """Poll provider state, reconcile managed runs, and dispatch ready work."""
+
     def __init__(
         self,
         control_plane: ControlPlane,
@@ -68,16 +96,20 @@ class AgentDaemon:
                 self._account_snapshot = await self._account_oracle.snapshot()
                 self._control_plane.apply_provider_snapshot(self._account_snapshot)
                 self._last_account_refresh = now
+                event_logger(component="account_oracle").info(
+                    "provider_quota_refreshed"
+                )
             except Exception as error:
                 # Existing durable telemetry remains authoritative until it
                 # becomes stale; the coordinator then blocks nonurgent work.
-                self._record_error(error)
+                self._record_error(error, operation="provider_quota_refresh")
             finally:
                 self._last_account_refresh = now
                 self._refreshed_admissions.update(admission_keys)
-        reconcile = getattr(self._control_plane, "reconcile_managed_runs", None)
-        if callable(reconcile):
-            await reconcile(self._account_snapshot, at=now)
+        if isinstance(self._control_plane, _ReconcilableControlPlane):
+            await self._control_plane.reconcile_managed_runs(
+                self._account_snapshot, at=now
+            )
         if self._dispatch_retry_at is not None and now < self._dispatch_retry_at:
             return None
         try:
@@ -102,12 +134,11 @@ class AgentDaemon:
         loop owns admission and dispatch only.
         """
 
-        recover = getattr(self._control_plane, "recover_managed_runs", None)
-        if callable(recover):
+        if isinstance(self._control_plane, _RecoverableControlPlane):
             try:
-                await recover()
+                await self._control_plane.recover_managed_runs()
             except Exception as error:
-                self._record_error(error)
+                self._record_error(error, operation="managed_run_recovery")
 
         while not stop.is_set():
             try:
@@ -116,36 +147,35 @@ class AgentDaemon:
                 # Admission effects compensate independently. Keep the daemon
                 # alive so a routine bad workspace/harness cannot stop unrelated
                 # work from being considered on the next tick.
-                self._record_error(error)
+                self._record_error(error, operation="dispatch_tick")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self._poll_interval)
             except TimeoutError:
                 continue
 
-    def _record_error(self, error: Exception) -> None:
+    def _record_error(self, error: Exception, *, operation: str) -> None:
         self._last_error = error
+        event_logger(
+            component="daemon",
+            operation=operation,
+            error_type=type(error).__name__,
+        ).error("operation_failed")
         if self._on_error is not None:
             self._on_error(error)
 
     def _codex_admission_keys(self) -> set[str]:
-        list_jobs = getattr(self._control_plane, "list_jobs", None)
-        if not callable(list_jobs):
+        if not isinstance(self._control_plane, _AdmissionInspectableControlPlane):
             return set()
         keys = {
             f"ready:{job.id}"
-            for job in list_jobs(frozenset({JobState.READY}))
+            for job in self._control_plane.list_jobs(frozenset({JobState.READY}))
             if "codex" in job.allowed_harnesses
         }
-        store = getattr(self._control_plane, "store", None)
-        list_pending = getattr(store, "list_pending_run_commands", None)
-        get_run = getattr(store, "get_run", None)
-        if not callable(list_pending) or not callable(get_run):
-            return keys
-        for command in list_pending():
+        for command in self._control_plane.store.list_pending_run_commands():
             if command.action != "repair":
                 continue
             try:
-                run = get_run(command.run_id)
+                run = self._control_plane.store.get_run(command.run_id)
             except LookupError:
                 continue
             if run.driver == "codex":

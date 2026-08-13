@@ -22,6 +22,15 @@ from agentd.harness.supervisor import RunSupervisor
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
 
+def test_driver_advertises_its_configured_model() -> None:
+    driver = CodexSdkDriver(
+        cast(RunSupervisor, object()),
+        model="experimental-model",
+    )
+
+    assert "experimental-model" in driver.capabilities().models
+
+
 @dataclass(frozen=True, slots=True)
 class StoredRun:
     contract: ExecutionContract

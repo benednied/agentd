@@ -26,9 +26,14 @@ from agentd.workers.local import LocalWorkerBackend
 from agentd.workers.registry import BackendRegistry
 from agentd.workspaces.git import GitWorkspaceManager
 
+_PRODUCTION_MODEL = "gpt-5.6-terra"
+_PRODUCTION_REASONING_EFFORT = "medium"
+
 
 @dataclass(slots=True)
 class LocalRuntime:
+    """Owned components of one local control-plane process."""
+
     store: SQLiteStateStore
     coordinator: SchedulerCoordinator
     control_plane: ControlPlane
@@ -85,6 +90,16 @@ def create_local_runtime(
             "AGENTD_WORKSPACE_ROOT": str(workspace_root),
         }
     )
+    if trusted_provisioning or enforce_codex_account_policy:
+        if effective_config.model != _PRODUCTION_MODEL:
+            raise ValueError(
+                f"Production deployment model is fixed to {_PRODUCTION_MODEL!r}"
+            )
+        if effective_config.reasoning_effort != _PRODUCTION_REASONING_EFFORT:
+            raise ValueError(
+                "Production deployment reasoning effort is fixed to "
+                f"{_PRODUCTION_REASONING_EFFORT!r}"
+            )
     store = SQLiteStateStore(database)
     drivers = DriverRegistry()
     supervisor: RunSupervisor | None = None
@@ -112,7 +127,7 @@ def create_local_runtime(
             model=effective_config.model,
             effort=effective_config.reasoning_effort,
         )
-        drivers.register(CodexSdkDriver(supervisor))
+        drivers.register(CodexSdkDriver(supervisor, model=effective_config.model))
         account_oracle = CodexAccountOracle(
             "codex",
             client_factory=lambda: OpenAICodexClient(environment=codex_environment),

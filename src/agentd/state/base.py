@@ -24,14 +24,20 @@ from agentd.domain.models import (
 
 
 class EntityNotFoundError(LookupError):
+    """Raised when durable state lacks a requested domain entity."""
+
     pass
 
 
 class ConcurrentStateError(RuntimeError):
+    """Raised when optimistic state assumptions no longer hold."""
+
     pass
 
 
 class StateStore(Protocol):
+    """Durable state operations required by control-plane services."""
+
     def initialize(self) -> None: ...
 
     def close(self) -> None: ...

@@ -3,8 +3,42 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import agentd.bootstrap as bootstrap
 from agentd.config import ServiceConfig
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"model": "experimental"}, "Production deployment model"),
+        ({"reasoning_effort": "high"}, "Production deployment reasoning effort"),
+    ],
+)
+def test_production_policy_is_enforced_at_composition_boundary(
+    tmp_path: Path,
+    override: dict[str, str],
+    message: str,
+) -> None:
+    config = ServiceConfig(
+        database=tmp_path / "state.sqlite",
+        workspace_root=tmp_path / "workspaces",
+        codex_home=tmp_path / "codex-home",
+        uv_cache=tmp_path / "uv-cache",
+        **override,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        bootstrap.create_local_runtime(
+            config.database,
+            config.workspace_root,
+            include_fake_driver=False,
+            include_codex_driver=False,
+            include_codex_cli_driver=False,
+            trusted_provisioning=True,
+            config=config,
+        )
 
 
 def test_runtime_pins_goldenage_dev_toolchain_and_codex_environment(
