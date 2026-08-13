@@ -142,6 +142,31 @@ def test_trusted_commit_captures_nonignored_changes_with_fixed_identity(
     assert not hook_sentinel.exists()
     assert _git(repository, "rev-parse", "HEAD") == main_commit
 
+
+def test_trusted_commit_excludes_control_plane_runtime_scratch(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    manager = GitWorkspaceManager(tmp_path / "worktrees")
+    lease = manager.allocate(_job(repository))
+    working_directory = Path(lease.working_directory)
+
+    (working_directory / "result.txt").write_text("review me\n")
+    (working_directory / ".uv-cache").mkdir()
+    (working_directory / ".uv-cache" / "wheel").write_text("scratch\n")
+    (working_directory / "pytest-of-worker").mkdir()
+    (working_directory / "pytest-of-worker" / "state").write_text("scratch\n")
+
+    commit = manager.commit_changes(lease)
+
+    assert "result.txt" in _git(
+        working_directory, "ls-tree", "-r", "--name-only", commit
+    )
+    assert ".uv-cache" not in _git(
+        working_directory, "ls-tree", "-r", "--name-only", commit
+    )
+    assert "pytest-of-worker" not in _git(
+        working_directory, "ls-tree", "-r", "--name-only", commit
+    )
+
     commit_count = _git(working_directory, "rev-list", "--count", "HEAD")
     assert manager.commit_changes(lease) == commit
     assert _git(working_directory, "rev-list", "--count", "HEAD") == commit_count

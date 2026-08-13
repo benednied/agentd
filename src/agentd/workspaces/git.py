@@ -27,6 +27,11 @@ _COMMIT_ID = re.compile(r"[0-9a-fA-F]{40,64}")
 _AUTOMATION_NAME = "agentd automation"
 _AUTOMATION_EMAIL = "agentd@localhost"
 _AUTOMATION_COMMIT_MESSAGE = "agentd: capture review handoff"
+_RUNTIME_SCRATCH_PATHS = (
+    ":(exclude).uv-cache/**",
+    ":(exclude)pytest-of-*",
+    ":(exclude)pytest-of-*/**",
+)
 
 
 class _GitCommandError(RuntimeError):
@@ -300,7 +305,14 @@ class GitWorkspaceManager:
                 lease.branch,
             )
 
-            self._run_git(working_directory, "add", "--all", "--", ".")
+            self._run_git(
+                working_directory,
+                "add",
+                "--all",
+                "--",
+                ".",
+                *_RUNTIME_SCRATCH_PATHS,
+            )
 
             # Revalidate ownership after staging and before moving the ref. A
             # failed attempt can be retried safely because the index is retained.

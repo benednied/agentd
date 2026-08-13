@@ -600,6 +600,33 @@ class SchedulerCoordinator:
         self._store.save_job_and_run(review, event, final_run)
         return review
 
+    def promote_suspended_to_review(self, job_id: str) -> Job:
+        """Promote a completed, quiescent checkpoint after operator validation."""
+
+        job = self._store.get_job(job_id)
+        if job.state is not JobState.SUSPENDED:
+            raise LifecycleError(f"Job {job_id} is not suspended")
+        run = self._require_latest_run(job_id)
+        if run.state is not RunState.SUSPENDED or run.result is None:
+            raise LifecycleError(f"Job {job_id} has no durable suspended result")
+        if run.result.outcome is not RunOutcome.COMPLETED:
+            raise LifecycleError(f"Job {job_id} did not report completed work")
+        if self._store.find_active_allocation(job_id) is not None:
+            raise LifecycleError(f"Job {job_id} still has an active allocation")
+        reservation = self._store.find_active_reservation(job_id)
+        if reservation is not None:
+            raise LifecycleError(f"Job {job_id} still has an active reservation")
+
+        result = self._trusted_workspace_commit_result(run, run.result)
+        final_run = replace(run, result=result)
+        review, event = transition_job(
+            job,
+            JobState.REVIEW,
+            "operator promoted completed checkpoint after independent validation",
+        )
+        self._store.save_job_and_run(review, event, final_run)
+        return review
+
     async def complete(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
         if job.terminal:

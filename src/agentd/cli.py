@@ -93,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     accept = commands.add_parser("accept", help="accept a job currently in REVIEW")
     accept.add_argument("job_id")
 
+    review = commands.add_parser(
+        "review",
+        help="promote a completed suspended checkpoint after operator validation",
+    )
+    review.add_argument("job_id")
+
     repair = commands.add_parser(
         "repair",
         help="request one bounded same-thread repair for a job in REVIEW",
@@ -177,6 +183,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ControlPlane(store, coordinator=coordinator).accept(args.job_id)
             )
             _print_model(accepted)
+        return 0
+    if args.command == "review":
+        from agentd.coordinator import SchedulerCoordinator
+        from agentd.harness.registry import DriverRegistry
+        from agentd.service import ControlPlane
+        from agentd.workspaces.git import GitWorkspaceManager
+
+        with _store(args.db) as store:
+            coordinator = SchedulerCoordinator(
+                store,
+                GitWorkspaceManager(args.workspace_root),
+                DriverRegistry(),
+            )
+            _print_model(
+                ControlPlane(
+                    store, coordinator=coordinator
+                ).promote_suspended_to_review(args.job_id)
+            )
         return 0
     if args.command == "codex-status":
         from agentd.runtime.codex_oracle import CodexAccountOracle

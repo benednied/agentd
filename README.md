@@ -235,6 +235,7 @@ CODEX_HOME=/absolute/path/to/dedicated-codex-home \
   uv run agentd --db .agentd/state.sqlite \
   codex-status --pool codex --bucket codex
 uv run agentd --db .agentd/state.sqlite usage --run RUN_ID
+uv run agentd --db .agentd/state.sqlite review JOB_ID
 uv run agentd --db .agentd/state.sqlite repair JOB_ID \
   --instruction "Address the review findings and rerun validation"
 uv run agentd --db .agentd/state.sqlite accept JOB_ID
@@ -242,7 +243,9 @@ uv run agentd --db .agentd/state.sqlite accept JOB_ID
 
 The standalone `codex-status` command uses the process's `CODEX_HOME`; `serve`
 passes its configured `--codex-home` to both the driver and account oracle.
-`repair` durably queues a request for a job in `REVIEW`; the running daemon later
+`review` promotes a completed, quiescent suspended checkpoint after independent
+operator validation without starting another model turn. `repair` durably queues
+a request for a job in `REVIEW`; the running daemon later
 reacquires policy-compliant quota and node capacity and starts the repair. `accept`
 finalizes an already persisted reviewed result. Pause, resume, cancellation,
 checkpoint creation, reconnaissance promotion, and reset-event injection remain

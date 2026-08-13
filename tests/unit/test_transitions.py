@@ -17,6 +17,7 @@ from agentd.domain.transitions import InvalidStateTransition, transition_job
         (JobState.DRAINING, JobState.CHECKPOINTED),
         (JobState.CHECKPOINTED, JobState.SUSPENDED),
         (JobState.SUSPENDED, JobState.READY),
+        (JobState.SUSPENDED, JobState.REVIEW),
         (JobState.RUNNING, JobState.REVIEW),
         (JobState.REVIEW, JobState.COMPLETED),
     ],

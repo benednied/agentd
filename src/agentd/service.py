@@ -310,6 +310,9 @@ class ControlPlane:
     async def request_review(self, job_id: str) -> Job:
         return await self._lifecycle().request_review(job_id)
 
+    def promote_suspended_to_review(self, job_id: str) -> Job:
+        return self._lifecycle().promote_suspended_to_review(job_id)
+
     async def recover_managed_runs(self) -> None:
         await self._lifecycle().recover_managed_runs()
 
