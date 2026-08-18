@@ -29,3 +29,6 @@ enabled = false
 
 [analytics]
 enabled = false
+
+[projects."/home/bened/goldenage"]
+trust_level = "trusted"

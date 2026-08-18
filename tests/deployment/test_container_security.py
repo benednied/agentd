@@ -16,6 +16,7 @@ EXPECTED_MOUNTS = {
     "/home/bened/.local/state/agentd",
     "/home/bened/.local/share/agentd/workspaces",
     "/home/bened/.local/share/agentd/codex-home",
+    "/home/bened/.local/share/agentd/codex-home/config.toml",
     "/home/bened/.cache/uv",
     "/home/bened/goldenage",
 }
@@ -79,7 +80,14 @@ def test_compose_has_only_exact_narrow_mounts_and_tmpfs() -> None:
 
     assert targets == EXPECTED_MOUNTS
     assert all(volume["type"] == "bind" for volume in volumes)
-    assert all(volume["read_only"] is False for volume in volumes)
+    assert {volume["target"] for volume in volumes if volume["read_only"] is True} == {
+        "/home/bened/.local/share/agentd/codex-home/config.toml"
+    }
+    assert all(
+        volume["read_only"] is False
+        for volume in volumes
+        if volume["target"] != "/home/bened/.local/share/agentd/codex-home/config.toml"
+    )
     assert all(volume["bind"] == {"create_host_path": False} for volume in volumes)
     serialized = json.dumps(volumes).lower()
     assert "docker.sock" not in serialized
@@ -363,6 +371,9 @@ def test_env_template_has_exact_nonsecret_mount_and_service_values() -> None:
     assert environment["AGENTD_CODEX_HOME"] == (
         "/home/bened/.local/share/agentd/codex-home"
     )
+    assert environment["AGENTD_CODEX_CONFIG"] == (
+        "/home/bened/.local/share/agentd/codex-home/config.toml"
+    )
     assert environment["AGENTD_UV_CACHE"] == "/home/bened/.cache/uv"
     assert environment["AGENTD_REPOSITORY_ROOT"] == "/home/bened/goldenage"
     assert "AUTH" not in " ".join(environment)
@@ -468,6 +479,22 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
     assert 'install -o 1000 -g 1000 -m 0600 "$config_source"' in provision
     assert 'chmod 0600 "$AGENTD_CODEX_HOME/config.toml"' in provision
     assert "deploy/container/config.toml /opt/agentd/security/config.toml" in dockerfile
+
+
+def test_codex_config_pins_repository_trust_before_read_only_mount() -> None:
+    config = tomllib.loads(
+        (DEPLOY / "container" / "config.toml").read_text(encoding="utf-8")
+    )
+
+    assert config["projects"]["/home/bened/goldenage"]["trust_level"] == "trusted"
+    service = _compose_service()
+    config_mount = next(
+        volume
+        for volume in service["volumes"]
+        if volume["target"] == "/home/bened/.local/share/agentd/codex-home/config.toml"
+    )
+    assert config_mount["read_only"] is True
+    assert config_mount["bind"] == {"create_host_path": False}
 
 
 def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None:

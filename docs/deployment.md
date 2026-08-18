@@ -274,10 +274,16 @@ above. The network assertion is a UDP route selection to the documentation-only
 
 An intentionally isolated deployment may pass a third argument naming a JSON mount
 policy. The policy must contain exactly a `mounts` object mapping all five reviewed
-container targets to absolute, narrow host sources. Without that explicit policy,
+container targets plus the reviewed Codex config file target to absolute, narrow
+host sources. Without that explicit policy,
 the validator continues to require the production paths byte-for-byte. Broad home
 or root mounts, Docker sockets, missing targets, and implicit host-path creation
 remain rejected. Record and retain the policy with the isolated-run evidence.
+
+The Codex home remains writable for authentication and durable session state, but
+its reviewed `config.toml` is overlaid as a separate read-only bind. The pinned
+config declares the exact container repository path trusted up front, preventing
+Codex from appending project trust state at runtime.
 
 The user systemd unit runs this check as a mandatory `ExecStartPre`; it is not an
 optional warning in normal deployment. A missing auth/config/state file, wrong

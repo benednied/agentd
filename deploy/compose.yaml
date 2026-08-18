@@ -67,6 +67,13 @@
         },
         {
           "type": "bind",
+          "source": "${AGENTD_CODEX_CONFIG:?set exact reviewed Codex config}",
+          "target": "/home/bened/.local/share/agentd/codex-home/config.toml",
+          "read_only": true,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
           "source": "${AGENTD_UV_CACHE:?set exact dedicated uv cache}",
           "target": "/home/bened/.cache/uv",
           "read_only": false,

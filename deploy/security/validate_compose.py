@@ -17,8 +17,14 @@ EXPECTED_MOUNTS = {
     "/home/bened/.local/share/agentd/codex-home": (
         "/home/bened/.local/share/agentd/codex-home"
     ),
+    "/home/bened/.local/share/agentd/codex-home/config.toml": (
+        "/home/bened/.local/share/agentd/codex-home/config.toml"
+    ),
     "/home/bened/.cache/uv": "/home/bened/.cache/uv",
     "/home/bened/goldenage": "/home/bened/goldenage",
+}
+READ_ONLY_MOUNTS = {
+    "/home/bened/.local/share/agentd/codex-home/config.toml",
 }
 EXPECTED_ENVIRONMENT = {
     "HOME": "/home/bened",
@@ -153,7 +159,8 @@ def validate_service(
         mounts[target] = source
         require(mount.get("type") == "bind", f"{target} must be a bind mount")
         require(
-            mount.get("read_only", False) is False, f"{target} must declare write mode"
+            bool(mount.get("read_only", False)) == (target in READ_ONLY_MOUNTS),
+            f"{target} has unexpected write mode",
         )
         bind = mount.get("bind", {})
         require(
