@@ -72,7 +72,12 @@ def _memory_is_12_gib(value: object) -> bool:
     return normalized in {"12g", "12gb", "12gib", "12884901888"}
 
 
-def validate_service(service: dict[str, Any]) -> None:
+def validate_service(
+    service: dict[str, Any],
+    *,
+    expected_mounts: dict[str, str] | None = None,
+) -> None:
+    expected_mounts = EXPECTED_MOUNTS if expected_mounts is None else expected_mounts
     errors: list[str] = []
 
     def require(condition: bool, message: str) -> None:
@@ -161,7 +166,7 @@ def validate_service(service: dict[str, Any]) -> None:
             "broad host mount",
         )
     require(
-        mounts == EXPECTED_MOUNTS,
+        mounts == expected_mounts,
         "bind mounts must match the exact reviewed paths",
     )
 
@@ -176,25 +181,58 @@ def validate_service(service: dict[str, Any]) -> None:
         raise SecurityValidationError("; ".join(errors))
 
 
-def validate_compose(document: dict[str, Any]) -> None:
+def validate_compose(
+    document: dict[str, Any],
+    *,
+    expected_mounts: dict[str, str] | None = None,
+) -> None:
     services = document.get("services")
     if not isinstance(services, dict) or set(services) != {"agentd"}:
         raise SecurityValidationError("Compose must define only the agentd service")
     service = services["agentd"]
     if not isinstance(service, dict):
         raise SecurityValidationError("agentd service must be an object")
-    validate_service(service)
+    validate_service(service, expected_mounts=expected_mounts)
+
+
+def _mount_policy(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict) or set(raw) != {"mounts"}:
+        raise SecurityValidationError("mount policy must contain only 'mounts'")
+    mounts = raw["mounts"]
+    if not isinstance(mounts, dict):
+        raise SecurityValidationError("mount policy 'mounts' must be an object")
+    expected = {str(target): str(source) for target, source in mounts.items()}
+    if set(expected) != set(EXPECTED_MOUNTS):
+        raise SecurityValidationError("mount policy must name every reviewed target")
+    for target, source in expected.items():
+        path = Path(source)
+        if not path.is_absolute():
+            raise SecurityValidationError(
+                f"mount policy source for {target} is relative"
+            )
+        if source in {"/", "/home", "/home/bened", "/root"}:
+            raise SecurityValidationError(f"mount policy source for {target} is broad")
+        if "docker.sock" in source:
+            raise SecurityValidationError("Docker socket must never be mounted")
+    return expected
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 1:
-        print("usage: validate_compose.py RENDERED_COMPOSE_JSON", file=sys.stderr)
+    if len(arguments) not in {1, 2}:
+        print(
+            "usage: validate_compose.py RENDERED_COMPOSE_JSON [MOUNT_POLICY_JSON]",
+            file=sys.stderr,
+        )
         return 2
     payload = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise SecurityValidationError("rendered Compose document must be an object")
-    validate_compose(payload)
+    expected_mounts = None
+    if len(arguments) == 2:
+        policy = json.loads(Path(arguments[1]).read_text(encoding="utf-8"))
+        expected_mounts = _mount_policy(policy)
+    validate_compose(payload, expected_mounts=expected_mounts)
     return 0
 
 

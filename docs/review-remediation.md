@@ -1,9 +1,85 @@
 # Code-review remediation status
 
 This document revalidates the findings in `agentd-code-review.md` (baseline commit
-`c9724043e46a`, 2026-08-09) against branch `codex/agentd-control-plane` at
-`de70f7d` plus the remediation worktree. It records what was implemented and what
-was deliberately left alone rather than treating the old measurements as current.
+`c9724043e46a`, 2026-08-09). The remediation was committed as `37049aa` on branch
+`codex/agentd-control-plane`. It records what was implemented and what was
+deliberately left alone rather than treating the old measurements as current.
+
+## Preservation contract for future changes
+
+Commit `37049aa` was an operational-readiness change, not merely a cleanup. Future
+changes may redesign its implementation, but must preserve the behavior below or
+replace it with an explicitly documented, tested equivalent.
+
+### Logging and sensitive data
+
+- Keep Loguru as the application logging system and keep sink configuration
+  centralized in `agentd.observability`. Do not introduce direct sinks throughout
+  the codebase or silently fall back to the standard-library logging module.
+- Preserve structured operational events at daemon, coordinator, harness, quota,
+  workspace, dispatch, repair, reconciliation, and recovery boundaries.
+- Preserve correlatable `job_id` and `run_id` context wherever those identifiers
+  exist. Workspace, reservation, pool, node, driver, and outcome identifiers should
+  remain attached at their respective boundaries.
+- Never log prompts, objectives, repair instructions, worker output, credentials,
+  authentication material, raw token values, exception messages, or tracebacks from
+  untrusted upstream processes. New context fields must be deliberately added to
+  the allow-list and covered by a non-leakage test.
+- Keep JSON as the production default, retain the text mode for local diagnosis,
+  and keep deployment validation aware of both logging environment variables.
+
+### Durable state and concurrency
+
+- Do not open SQLite without `foreign_keys`, the configured `busy_timeout`, and WAL
+  for file-backed databases.
+- Never edit `SCHEMA` without incrementing `SCHEMA_VERSION` and adding an explicit,
+  idempotent migration from every supported prior version. Continue rejecting a
+  database whose version is newer than the running binary.
+- Keep multi-statement state mutations atomic. Use `_transaction()` for ordinary
+  transactions. The two explicit transaction blocks intentionally translate
+  SQLite uniqueness failures into `ConcurrentStateError`; do not flatten them
+  unless that domain behavior remains tested.
+- Preserve append-only transitions, quota/accounting monotonicity, retry
+  idempotency, and compare-and-swap conflict detection.
+
+### Lifecycle and isolation
+
+- Preserve the dispatch compensation order and the `quiesced` rule: allocations,
+  reservations, and workspaces must not be released while a process may still be
+  running. Cleanup failures must remain attached to, rather than replace, the
+  original failure.
+- Keep worker-visible `ExecutionContract` data separated from scheduler scarcity,
+  quota balances, node identity, QoS rank, and placement reasoning.
+- Preserve exclusive Git-worktree ownership checks, lease identity validation,
+  path confinement, non-forced cleanup, and immutable commit handoff behavior.
+- Represent optional lifecycle features with runtime-checkable Protocols. Do not
+  restore silent `getattr()` capability discovery. The SDK `model_dump` probe is a
+  narrow external-payload compatibility exception.
+
+### Configuration and deployment policy
+
+- Keep core configuration portable through `HOME`/XDG defaults. Personal host paths
+  may remain in the reviewed single-host deployment profile, but must not return to
+  `src/agentd` defaults.
+- Keep the configuration type capable of representing non-production model and
+  reasoning choices. Enforce the reviewed production model policy at the trusted
+  runtime/deployment composition boundary.
+- Keep the hardened deployment checks, exact mounts, non-root execution, security
+  options, and environment allow-list synchronized with configuration changes.
+
+### Change discipline
+
+- Do not weaken or remove CI gates for locked dependency sync, Ruff lint, Ruff
+  formatting, and the full test suite.
+- Add focused regression tests before changing compensation, recovery, accounting,
+  migration, workspace cleanup, or security-boundary code.
+- Do not split the remaining complex lifecycle functions solely to satisfy a
+  complexity number. Refactor them only when their ordering and crash invariants
+  have direct regression coverage.
+- Keep `SECURITY.md` aligned with the actual supported revisions and trust boundary.
+- Before merging, run the authoritative commands below. If coverage falls or an
+  intentional invariant changes, explain that change in this document or its
+  successor rather than silently accepting the regression.
 
 ## Current verification baseline
 

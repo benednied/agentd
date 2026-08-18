@@ -184,6 +184,69 @@ def test_rendered_compose_security_validator_rejects_unreviewed_exposure(
         assert result.returncode != 0
 
 
+def test_rendered_validator_requires_explicit_exact_alternate_mount_policy(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(COMPOSE.read_text(encoding="utf-8"))
+    service = copy.deepcopy(payload["services"]["agentd"])
+    service["image"] = f"agentd:{'a' * 40}"
+    alternate_sources = {
+        target: f"/srv/agentd-smoke/{index}"
+        for index, target in enumerate(sorted(EXPECTED_MOUNTS), start=1)
+    }
+    for volume in service["volumes"]:
+        volume["source"] = alternate_sources[volume["target"]]
+    for name, value in list(service["environment"].items()):
+        if str(value).startswith("${"):
+            service["environment"][name] = {
+                "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
+                "AGENTD_CODEX_REASONING_EFFORT": "medium",
+            }.get(name, "1")
+    rendered = tmp_path / "compose-alternate.json"
+    rendered.write_text(
+        json.dumps({"services": {"agentd": service}}),
+        encoding="utf-8",
+    )
+    validator = DEPLOY / "security" / "validate_compose.py"
+
+    without_policy = subprocess.run(
+        [sys.executable, str(validator), rendered],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert without_policy.returncode != 0
+
+    policy = tmp_path / "mount-policy.json"
+    policy.write_text(json.dumps({"mounts": alternate_sources}), encoding="utf-8")
+    with_policy = subprocess.run(
+        [sys.executable, str(validator), rendered, policy],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert with_policy.returncode == 0, with_policy.stderr
+
+    policy.write_text(
+        json.dumps(
+            {
+                "mounts": {
+                    **alternate_sources,
+                    "/home/bened/goldenage": "/home/bened",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    broad_policy = subprocess.run(
+        [sys.executable, str(validator), rendered, policy],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert broad_policy.returncode != 0
+
+
 def test_seccomp_is_default_deny_with_narrow_user_namespace_escape() -> None:
     profile = json.loads(SECCOMP.read_text(encoding="utf-8"))
     assert profile["defaultAction"] == "SCMP_ACT_ERRNO"

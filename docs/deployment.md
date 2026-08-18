@@ -272,6 +272,13 @@ above. The network assertion is a UDP route selection to the documentation-only
   /home/bened/.local/share/agentd/current/release.env runtime
 ```
 
+An intentionally isolated deployment may pass a third argument naming a JSON mount
+policy. The policy must contain exactly a `mounts` object mapping all five reviewed
+container targets to absolute, narrow host sources. Without that explicit policy,
+the validator continues to require the production paths byte-for-byte. Broad home
+or root mounts, Docker sockets, missing targets, and implicit host-path creation
+remain rejected. Record and retain the policy with the isolated-run evidence.
+
 The user systemd unit runs this check as a mandatory `ExecStartPre`; it is not an
 optional warning in normal deployment. A missing auth/config/state file, wrong
 ownership or mode, unavailable named profile or nested user namespace, absent or

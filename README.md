@@ -39,6 +39,10 @@ current adapters. The control plane itself has a reviewed container deployment.
 The detailed component, lifecycle, and durability boundaries are in
 [docs/architecture.md](docs/architecture.md).
 
+The operational-readiness work from commit `37049aa`, including the invariants
+future changes must preserve, is documented in
+[docs/review-remediation.md](docs/review-remediation.md).
+
 ## Requirements and installation
 
 - Python 3.12 or newer

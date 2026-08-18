@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 ENV_FILE=${1:-/home/bened/.local/share/agentd/current/release.env}
 MODE=${2:-static}
+MOUNT_POLICY=${3:-}
 
 case "$MODE" in static|runtime) ;; *) printf '%s\n' "mode must be static or runtime" >&2; exit 2 ;; esac
 [ -f "$ENV_FILE" ] || { printf '%s\n' "missing env file: $ENV_FILE" >&2; exit 1; }
@@ -19,7 +20,13 @@ docker compose \
     --env-file "$ENV_FILE" \
     --file "$DEPLOY_DIR/compose.yaml" \
     config --format json >"$rendered"
-python3 "$DEPLOY_DIR/security/validate_compose.py" "$rendered"
+if [ -n "$MOUNT_POLICY" ]; then
+    [ -f "$MOUNT_POLICY" ] \
+        || { printf '%s\n' "missing mount policy: $MOUNT_POLICY" >&2; exit 1; }
+    python3 "$DEPLOY_DIR/security/validate_compose.py" "$rendered" "$MOUNT_POLICY"
+else
+    python3 "$DEPLOY_DIR/security/validate_compose.py" "$rendered"
+fi
 
 if [ "$MODE" = runtime ]; then
     docker compose \
