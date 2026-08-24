@@ -1,0 +1,34 @@
+# Nonsecret policy for the dedicated agentd Codex home.
+# The runtime preflight verifies the effective sandbox instead of trusting this
+# file alone.
+approval_policy = "never"
+default_permissions = "agentd-workspace"
+
+[permissions.agentd-workspace]
+description = "Agentd leased workspace only"
+
+[permissions.agentd-workspace.filesystem]
+":minimal" = "read"
+"/opt/agentd/venv" = "read"
+"/usr/local/bin" = "read"
+"/usr/bin" = "read"
+"/usr/libexec/agentd" = "read"
+"/bin" = "read"
+"/usr/lib" = "read"
+"/lib" = "read"
+"/home/bened/.cache/uv" = "read"
+"/home/bened/.local/share/agentd/codex-home" = "deny"
+"/home/bened/.local/state/agentd" = "deny"
+"/home/bened/.local/share/agentd/workspaces" = "deny"
+
+[permissions.agentd-workspace.filesystem.":workspace_roots"]
+"." = "write"
+
+[permissions.agentd-workspace.network]
+enabled = false
+
+[analytics]
+enabled = false
+
+[projects."/home/bened/goldenage"]
+trust_level = "trusted"

@@ -1,0 +1,102 @@
+{
+  "name": "agentd",
+  "services": {
+    "agentd": {
+      "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
+      "pull_policy": "never",
+      "user": "1000:1000",
+      "working_dir": "/home/bened/goldenage",
+      "read_only": true,
+      "privileged": false,
+      "init": true,
+      "entrypoint": [
+        "/bin/sh",
+        "-ec",
+        "/opt/agentd/venv/bin/python /opt/agentd/security/runtime_sandbox_probe.py && exec /opt/agentd/venv/bin/agentd \"$@\"",
+        "agentd-entrypoint"
+      ],
+      "restart": "unless-stopped",
+      "stop_grace_period": "45s",
+      "pids_limit": 512,
+      "cpus": "6.0",
+      "mem_limit": "12g",
+      "cap_drop": ["ALL"],
+      "security_opt": [
+        "no-new-privileges:true",
+        "apparmor=lxc-usernsexec",
+        "seccomp=./container/seccomp-agentd.json"
+      ],
+      "environment": {
+        "HOME": "/home/bened",
+        "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home",
+        "UV_CACHE_DIR": "/home/bened/.cache/uv",
+        "XDG_CACHE_HOME": "/tmp/agentd-cache",
+        "TMPDIR": "/tmp",
+        "AGENTD_DB": "/home/bened/.local/state/agentd/state.sqlite",
+        "AGENTD_WORKSPACE_ROOT": "/home/bened/.local/share/agentd/workspaces",
+        "AGENTD_CODEX_HOME": "/home/bened/.local/share/agentd/codex-home",
+        "AGENTD_CODEX_MODEL": "${AGENTD_CODEX_MODEL:-gpt-5.6-terra}",
+        "AGENTD_CODEX_REASONING_EFFORT": "${AGENTD_CODEX_REASONING_EFFORT:-medium}",
+        "AGENTD_POLL_SECONDS": "${AGENTD_POLL_SECONDS:-1}",
+        "AGENTD_ACCOUNT_POLL_SECONDS": "${AGENTD_ACCOUNT_POLL_SECONDS:-60}",
+        "AGENTD_ACCOUNT_STALE_SECONDS": "${AGENTD_ACCOUNT_STALE_SECONDS:-300}",
+        "AGENTD_QUOTA_TOP_UP_TOKENS": "${AGENTD_QUOTA_TOP_UP_TOKENS:-25000}",
+        "AGENTD_HARD_CAP_GRACE_SECONDS": "${AGENTD_HARD_CAP_GRACE_SECONDS:-120}",
+        "AGENTD_LOG_LEVEL": "${AGENTD_LOG_LEVEL:-INFO}",
+        "AGENTD_LOG_FORMAT": "${AGENTD_LOG_FORMAT:-json}",
+        "GIT_AUTHOR_NAME": "agentd automation",
+        "GIT_AUTHOR_EMAIL": "agentd@localhost",
+        "GIT_COMMITTER_NAME": "agentd automation",
+        "GIT_COMMITTER_EMAIL": "agentd@localhost"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${AGENTD_STATE_ROOT:?set exact state root}",
+          "target": "/home/bened/.local/state/agentd",
+          "read_only": false,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_WORKSPACE_ROOT:?set exact workspace root}",
+          "target": "/home/bened/.local/share/agentd/workspaces",
+          "read_only": false,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CODEX_HOME:?set exact dedicated Codex home}",
+          "target": "/home/bened/.local/share/agentd/codex-home",
+          "read_only": false,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CODEX_CONFIG:?set exact reviewed Codex config}",
+          "target": "/home/bened/.local/share/agentd/codex-home/config.toml",
+          "read_only": true,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_UV_CACHE:?set exact dedicated uv cache}",
+          "target": "/home/bened/.cache/uv",
+          "read_only": false,
+          "bind": {"create_host_path": false}
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_REPOSITORY_ROOT:?set exact Goldenage repository}",
+          "target": "/home/bened/goldenage",
+          "read_only": false,
+          "bind": {"create_host_path": false}
+        }
+      ],
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,nodev,size=1073741824,uid=1000,gid=1000,mode=1770",
+        "/run/agentd:rw,noexec,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700"
+      ]
+    }
+  }
+}
