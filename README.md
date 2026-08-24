@@ -9,18 +9,21 @@ usage, preserves checkpoints, recovers managed sessions, and holds completed wor
 for review.
 
 > **Project status:** executable local MVP. The scheduler, state store, Git lease
-> management, Codex integration, and hardened single-host deployment are real. The
-> worker backend is still local-process only. This is neither a distributed agent
-> platform nor a general multi-tenant security boundary.
+> management, managed Codex integration, and hardened single-host deployment
+> profile are implemented. Execution is still local-process only. The deployment
+> profile includes mandatory runtime isolation probes, but those host-dependent
+> checks must pass on the target machine before its security guarantees apply.
+> This is neither a distributed agent platform nor a general multi-tenant security
+> boundary.
 
 ## At a glance
 
 | Area | Current implementation |
 | --- | --- |
-| Scheduling | Deterministic QoS, priority, dependency, gang-readiness, capability, and best-fit placement policies |
+| Scheduling | Deterministic QoS, priority, dependency, gang-readiness, capability, and best-fit logical node placement |
 | State | SQLite snapshots, append-only job transitions and usage samples, durable commands, and schema version 1 |
 | Workspaces | One owned Git branch and linked worktree per lease |
-| Execution | One local-process backend |
+| Execution | One local-process backend; logical node placement does not provide remote execution |
 | Harnesses | Deterministic fake driver, managed Codex SDK/App Server driver, and legacy `codex exec` driver |
 | Interfaces | Python control-plane API, worker-scoped API, administrative CLI, and a polling daemon |
 | Completion | Managed Codex uses a metered review handoff with optional repair turns; `agentd` never merges the result |
@@ -32,16 +35,19 @@ for review.
 - accepts typed jobs with objectives, acceptance criteria, dependencies, effort
   estimates, QoS, resource requirements, capabilities, and quota budgets;
 - orders ready work deterministically and admits it only when dependencies, quota,
-  provider policy, a compatible node, and a matching harness are available;
-- uses separate atomic SQLite operations to reserve quota and CPU/RAM/GPU
-  capacity;
+  provider policy, compatible logical node metadata, a local worker backend, and
+  a matching harness are available;
+- uses separate atomic SQLite operations to reserve quota and logical CPU/RAM/GPU
+  capacity against the selected node record;
 - creates and validates exclusive Git worktree leases without mutating the base
   branch;
 - starts a selected harness through a worker-backend protocol;
 - gives the worker only its `ExecutionContract`, not quota balances, node identity,
   scarcity, QoS rank, or scheduler reasoning;
-- supports checkpoints, suspension, resumption, usage accounting, restart recovery
-  for managed Codex threads, and bounded repair turns; and
+- supports durable checkpoints, suspension, logical continuation, usage
+  accounting, managed Codex thread recovery, and bounded repair turns. Resume and
+  restart recovery preserve durable intent and thread state; they do not resume
+  the interrupted OS process or exact turn; and
 - creates a trusted handoff commit for a valid managed Codex result, then waits for
   an operator to accept or repair it.
 
@@ -56,16 +62,20 @@ CLI / Python caller
         v
 ControlPlane + AgentDaemon
         |
-        +-- readiness -> quota -> placement -> Git lease
+        +-- readiness -> quota -> logical placement -> Git lease
         |
         v
-LocalWorkerBackend
+LocalWorkerBackend (current host only)
         |
         +-- fake | Codex SDK/App Server | legacy codex-cli
         |
         v
 checkpoint / metering / review / repair / acceptance
 ```
+
+In the current MVP, placement selects and accounts against a `WorkerNode` record.
+It does not route execution to another machine. `LocalWorkerBackend` starts every
+selected harness on the host running the controller process.
 
 For an ordinary job, the main path is:
 
@@ -74,11 +84,13 @@ For an ordinary job, the main path is:
    child instead.
 2. The daemon filters incomplete dependencies and gang members, then orders the
    remaining candidates by QoS, priority, age, and stable job ID.
-3. The coordinator reserves the expected quota path, allocates node resources,
-   and validates or creates the job's worktree lease.
-4. The coordinator persists an admitted run before the local backend starts the
-   selected driver. Failed starts compensate acquired resources only after the
-   process is known to be quiescent.
+3. The coordinator reserves the expected quota path, selects a compatible logical
+   node, accounts the requested resources against that node, and validates or
+   creates the job's worktree lease.
+4. The coordinator persists an admitted run before `LocalWorkerBackend` starts
+   the selected driver on the current host. The selected node does not represent
+   a remote execution target in the current MVP. Failed starts compensate acquired
+   resources only after the process is known to be quiescent.
 5. The driver receives a compact `ExecutionContract` containing the objective,
    scope, acceptance criteria, dependency handoffs, workspace, model class, and
    optional resume capsule.
@@ -215,6 +227,11 @@ uv run agentd --db .agentd/state.sqlite job JOB_ID
 uv run agentd --db .agentd/state.sqlite history JOB_ID
 ```
 
+For production use with the current backend, register node metadata that represents
+the controller host. Registering additional `WorkerNode` records does not create
+remote workers; without a remote backend they remain scheduling and accounting
+metadata.
+
 ### Run managed Codex work
 
 The reviewed service path additionally requires Linux, Bubblewrap, unprivileged
@@ -341,8 +358,10 @@ When an XDG variable is unset, paths fall back under `~/.local/state`,
 
 These are current boundaries, not hidden roadmap claims:
 
-- It cannot coordinate multiple controller processes. There is one process, one
-  SQLite database, no leader election, and no transactional outbox.
+- It supports one active scheduling daemon per SQLite database. Administrative CLI
+  processes may open the same database, but multiple concurrent schedulers are
+  unsupported: there is no leader election, distributed ownership protocol, or
+  transactional outbox.
 - It cannot execute on a registered machine remotely. `WorkerNode` is scheduling
   metadata; the only worker backend starts a harness on the current host.
 - It has no HTTP/JSON service, MCP transport, web UI, SSH backend, Kubernetes,
@@ -352,8 +371,10 @@ These are current boundaries, not hidden roadmap claims:
   demos; the two real adapters are managed Codex and legacy local `codex exec`.
 - It does not read Beads, issues, or planning documents and cannot compile
   repository intent into jobs automatically.
-- Gang readiness is implemented, but multi-node gang launch is not atomic and has
-  no persisted barrier aggregate.
+- Gang readiness can hold related jobs until their members are dependency-ready.
+  There is no distributed gang launch or multi-host barrier: every dispatched
+  harness still starts through the local-process backend. Gang barrier state is
+  not persisted as a separate aggregate.
 - Tail-governor decisions are a Python policy call, not an automatic daemon loop.
   Explicit quota reset events also require a caller.
 - Refinement and blocker messages are bounded in-memory records and are lost on
@@ -370,8 +391,9 @@ These are current boundaries, not hidden roadmap claims:
 - The trusted provisioning profile currently installs Python 3.14 and the `dev`
   extra for the reviewed deployment. Per-job toolchains and extras are not a
   public policy surface.
-- Schema migration support currently covers initialization from version 0 to
-  version 1. No later migration path exists yet.
+- SQLite records schema version 1 in `PRAGMA user_version`. Databases with version
+  0 are bootstrapped in place to the current schema; databases newer than the
+  binary are rejected. No version-to-version upgrade migration exists yet.
 
 ## Troubleshooting
 

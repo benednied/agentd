@@ -32,6 +32,8 @@ replace it with an explicitly documented, tested equivalent.
 
 - Do not open SQLite without `foreign_keys`, the configured `busy_timeout`, and WAL
   for file-backed databases.
+- Treat version 0 to 1 as the bootstrap path, not as evidence that a deployed
+  schema upgrade has been exercised.
 - Never edit `SCHEMA` without incrementing `SCHEMA_VERSION` and adding an explicit,
   idempotent migration from every supported prior version. Continue rejecting a
   database whose version is newer than the running binary.
@@ -81,9 +83,13 @@ replace it with an explicitly documented, tested equivalent.
   intentional invariant changes, explain that change in this document or its
   successor rather than silently accepting the regression.
 
-## Current verification baseline
+## Historical verification baseline
 
-| Check | Current result |
+The metrics below record the remediation snapshot; they are historical evidence,
+not repository-wide current-status claims. Current pull requests must run the
+authoritative commands below and report their own results.
+
+| Check | Recorded result |
 | --- | --- |
 | Test suite | 286 passed in 12.19 s |
 | Statement coverage | 84% (5,128 statements, 801 missed) |
@@ -109,7 +115,7 @@ uv run ruff check src/agentd --select C901
 | --- | --- | --- |
 | 1. No operational logging | **Completed** | Loguru is a runtime dependency. `observability.py` owns the single stderr sink, JSON/text selection, levels, exception-safe sink settings, and an explicit context-field allow-list. Daemon, coordinator, managed harness, quota, workspace, recovery, and service lifecycle events carry operational IDs without prompts, instructions, credentials, token values, worker output, or exception messages. Unit tests cover structured context and rejection of unknown sensitive fields; deployment configuration and retention responsibilities are documented. |
 | 2. No CI | **Completed** | `.github/workflows/ci.yml` runs locked dependency sync, Ruff lint, Ruff format check, and the full Pytest suite with read-only repository permissions and a job timeout. |
-| 3. No schema versioning or migrations | **Completed for the current schema** | SQLite initialization reads `PRAGMA user_version`, rejects databases newer than the binary, and idempotently upgrades version 0 to version 1 using the existing `IF NOT EXISTS` schema. Tests cover new, reopened, legacy-version, and future-version databases. Future schema changes must add another explicit migration step. |
+| 3. No schema versioning or migrations | **Schema versioning completed; upgrade migrations not yet exercised** | SQLite initialization reads `PRAGMA user_version`, records schema version 1, bootstraps version 0 in place, and rejects databases newer than the binary. No nonzero-to-nonzero schema upgrade exists yet because version 1 is the first persisted schema. The first schema change must add and test an explicit idempotent migration before incrementing `SCHEMA_VERSION`. |
 | 4. Personal paths in core source | **Completed** | `ServiceConfig` derives defaults from `HOME` and XDG state/data/cache locations. There are zero `/home/bened` or `goldenage` references in `src/agentd`. The reviewed single-host paths remain explicit deployment policy in `deploy/` and deployment documentation. |
 | 5. Twelve high-complexity functions | **Partially completed; remaining work deliberately deferred** | The 174-line CLI cascade was replaced by focused process, lifecycle, and store handlers; `cli.main` is no longer a C901 finding. Eleven functions remain above 10. Coordinator dispatch/recovery, streamed result collection, usage settlement, and Git rollback encode failure compensation or state-machine invariants; they were not split merely to lower a metric. Logging slightly increased `_dispatch`'s measured branching, but its compensation order and tests remain intact. Future refactors require invariant-specific regression tests first. |
 | 6. Optional methods discovered with `getattr()` | **Completed for lifecycle capabilities** | Runtime-checkable Protocols now represent recovery, reconciliation, admission inspection, pending commands, and repair continuation. The sole remaining `getattr()` adapts an external SDK payload's optional `model_dump` serializer; it is compatibility probing, not silent lifecycle capability discovery, so the original finding no longer applies to it. |

@@ -1,8 +1,11 @@
 # Architecture
 
-Agentd is a local meta-harness: it decides what may run and where, then gives a
-bounded execution contract to a harness. Harnesses execute work; they do not own
-quota, priority, node selection, workspace isolation, preemption, or job lifecycle.
+Agentd is a local meta-harness: it decides what may run, selects a logical node for
+resource accounting and compatibility, then gives a bounded execution contract to
+a harness. In the current MVP, physical execution is not distributed:
+`LocalWorkerBackend` starts the harness on the controller host. Harnesses execute
+work; they do not own quota, priority, node selection, workspace isolation,
+preemption, or job lifecycle.
 
 ```text
 Repository intent (caller-supplied in the current MVP)
@@ -33,12 +36,17 @@ Repository intent (caller-supplied in the current MVP)
 | `SchedulerCoordinator` | Admission effects, compensation and lifecycle sequencing | Harness command syntax or project authoring |
 | SQLite state store | Runtime snapshots, job transition audit, reservations, allocations, managed-driver sessions, telemetry and durable commands | Repository truth or live App Server transports |
 | Git workspace manager | Exclusive branch/worktree leases and commit inspection | Review acceptance, merges or integration policy |
-| Worker backend | Where a selected driver starts | Which job, harness or model wins |
+| Worker backend | How and where a selected driver is physically started | Which job, logical node, harness or model wins |
 | Harness driver | Translation of `ExecutionContract` and run control | Scheduler quota, QoS, scarcity or preemption policy |
 | Run supervisor | App Server thread/turn transport, streamed observations, usage normalization and command delivery | Admission, repair count, review acceptance or provider-account policy |
 | Account oracle | Read-only provider window, reset and opaque-credit observations | Local token balances or admission decisions |
 | `AgentDaemon` | Startup recovery, provider polling, managed-run reconciliation and repeated dispatch | Repository intent, review judgment or integration |
 | `AgentAPI` | The six run-scoped worker operations | Administrative state and scheduler rationale |
+
+`WorkerNode` and `WorkerBackend` are deliberately separate concepts. Placement
+selects a `WorkerNode` for compatibility and resource accounting. A backend turns
+that admitted assignment into physical execution. The MVP has only
+`LocalWorkerBackend`, so a selected node does not imply transport to another host.
 
 The architectural source of truth for project intent is the repository. The MVP
 does not yet include a Beads/issue/plan adapter, so callers currently construct
@@ -120,8 +128,9 @@ reuses the validated lease.
 For jobs in `READY`, `dispatch_next` applies this sequence:
 
 1. Order candidates deterministically and require dependency/gang readiness.
-2. Require the named quota pool and a compatible node, harness, model and local
-   backend.
+2. Require the named quota pool, a compatible logical node, harness and model,
+   plus a worker backend capable of executing that node. The MVP backend is local
+   only.
 3. Reserve the expected accepted-artifact quota path.
 4. Allocate node resources.
 5. Validate and reuse the job's lease, or create a Git branch/worktree.
@@ -158,15 +167,19 @@ errors do not roll back the accepted lifecycle result and are reported as a
 
 The scheduler policy modules are pure and deterministic:
 
-- Dependencies block until every referenced job is `COMPLETED`. Gang members are
-  held until every known member is dependency-ready; multi-node gang launch is not
-  atomic and there is no persisted barrier aggregate.
+- Dependencies block until every referenced job is `COMPLETED`. Gang readiness can
+  hold related jobs until every known member is dependency-ready. The current
+  backend provides no distributed or multi-host gang launch, and there is no
+  persisted gang-barrier aggregate.
 - QoS, explicit priority, age and stable job ID determine ordering. Urgent work
   remains ahead of pre-reset burn work.
-- Placement filters node state, OS/architecture/labels, browser/desktop and generic
+- Logical placement filters registered node state, OS/architecture/labels,
+  browser/desktop and generic
   capabilities, available CPU/RAM/GPU/VRAM, allowed harnesses, and exact advertised
   model-class strings. Harness preference wins first; normalized resource waste
-  and stable IDs provide deterministic best fit.
+  and stable IDs provide deterministic best fit. The result controls admission and
+  resource accounting; it does not route the process to another host in the
+  current backend.
 - Hors-categorie submission creates one bounded reconnaissance child and leaves
   the parent in `PLANNING`. Explicit promotion requires completed reconnaissance
   plus a structured finite plan, checkpoint boundaries, effort tail and budget
@@ -328,11 +341,19 @@ mode. The following multi-record operations are atomic:
 - compare-and-swap observation-cursor advancement plus the latest observation and,
   for terminal observations, driver-session deactivation.
 
-The process-local lock serializes use of one store instance, while optimistic
-snapshot validation catches stale accounting updates. The schema is created in
-place and has no versioned migration mechanism. App Server client objects, stream
-tasks, legacy CLI/fake process objects, the model API's refinement/blocker records,
-and daemon polling timestamps remain memory-only. Durable commands are delivered
-at least once: acknowledgement occurs only after the provider call succeeds and
-the command ID is included in steering text, but a controller crash between those
-two effects can cause replay.
+The process-local lock serializes use of one store instance. Separate processes
+rely on SQLite locking/WAL plus persisted optimistic checks; the process-local lock
+does not coordinate them. Only one active scheduling daemon is supported for a
+database.
+
+The store records `SCHEMA_VERSION = 1` through SQLite `PRAGMA user_version`.
+Version 0 is bootstrapped in place to schema version 1 and databases newer than the
+binary are rejected. There is currently no general version-to-version migration
+chain; the first real schema upgrade must add an explicit migration before
+increasing `SCHEMA_VERSION`.
+
+App Server client objects, stream tasks, legacy CLI/fake process objects, the model
+API's refinement/blocker records, and daemon polling timestamps remain memory-only.
+Durable commands are delivered at least once: acknowledgement occurs only after
+the provider call succeeds and the command ID is included in steering text, but a
+controller crash between those two effects can cause replay.
