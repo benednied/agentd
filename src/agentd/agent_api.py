@@ -178,6 +178,7 @@ class AgentAPI:
         """Hand the current artifact to the control plane's review lifecycle."""
 
         run = self._require_current_run(run_id, frozenset({RunState.RUNNING}))
+        self._reject_managed_lifecycle(run)
         job = await self._control_plane.request_review(run.job_id)
         self._verify_job(job, run)
         return AgentActionResult(
@@ -193,6 +194,7 @@ class AgentAPI:
             run_id,
             frozenset({RunState.RUNNING, RunState.SUSPENDED}),
         )
+        self._reject_managed_lifecycle(run)
         if (
             run.state is RunState.SUSPENDED
             and self._control_plane.inspect_job(run.job_id).state is not JobState.REVIEW
@@ -248,6 +250,15 @@ class AgentAPI:
         if run.state not in allowed_states:
             raise AgentRunStateError("Operation is unavailable for this run state")
         return run
+
+    def _reject_managed_lifecycle(self, run: RunRecord) -> None:
+        """Keep durable managed drivers on observation-led finalization only."""
+
+        if not self._control_plane.is_managed_run(run.id):
+            return
+        raise AgentRunStateError(
+            "Managed runs finalize through durable observation reconciliation"
+        )
 
     def _record_request(
         self,

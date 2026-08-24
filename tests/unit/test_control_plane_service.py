@@ -15,7 +15,8 @@ def _advance(store: SQLiteStateStore, job: Job, *states: JobState) -> Job:
     current = job
     for state in states:
         current, event = transition_job(current, state, f"advance to {state}")
-        store.save_job(current, event)
+        store.save_job(current, event, expected=job)
+        job = current
     return current
 
 
@@ -42,6 +43,33 @@ def test_hors_categorie_submission_dispatches_only_bounded_reconnaissance(
     assert reconnaissance[0].effort.p99 is not None
     assert reconnaissance[0].quota_budget.maximum == 10
     assert "Do not implement the full objective yet" in reconnaissance[0].objective
+
+
+def test_codex_hors_categorie_reconnaissance_preserves_token_quota(
+    make_job: Callable[..., Job],
+) -> None:
+    store = SQLiteStateStore()
+    plane = ControlPlane(store, id_factory=lambda: "codex-recon")
+    parent = make_job(
+        id="codex-parent",
+        qos=QoSClass.HORS_CATEGORIE,
+        allowed_harnesses=("codex",),
+        preferred_harnesses=("codex",),
+        quota_budget=QuotaBudget(
+            50_000,
+            maximum=100_000,
+            pool_id="codex-subscription",
+            unit=QuotaUnit.TOKENS,
+        ),
+    )
+
+    submitted = plane.submit(parent)
+    reconnaissance = plane.reconnaissance_for(parent.id)[0]
+
+    assert submitted.state is JobState.PLANNING
+    assert reconnaissance.state is JobState.READY
+    assert reconnaissance.quota_budget.pool_id == "codex-subscription"
+    assert reconnaissance.quota_budget.unit is QuotaUnit.TOKENS
 
 
 def test_hors_categorie_promotion_requires_completed_bounded_outcome(

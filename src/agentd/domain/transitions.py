@@ -56,6 +56,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.METERING_PENDING: frozenset(
         {
             JobState.REVIEW,
+            JobState.SUSPENDED,
             JobState.FAILED,
             JobState.CANCELLED,
         }

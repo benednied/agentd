@@ -102,7 +102,7 @@ def _runtime(
         working_directory="/worktree",
         base_ref=job.base_ref,
     )
-    store.save_workspace(workspace)
+    store.save_workspace(workspace, expected=None)
     run = RunRecord(
         id="run",
         job_id=job.id,
@@ -117,7 +117,7 @@ def _runtime(
         state=RunState.RUNNING,
         started_at=NOW,
     )
-    store.save_run(run)
+    store.save_run(run, expected=None)
     return store, job, run
 
 
@@ -295,7 +295,7 @@ def test_top_up_and_metering_final_settlement(
         JobState.REVIEW,
         "final telemetry accepted",
     )
-    store.save_job(review, event)
+    store.save_job(review, event, expected=pending_job)
 
     duplicate = store.apply_usage_sample(final_sample, maximum=30)
     assert duplicate.duplicate
@@ -333,7 +333,7 @@ def test_driver_session_terminal_observation_and_durable_command_ack(
         created_at=NOW,
         updated_at=NOW,
     )
-    store.save_driver_session(session)
+    store.save_driver_session(session, expected=None)
     result = RunResult(
         outcome=RunOutcome.COMPLETED,
         usage=TokenUsage(input_tokens=3, output_tokens=1),
@@ -452,7 +452,7 @@ def test_usage_sessions_snapshots_and_commands_survive_store_restart(
         created_at=NOW,
         updated_at=NOW,
     )
-    store.save_driver_session(session)
+    store.save_driver_session(session, expected=None)
     snapshot = ProviderQuotaSnapshot(
         id="durable-snapshot",
         pool_id=job.quota_budget.pool_id,

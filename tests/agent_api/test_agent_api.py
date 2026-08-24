@@ -17,6 +17,7 @@ from agentd.agent_api import (
 from agentd.domain.enums import JobState, RunState
 from agentd.domain.models import (
     Checkpoint,
+    DriverSession,
     ExecutionContract,
     Job,
     QuotaPool,
@@ -47,6 +48,13 @@ class RecordingCoordinator:
         self.calls.append(("assignment", run_id))
         return self.store.get_run(run_id).contract
 
+    def is_managed_run(self, run_id: str) -> bool:
+        try:
+            self.store.get_driver_session(run_id)
+        except LookupError:
+            return False
+        return True
+
     async def checkpoint(
         self,
         job_id: str,
@@ -73,9 +81,12 @@ class RecordingCoordinator:
             "worker requested review",
             at=FIXED_TIME,
         )
-        self.store.save_job(review, event)
+        self.store.save_job(review, event, expected=job)
         run = self._active_run(job_id)
-        self.store.save_run(replace(run, state=RunState.SUSPENDED, ended_at=FIXED_TIME))
+        self.store.save_run(
+            replace(run, state=RunState.SUSPENDED, ended_at=FIXED_TIME),
+            expected=run,
+        )
         return review
 
     async def complete(self, job_id: str) -> Job:
@@ -87,7 +98,7 @@ class RecordingCoordinator:
             "worker completion accepted",
             at=FIXED_TIME + timedelta(seconds=1),
         )
-        self.store.save_job(completed, event)
+        self.store.save_job(completed, event, expected=job)
         run = self.store.latest_run(job_id)
         if run is None:  # pragma: no cover - test-double invariant
             raise AssertionError(f"No run for {job_id}")
@@ -96,7 +107,8 @@ class RecordingCoordinator:
                 run,
                 state=RunState.COMPLETED,
                 ended_at=FIXED_TIME + timedelta(seconds=1),
-            )
+            ),
+            expected=run,
         )
         return completed
 
@@ -205,9 +217,10 @@ def api_context(make_job: Callable[..., Job]) -> Iterator[APIContext]:
             working_directory=contract.working_directory,
             base_ref="HEAD",
             created_at=FIXED_TIME,
-        )
+        ),
+        expected=None,
     )
-    store.save_run(run)
+    store.save_run(run, expected=None)
     coordinator = RecordingCoordinator(store)
     control_plane = ControlPlane(store, coordinator=coordinator)
     api = AgentAPI(
@@ -260,7 +273,7 @@ def test_stale_run_cannot_control_a_newer_attempt(api_context: APIContext) -> No
         started_at=FIXED_TIME - timedelta(hours=1),
         ended_at=FIXED_TIME - timedelta(minutes=30),
     )
-    api_context.store.save_run(stale)
+    api_context.store.save_run(stale, expected=None)
 
     # The opaque capability can still retrieve its immutable historical contract,
     # but it cannot act on the current attempt for the same job.
@@ -366,3 +379,26 @@ def test_agent_api_validates_bounded_request_configuration(
         AgentAPI(api_context.control_plane, max_request_records=0)
     with pytest.raises(ValueError, match="message length"):
         AgentAPI(api_context.control_plane, max_message_length=0)
+
+
+def test_managed_run_cannot_bypass_observation_review_gate(
+    api_context: APIContext,
+) -> None:
+    api_context.store.save_driver_session(
+        DriverSession(
+            id="managed-session",
+            run_id=api_context.run.id,
+            driver=api_context.run.driver,
+        ),
+        expected=None,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(AgentRunStateError, match="observation reconciliation"):
+            await api_context.api.request_review(api_context.run.id)
+        with pytest.raises(AgentRunStateError, match="observation reconciliation"):
+            await api_context.api.complete(api_context.run.id)
+
+    asyncio.run(scenario())
+    assert api_context.coordinator.calls == []
+    assert api_context.store.get_job(api_context.job.id).state is JobState.RUNNING

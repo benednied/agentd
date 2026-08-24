@@ -57,7 +57,7 @@ def test_job_snapshots_and_transition_history_survive_restart(
     with SQLiteStateStore(path) as store:
         store.create_job(job, initial_transition(job))
         ready, event = transition_job(job, JobState.READY, "ready")
-        store.save_job(ready, event)
+        store.save_job(ready, event, expected=job)
 
     with SQLiteStateStore(path) as reopened:
         assert reopened.get_job(job.id) == ready
@@ -78,7 +78,7 @@ def test_store_rejects_unaudited_state_change(
     store.create_job(job, initial_transition(job))
 
     with pytest.raises(ConcurrentStateError, match="audit transition"):
-        store.save_job(replace(job, state=JobState.READY))
+        store.save_job(replace(job, state=JobState.READY), expected=job)
 
     assert store.get_job(job.id).state == JobState.BACKLOG
 
@@ -90,7 +90,7 @@ def test_non_state_metadata_update_does_not_forge_history(
     job = make_job()
     store.create_job(job, initial_transition(job))
 
-    store.save_job(replace(job, selected_harness="fake"))
+    store.save_job(replace(job, selected_harness="fake"), expected=job)
 
     assert store.get_job(job.id).selected_harness == "fake"
     assert len(store.list_transitions(job.id)) == 1

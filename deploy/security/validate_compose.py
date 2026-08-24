@@ -51,6 +51,52 @@ REQUIRED_CONFIG_ENVIRONMENT = {
     "AGENTD_LOG_LEVEL",
     "AGENTD_LOG_FORMAT",
 }
+EXPECTED_SECURITY_OPTIONS = {
+    "no-new-privileges:true",
+    "apparmor=lxc-usernsexec",
+    "seccomp=./container/seccomp-agentd.json",
+}
+EXPECTED_TMPFS = {
+    "/tmp": {
+        "rw",
+        "noexec",
+        "nosuid",
+        "nodev",
+        "size=1073741824",
+        "uid=1000",
+        "gid=1000",
+        "mode=1770",
+    },
+    "/run/agentd": {
+        "rw",
+        "noexec",
+        "nosuid",
+        "nodev",
+        "size=16777216",
+        "uid=1000",
+        "gid=1000",
+        "mode=0700",
+    },
+}
+EXPECTED_ENTRYPOINT_COMMAND = (
+    "/opt/agentd/venv/bin/python "
+    "/opt/agentd/security/runtime_sandbox_probe.py && "
+    'exec /opt/agentd/venv/bin/agentd "$@"'
+)
+EXPECTED_ENTRYPOINTS = (
+    [
+        "/bin/sh",
+        "-ec",
+        EXPECTED_ENTRYPOINT_COMMAND,
+        "agentd-entrypoint",
+    ],
+    [
+        "/bin/sh",
+        "-ec",
+        EXPECTED_ENTRYPOINT_COMMAND.replace("$", "$$"),
+        "agentd-entrypoint",
+    ],
+)
 
 
 class SecurityValidationError(ValueError):
@@ -104,6 +150,10 @@ def validate_service(
     )
     require(service.get("working_dir") == "/home/bened/goldenage", "unexpected workdir")
     require(service.get("init") is True, "container init must be enabled")
+    require(
+        service.get("entrypoint") in EXPECTED_ENTRYPOINTS,
+        "container startup must run the runtime security preflight",
+    )
     require(service.get("cap_drop") == ["ALL"], "all Linux capabilities must drop")
     require(not service.get("cap_add"), "capabilities must not be added")
     require(service.get("pids_limit") == 512, "PID limit must be 512")
@@ -121,7 +171,12 @@ def validate_service(
         require(not service.get(unsafe_key), f"{unsafe_key} must not be configured")
     require(service.get("network_mode") != "host", "host networking is forbidden")
 
-    security_options = {str(item) for item in service.get("security_opt", [])}
+    raw_security_options = service.get("security_opt", [])
+    security_options = (
+        {str(item) for item in raw_security_options}
+        if isinstance(raw_security_options, list)
+        else set()
+    )
     require(
         "no-new-privileges:true" in security_options,
         "no-new-privileges must be enabled",
@@ -131,12 +186,13 @@ def validate_service(
         "the reviewed user-namespace AppArmor profile must be selected",
     )
     require(
-        any(option.endswith("seccomp-agentd.json") for option in security_options),
+        "seccomp=./container/seccomp-agentd.json" in security_options,
         "reviewed seccomp profile must be selected",
     )
     require(
-        len(security_options) == 3,
-        "service security options contain an unreviewed value",
+        security_options == EXPECTED_SECURITY_OPTIONS
+        and len(raw_security_options) == len(EXPECTED_SECURITY_OPTIONS),
+        "service security options must exactly match the reviewed values",
     )
 
     environment = _environment_map(service.get("environment", {}))
@@ -177,12 +233,31 @@ def validate_service(
         "bind mounts must match the exact reviewed paths",
     )
 
-    tmpfs_entries = [str(item) for item in service.get("tmpfs", [])]
-    tmpfs = "\n".join(tmpfs_entries)
-    require(len(tmpfs_entries) == 2, "only the two reviewed tmpfs mounts are allowed")
-    require("/tmp:" in tmpfs and "/run/agentd:" in tmpfs, "required tmpfs missing")
-    require("noexec" in tmpfs and "nosuid" in tmpfs and "nodev" in tmpfs, "tmpfs flags")
-    require("uid=1000" in tmpfs and "gid=1000" in tmpfs, "tmpfs owner must be 1000")
+    raw_tmpfs = service.get("tmpfs", [])
+    tmpfs_entries = raw_tmpfs if isinstance(raw_tmpfs, list) else []
+    parsed_tmpfs: dict[str, set[str]] = {}
+    for raw_entry in tmpfs_entries:
+        if not isinstance(raw_entry, str):
+            errors.append("all tmpfs mounts must use string syntax")
+            continue
+        target, separator, raw_options = raw_entry.partition(":")
+        options = raw_options.split(",") if separator and raw_options else []
+        if target in parsed_tmpfs:
+            errors.append(f"duplicate tmpfs target: {target}")
+            continue
+        parsed_tmpfs[target] = set(options)
+        require(
+            len(options) == len(parsed_tmpfs[target]),
+            f"{target} contains duplicate tmpfs options",
+        )
+    require(
+        len(tmpfs_entries) == len(EXPECTED_TMPFS),
+        "only the two reviewed tmpfs mounts are allowed",
+    )
+    require(
+        parsed_tmpfs == EXPECTED_TMPFS,
+        "each tmpfs target must use its complete reviewed option set",
+    )
 
     if errors:
         raise SecurityValidationError("; ".join(errors))

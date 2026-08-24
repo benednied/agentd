@@ -73,7 +73,12 @@ class RunSupervisorStore(Protocol):
 
     def get_run(self, run_id: str) -> RunRecord: ...
 
-    def save_driver_session(self, session: DriverSession) -> None: ...
+    def save_driver_session(
+        self,
+        session: DriverSession,
+        *,
+        expected: DriverSession | None,
+    ) -> None: ...
 
     def get_driver_session(self, run_id: str) -> DriverSession: ...
 
@@ -192,7 +197,8 @@ class RunSupervisor:
                 thread_id=thread_id,
                 metadata=metadata,
             )
-            self._store.save_driver_session(session)
+            self._store.save_driver_session(session, expected=None)
+            previous_session = session
             turn_id = await self._start_turn(
                 client,
                 thread_id,
@@ -200,7 +206,7 @@ class RunSupervisor:
                 workspace,
             )
             session = replace(session, turn_id=turn_id, updated_at=utc_now())
-            self._store.save_driver_session(session)
+            self._store.save_driver_session(session, expected=previous_session)
             live = self._activate(
                 run_id,
                 execution,
@@ -277,8 +283,9 @@ class RunSupervisor:
                 workspace,
             )
             recovery_count = _metadata_int(session.metadata, "recovery_count") + 1
+            previous_session = session
             session = replace(
-                session,
+                previous_session,
                 external_id=thread_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -290,7 +297,7 @@ class RunSupervisor:
                 },
                 updated_at=utc_now(),
             )
-            self._store.save_driver_session(session)
+            self._store.save_driver_session(session, expected=previous_session)
             live = self._activate(
                 run_id,
                 execution,
@@ -371,8 +378,9 @@ class RunSupervisor:
             continuation_count = (
                 _metadata_int(session.metadata, "continuation_count") + 1
             )
+            previous_session = session
             session = replace(
-                session,
+                previous_session,
                 external_id=thread_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -385,7 +393,7 @@ class RunSupervisor:
                 },
                 updated_at=utc_now(),
             )
-            self._store.save_driver_session(session)
+            self._store.save_driver_session(session, expected=previous_session)
             live = self._activate(
                 run_id,
                 execution,

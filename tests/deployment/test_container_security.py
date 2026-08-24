@@ -7,6 +7,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 DEPLOY = REPOSITORY / "deploy"
 COMPOSE = DEPLOY / "compose.yaml"
@@ -42,6 +44,21 @@ def _compose_service() -> dict[str, object]:
     return payload["services"]["agentd"]
 
 
+def _rendered_service() -> dict[str, object]:
+    service = copy.deepcopy(_compose_service())
+    service["image"] = f"agentd:{'a' * 40}"
+    service["entrypoint"][2] = service["entrypoint"][2].replace("$", "$$")
+    for volume in service["volumes"]:
+        volume["source"] = volume["target"]
+    for name, value in list(service["environment"].items()):
+        if str(value).startswith("${"):
+            service["environment"][name] = {
+                "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
+                "AGENTD_CODEX_REASONING_EFFORT": "medium",
+            }.get(name, "1")
+    return service
+
+
 def _template_environment() -> dict[str, str]:
     result: dict[str, str] = {}
     for raw_line in ENV_TEMPLATE.read_text(encoding="utf-8").splitlines():
@@ -71,6 +88,22 @@ def test_compose_enforces_resource_and_privilege_boundary() -> None:
     assert "apparmor=lxc-usernsexec" in service["security_opt"]
     assert "seccomp=./container/seccomp-agentd.json" in service["security_opt"]
     assert "ports" not in service
+
+
+def test_compose_runs_runtime_preflight_inside_every_container_start() -> None:
+    service = _compose_service()
+
+    assert service["restart"] == "unless-stopped"
+    assert service["entrypoint"] == [
+        "/bin/sh",
+        "-ec",
+        (
+            "/opt/agentd/venv/bin/python "
+            "/opt/agentd/security/runtime_sandbox_probe.py && "
+            'exec /opt/agentd/venv/bin/agentd "$@"'
+        ),
+        "agentd-entrypoint",
+    ]
 
 
 def test_compose_has_only_exact_narrow_mounts_and_tmpfs() -> None:
@@ -126,17 +159,7 @@ def test_compose_aligns_service_config_and_nonsecret_git_identity() -> None:
 def test_rendered_compose_security_validator_accepts_reviewed_contract(
     tmp_path: Path,
 ) -> None:
-    payload = json.loads(COMPOSE.read_text(encoding="utf-8"))
-    service = copy.deepcopy(payload["services"]["agentd"])
-    service["image"] = f"agentd:{'a' * 40}"
-    for volume in service["volumes"]:
-        volume["source"] = volume["target"]
-    for name, value in list(service["environment"].items()):
-        if str(value).startswith("${"):
-            service["environment"][name] = {
-                "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
-                "AGENTD_CODEX_REASONING_EFFORT": "medium",
-            }.get(name, "1")
+    service = _rendered_service()
     rendered = tmp_path / "compose.json"
     rendered.write_text(
         json.dumps({"services": {"agentd": service}}),
@@ -151,6 +174,45 @@ def test_rendered_compose_security_validator_accepts_reviewed_contract(
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("case", ["seccomp", "tmpfs", "entrypoint"])
+def test_rendered_validator_rejects_security_preflight_bypasses(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    service = _rendered_service()
+    if case == "seccomp":
+        service["security_opt"][-1] = "seccomp=/tmp/unreviewed/seccomp-agentd.json"
+    elif case == "tmpfs":
+        service["tmpfs"][0] = (
+            service["tmpfs"][0]
+            .replace("noexec,", "")
+            .replace(
+                ",size=1073741824",
+                "",
+            )
+        )
+    else:
+        service["entrypoint"] = ["/opt/agentd/venv/bin/agentd"]
+    rendered = tmp_path / f"compose-{case}.json"
+    rendered.write_text(
+        json.dumps({"services": {"agentd": service}}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOY / "security" / "validate_compose.py"),
+            rendered,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
 
 
 def test_rendered_compose_security_validator_rejects_unreviewed_exposure(
@@ -441,6 +503,7 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
     config_path = DEPLOY / "container" / "config.toml"
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     provision = (DEPLOY / "scripts" / "provision-host.sh").read_text(encoding="utf-8")
+    common = (DEPLOY / "scripts" / "common.sh").read_text(encoding="utf-8")
     dockerfile = (REPOSITORY / "Dockerfile").read_text(encoding="utf-8")
 
     assert config["approval_policy"] == "never"
@@ -476,9 +539,45 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
     assert config["analytics"] == {"enabled": False}
     assert "auth" not in config_path.read_text(encoding="utf-8").lower()
     assert "../container/config.toml" in provision
-    assert 'install -o 1000 -g 1000 -m 0600 "$config_source"' in provision
-    assert 'chmod 0600 "$AGENTD_CODEX_HOME/config.toml"' in provision
+    assert 'install_config_atomically "$config_source"' in provision
+    assert "require_safe_codex_config" in provision
+    assert 'install -o 1000 -g 1000 -m 0600 "$config_source"' in common
+    assert 'mv -f "$config_tmp" "$AGENTD_CODEX_CONFIG"' in common
     assert "deploy/container/config.toml /opt/agentd/security/config.toml" in dockerfile
+
+
+def test_release_backup_and_rollback_include_codex_policy() -> None:
+    common = (DEPLOY / "scripts" / "common.sh").read_text(encoding="utf-8")
+    deploy = (DEPLOY / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    rollback = (DEPLOY / "scripts" / "rollback.sh").read_text(encoding="utf-8")
+    provision = (DEPLOY / "scripts" / "provision-host.sh").read_text(encoding="utf-8")
+
+    assert '"$AGENTD_CODEX_CONFIG" "$backup_dir/config.toml"' in common
+    assert 'cmp -s "$AGENTD_CODEX_CONFIG" "$release_config"' in common
+    assert '"$backup_dir/config.toml" \\' in common
+    assert "config_restore_tmp=$AGENTD_CODEX_HOME/.config.toml.restore-$$" in common
+    assert 'mv -f "$config_restore_tmp" "$AGENTD_CODEX_CONFIG"' in common
+    assert 'install_release_config "$release_sha"' in deploy
+    assert 'if ! atomic_release_link "$release_sha"; then' in deploy
+    assert deploy.count("restore_previous_activation") == 4
+    assert deploy.index("stop_current_release_containers") < deploy.index(
+        'restore_state "$backup_dir"'
+    )
+    assert 'restore_state "$backup_dir"' in deploy
+    assert 'if ! atomic_release_link "$target_sha"; then' in rollback
+    assert rollback.count("restore_pre_rollback_activation") == 3
+    assert rollback.index("stop_current_release_containers") < rollback.index(
+        'restore_state "$safety_backup"'
+    )
+    assert 'restore_state "$selected_backup"' in rollback
+    assert 'cmp -s "$selected_backup/config.toml" "$target_config"' in rollback
+    assert 'restore_state "$safety_backup"' in rollback
+    assert 'if ! mv -Tf "$temporary_link" "$AGENTD_CURRENT_LINK"; then' in common
+    assert 'if ! mv -f "$restore_tmp" "$AGENTD_DB"; then' in common
+    assert common.index(
+        'mv -f "$config_restore_tmp" "$AGENTD_CODEX_CONFIG"'
+    ) < common.index('mv -f "$restore_tmp" "$AGENTD_DB"')
+    assert "config_status=preserved" in provision
 
 
 def test_codex_config_pins_repository_trust_before_read_only_mount() -> None:

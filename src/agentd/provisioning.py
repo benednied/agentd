@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -43,7 +45,18 @@ async def _run_command(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await process.communicate()
+    except BaseException:
+        # ``start_new_session`` makes the child the leader of a process group.
+        # A timeout in ``_run_trusted_step`` cancels this coroutine; cancelling
+        # ``communicate`` alone leaves the process and any package build hooks
+        # alive after the workspace has been released.  Kill the whole owned
+        # group and reap the leader before allowing cancellation to propagate.
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        raise
     return process.returncode, stdout, stderr
 
 

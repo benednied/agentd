@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from pathlib import Path
 
 import pytest
 
 from agentd.domain.models import WorkspaceLease
-from agentd.provisioning import RepositoryProvisioningError, TrustedUvProvisioner
+from agentd.provisioning import (
+    RepositoryProvisioningError,
+    TrustedUvProvisioner,
+    _run_command,
+)
 
 
 def _lease(workspace: Path) -> WorkspaceLease:
@@ -166,3 +171,53 @@ def test_provisioner_rejects_missing_workspace(tmp_path: Path) -> None:
 
     with pytest.raises(RepositoryProvisioningError, match="does not exist"):
         asyncio.run(provisioner.prepare(_lease(tmp_path / "missing")))
+
+
+def test_command_runner_kills_and_reaps_process_group_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        communicating = asyncio.Event()
+
+        class FakeProcess:
+            pid = 4242
+            returncode = -signal.SIGKILL
+            waited = False
+
+            async def communicate(self):
+                communicating.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def wait(self):
+                self.waited = True
+                return self.returncode
+
+        process = FakeProcess()
+
+        async def create_subprocess_exec(*_arguments, **kwargs):
+            assert kwargs["start_new_session"] is True
+            return process
+
+        killed: list[tuple[int, signal.Signals]] = []
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+        monkeypatch.setattr(
+            "agentd.provisioning.os.killpg",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        task = asyncio.create_task(_run_command(("uv",), tmp_path, {}))
+        await communicating.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert killed == [(process.pid, signal.SIGKILL)]
+        assert process.waited
+
+    asyncio.run(scenario())

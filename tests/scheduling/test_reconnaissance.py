@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from agentd.domain.enums import JobState, QoSClass
+from agentd.domain.enums import JobState, QoSClass, QuotaUnit
 from agentd.domain.models import EffortEstimate, QuotaBudget
 from agentd.scheduling.reconnaissance import (
     RECONNAISSANCE_ACCEPTANCE_CRITERIA,
@@ -20,7 +20,14 @@ def test_compiles_hors_categorie_parent_into_bounded_reconnaissance(job_factory)
         id="parent",
         qos=QoSClass.HORS_CATEGORIE,
         dependencies=("foundation",),
-        quota_budget=QuotaBudget(implementation=100, pool_id="subscription"),
+        allowed_harnesses=("codex",),
+        preferred_harnesses=("codex",),
+        quota_budget=QuotaBudget(
+            implementation=100,
+            maximum=100,
+            pool_id="subscription",
+            unit=QuotaUnit.TOKENS,
+        ),
         effort=EffortEstimate(10, 100),
     )
 
@@ -40,6 +47,7 @@ def test_compiles_hors_categorie_parent_into_bounded_reconnaissance(job_factory)
     assert reconnaissance.quota_budget.expected_path == 7
     assert reconnaissance.quota_budget.maximum == 7
     assert reconnaissance.quota_budget.pool_id == "subscription"
+    assert reconnaissance.quota_budget.unit is QuotaUnit.TOKENS
     assert reconnaissance.acceptance_criteria == RECONNAISSANCE_ACCEPTANCE_CRITERIA
     assert reconnaissance.created_at == now
     assert reconnaissance.updated_at == now

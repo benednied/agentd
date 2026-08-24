@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 
 def _positive_float(values: Mapping[str, str], name: str, default: float) -> float:
     raw = values.get(name)
     value = default if raw is None else float(raw)
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
     return value
 
 
@@ -47,8 +48,8 @@ class ServiceConfig:
             "hard_cap_grace_seconds": self.hard_cap_grace_seconds,
         }
         for name, value in numeric.items():
-            if value <= 0:
-                raise ValueError(f"{name} must be positive")
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         if self.log_level.upper() not in {
             "TRACE",
             "DEBUG",

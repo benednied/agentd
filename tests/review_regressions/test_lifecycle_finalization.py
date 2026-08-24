@@ -16,6 +16,7 @@ from agentd.domain.enums import (
 from agentd.domain.models import (
     Job,
     QuotaPool,
+    ResourceAllocation,
     ResourceVector,
     ResumeCapsule,
     RunHandle,
@@ -178,7 +179,7 @@ class FailOnceFinalJobSaveStore(SQLiteStateStore):
         super().__init__()
         self.failed = False
 
-    def save_job(self, job, transition=None) -> None:
+    def save_job(self, job, transition=None, *, expected) -> None:
         if (
             not self.failed
             and transition is not None
@@ -186,13 +187,50 @@ class FailOnceFinalJobSaveStore(SQLiteStateStore):
         ):
             self.failed = True
             raise RuntimeError("injected final job save failure")
-        super().save_job(job, transition)
+        super().save_job(job, transition, expected=expected)
 
-    def save_job_and_run(self, job, transition, run) -> None:
+    def save_job_and_run(
+        self,
+        job,
+        transition,
+        run,
+        *,
+        expected_job,
+        expected_run,
+    ) -> None:
         if not self.failed and job.state is JobState.COMPLETED:
             self.failed = True
             raise RuntimeError("injected final job save failure")
-        super().save_job_and_run(job, transition, run)
+        super().save_job_and_run(
+            job,
+            transition,
+            run,
+            expected_job=expected_job,
+            expected_run=expected_run,
+        )
+
+
+class FailOnceCapacityCleanupStore(SQLiteStateStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    def release_resources(
+        self,
+        expected_node: WorkerNode,
+        updated_node: WorkerNode,
+        expected_allocation: ResourceAllocation,
+        released_allocation: ResourceAllocation,
+    ) -> None:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("injected capacity cleanup failure")
+        super().release_resources(
+            expected_node,
+            updated_node,
+            expected_allocation,
+            released_allocation,
+        )
 
 
 def test_completion_can_be_retried_after_final_job_persistence_failure(
@@ -249,6 +287,63 @@ def test_completion_can_be_retried_after_final_job_persistence_failure(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("lifecycle", "job_state", "run_state"),
+    (
+        ("cancel", JobState.CANCELLED, RunState.CANCELLED),
+        ("review", JobState.REVIEW, RunState.SUSPENDED),
+        ("suspend", JobState.SUSPENDED, RunState.SUSPENDED),
+    ),
+)
+def test_lifecycle_marker_precedes_retryable_capacity_cleanup(
+    lifecycle: str,
+    job_state: JobState,
+    run_state: RunState,
+    make_regression_rig,
+    make_regression_job: Callable[..., Job],
+    regression_node: WorkerNode,
+    regression_pool: QuotaPool,
+) -> None:
+    rig = make_regression_rig(store=FailOnceCapacityCleanupStore())
+    job = make_regression_job()
+
+    async def scenario() -> None:
+        rig.plane.register_node(regression_node)
+        rig.plane.register_quota_pool(regression_pool)
+        rig.plane.submit(job)
+        run = await rig.plane.dispatch_next()
+        assert run is not None
+
+        async def invoke():
+            if lifecycle == "cancel":
+                return await rig.plane.cancel(job.id)
+            if lifecycle == "review":
+                return await rig.plane.request_review(job.id)
+            return await rig.plane.pause(
+                job.id,
+                ResumeCapsule(current=("durable boundary",)),
+            )
+
+        with pytest.raises(RuntimeError, match="Lifecycle persisted"):
+            await invoke()
+
+        assert rig.store.get_job(job.id).state is job_state
+        assert rig.store.get_run(run.id).state is run_state
+        assert (
+            rig.store.get_allocation(run.allocation_id).state is AllocationState.ACTIVE
+        )
+
+        retried = await invoke()
+
+        assert retried.state is job_state
+        assert (
+            rig.store.get_allocation(run.allocation_id).state
+            is AllocationState.RELEASED
+        )
+
+    asyncio.run(scenario())
+
+
 def test_cancel_cleans_active_job_resources_even_without_run(
     make_regression_rig,
     make_regression_job: Callable[..., Job],
@@ -265,7 +360,7 @@ def test_cancel_cleans_active_job_resources_even_without_run(
         reservation = QuotaManager(rig.store).reserve(ready)
         allocation = ResourceManager(rig.store).allocate(ready, regression_node)
         workspace = rig.workspaces.allocate(ready)
-        rig.store.save_workspace(workspace)
+        rig.store.save_workspace(workspace, expected=None)
         assert rig.plane.runs(job.id) == []
 
         cancelled = await rig.plane.cancel(job.id)

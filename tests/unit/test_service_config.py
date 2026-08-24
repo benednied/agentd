@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,42 @@ def test_service_config_parses_explicit_environment() -> None:
 def test_service_config_rejects_nonpositive_controls(name: str) -> None:
     with pytest.raises(ValueError, match=name):
         ServiceConfig.from_environment({name: "0"})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AGENTD_POLL_SECONDS",
+        "AGENTD_ACCOUNT_POLL_SECONDS",
+        "AGENTD_ACCOUNT_STALE_SECONDS",
+        "AGENTD_QUOTA_TOP_UP_TOKENS",
+        "AGENTD_HARD_CAP_GRACE_SECONDS",
+    ],
+)
+@pytest.mark.parametrize("value", ["nan", "inf"])
+def test_service_config_rejects_nonfinite_environment_controls(
+    name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=name):
+        ServiceConfig.from_environment({name: value})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "poll_interval_seconds",
+        "account_poll_seconds",
+        "account_stale_seconds",
+        "quota_top_up_tokens",
+        "hard_cap_grace_seconds",
+    ],
+)
+def test_service_config_rejects_nonfinite_programmatic_controls(name: str) -> None:
+    config = ServiceConfig.from_environment({"HOME": "/home/operator"})
+
+    with pytest.raises(ValueError, match=name):
+        replace(config, **{name: float("nan")})
 
 
 def test_service_config_represents_nonproduction_model_policy() -> None:

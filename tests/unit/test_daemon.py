@@ -83,3 +83,42 @@ def test_dispatch_failures_back_off_without_delaying_reconciliation() -> None:
         assert plane.reconciliations == 8
 
     asyncio.run(scenario())
+
+
+class FlakyRecoveryControlPlane:
+    def __init__(self, stop: asyncio.Event) -> None:
+        self._stop = stop
+        self.recoveries = 0
+        self.dispatches = 0
+
+    async def recover_managed_runs(self) -> None:
+        self.recoveries += 1
+        if self.recoveries == 1:
+            raise RuntimeError("temporary App Server startup failure")
+
+    async def dispatch_next(self) -> None:
+        self.dispatches += 1
+        self._stop.set()
+
+
+def test_daemon_retries_startup_recovery_before_dispatching() -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        plane = FlakyRecoveryControlPlane(stop)
+        observed: list[Exception] = []
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            poll_interval=0.001,
+            dispatch_retry_base_seconds=0.001,
+            dispatch_retry_max_seconds=0.002,
+            on_error=observed.append,
+        )
+
+        await asyncio.wait_for(daemon.serve(stop), timeout=0.2)
+
+        assert plane.recoveries == 2
+        assert plane.dispatches == 1
+        assert len(observed) == 1
+        assert "temporary App Server" in str(observed[0])
+
+    asyncio.run(scenario())

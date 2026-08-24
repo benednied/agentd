@@ -89,6 +89,7 @@ def compile_reconnaissance(
         implementation=limits.quota,
         maximum=limits.quota,
         pool_id=parent.quota_budget.pool_id,
+        unit=parent.quota_budget.unit,
     )
 
     return replace(

@@ -15,11 +15,14 @@ case "$image_repository" in
     *[!A-Za-z0-9._/-]*|'') die "invalid local image repository" ;;
 esac
 
+require_command cmp
 require_command docker
 require_command git
+require_command install
 require_command mv
 require_command python3
 require_command sha256sum
+require_command stat
 require_command systemctl
 require_command tar
 require_provisioned_layout
@@ -91,18 +94,38 @@ if stop_if_active; then
 fi
 previous_sha=$(current_release_sha)
 backup_dir=$(backup_state "before-$release_sha" "$previous_sha")
-atomic_release_link "$release_sha"
 
-if ! systemctl --user start "$AGENTD_SERVICE"; then
+restore_previous_activation() {
+    stop_current_release_containers \
+        || die "failed to stop containers before restoring the previous release"
     restore_state "$backup_dir"
+    active_sha=$(current_release_sha)
     if [ -n "$previous_sha" ]; then
-        atomic_release_link "$previous_sha"
-        if [ "$was_active" = true ]; then
-            systemctl --user start "$AGENTD_SERVICE" || true
+        if [ "$active_sha" != "$previous_sha" ]; then
+            atomic_release_link "$previous_sha" \
+                || die "failed to restore the previous release link"
         fi
-    else
+    elif [ -n "$active_sha" ]; then
+        [ "$active_sha" = "$release_sha" ] \
+            || die "refusing to remove an unexpected current release link"
         unlink "$AGENTD_CURRENT_LINK"
     fi
+    if [ "$was_active" = true ]; then
+        systemctl --user start "$AGENTD_SERVICE" || true
+    fi
+}
+
+if ! install_release_config "$release_sha"; then
+    restore_previous_activation
+    die "failed to install the release-coupled Codex config"
+fi
+if ! atomic_release_link "$release_sha"; then
+    restore_previous_activation
+    die "failed to activate the new release link"
+fi
+
+if ! systemctl --user start "$AGENTD_SERVICE"; then
+    restore_previous_activation
     die "new release failed to start; previous release was restored when available"
 fi
 

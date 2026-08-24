@@ -166,7 +166,7 @@ def test_checkpoint_suspend_resume_complete_has_exact_durable_history(
         )
         assert history[5].reason == (f"durable checkpoint {checkpoints[1].id} recorded")
         assert history[6].reason == (
-            "checkpoint durable; scarce execution resources released"
+            "checkpoint durable; execution capacity cleanup pending"
         )
         assert history[7].reason == ("resume requested; queued for a new run attempt")
         assert history[8].reason == "admitted on node node-1 with fake"

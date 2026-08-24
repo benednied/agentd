@@ -322,35 +322,52 @@ class SQLiteStateStore:
             )
             self._insert_transition(transition)
 
-    def save_job(self, job: Job, transition: StateTransition | None = None) -> None:
+    def save_job(
+        self,
+        job: Job,
+        transition: StateTransition | None = None,
+        *,
+        expected: Job,
+    ) -> None:
         with self._lock, self._transaction():
-            self._save_job_in_transaction(job, transition)
+            self._save_job_in_transaction(job, transition, expected)
 
     def save_job_and_run(
         self,
         job: Job,
         transition: StateTransition,
         run: RunRecord,
+        *,
+        expected_job: Job,
+        expected_run: RunRecord | None,
     ) -> None:
         """Atomically persist a job transition and its corresponding run snapshot."""
 
         if run.job_id != job.id:
             raise ValueError("The run must belong to the transitioned job")
         with self._lock, self._transaction():
-            self._save_job_in_transaction(job, transition)
-            self._save_run_in_transaction(run)
+            self._save_job_in_transaction(job, transition, expected_job)
+            self._save_run_in_transaction(run, expected_run)
 
     def _save_job_in_transaction(
         self,
         job: Job,
         transition: StateTransition | None,
+        expected: Job,
     ) -> None:
+        if expected.id != job.id:
+            raise ValueError("Expected and updated jobs must have the same identifier")
         row = self._connection.execute(
-            "SELECT state FROM jobs WHERE id = ?", (job.id,)
+            "SELECT state, payload FROM jobs WHERE id = ?", (job.id,)
         ).fetchone()
         if row is None:
             raise EntityNotFoundError(f"Job {job.id} does not exist")
+        persisted = _load(row["payload"], Job.from_dict)
+        if persisted != expected:
+            raise ConcurrentStateError(f"Job {job.id} changed concurrently")
         persisted_state = JobState(row["state"])
+        if persisted_state is not expected.state:
+            raise ConcurrentStateError(f"Job {job.id} changed concurrently")
         if transition is None:
             if persisted_state != job.state:
                 raise ConcurrentStateError(
@@ -375,13 +392,14 @@ class SQLiteStateStore:
 
         cursor = self._connection.execute(
             "UPDATE jobs SET project = ?, state = ?, payload = ? "
-            "WHERE id = ? AND state = ?",
+            "WHERE id = ? AND state = ? AND payload = ?",
             (
                 job.project,
                 job.state.value,
                 _dump(job),
                 job.id,
                 persisted_state.value,
+                row["payload"],
             ),
         )
         if cursor.rowcount != 1:
@@ -433,12 +451,13 @@ class SQLiteStateStore:
         return [_load(row["payload"], StateTransition.from_dict) for row in rows]
 
     def save_node(self, node: WorkerNode) -> None:
-        self._upsert(
-            "nodes",
-            node.id,
-            ("state", "payload"),
-            (node.state.value, _dump(node)),
-        )
+        with self._lock, self._transaction():
+            self._execute_insert_idempotent(
+                "nodes",
+                node.id,
+                ("state", "payload"),
+                (node.state.value, _dump(node)),
+            )
 
     def register_node(self, node: WorkerNode) -> WorkerNode:
         """Atomically apply topology metadata without overwriting live usage."""
@@ -474,19 +493,20 @@ class SQLiteStateStore:
         ]
 
     def save_allocation(self, allocation: ResourceAllocation) -> None:
-        self._upsert(
-            "resource_allocations",
-            allocation.id,
-            ("job_id", "node_id", "state", "created_at", "payload"),
-            (
-                allocation.job_id,
-                allocation.node_id,
-                allocation.state.value,
-                allocation.created_at.isoformat(),
-                _dump(allocation),
-            ),
-            immutable_columns=("job_id", "node_id"),
-        )
+        with self._lock, self._transaction():
+            self._execute_insert_idempotent(
+                "resource_allocations",
+                allocation.id,
+                ("job_id", "node_id", "state", "created_at", "payload"),
+                (
+                    allocation.job_id,
+                    allocation.node_id,
+                    allocation.state.value,
+                    allocation.created_at.isoformat(),
+                    _dump(allocation),
+                ),
+                immutable_columns=("job_id", "node_id"),
+            )
 
     def allocate_resources(
         self,
@@ -624,7 +644,13 @@ class SQLiteStateStore:
         ]
 
     def save_quota_pool(self, pool: QuotaPool) -> None:
-        self._upsert("quota_pools", pool.id, ("payload",), (_dump(pool),))
+        with self._lock, self._transaction():
+            self._execute_insert_idempotent(
+                "quota_pools",
+                pool.id,
+                ("payload",),
+                (_dump(pool),),
+            )
 
     def register_quota_pool(self, pool: QuotaPool) -> QuotaPool:
         """Atomically apply pool configuration while preserving live counters."""
@@ -688,19 +714,20 @@ class SQLiteStateStore:
         ]
 
     def save_reservation(self, reservation: QuotaReservation) -> None:
-        self._upsert(
-            "quota_reservations",
-            reservation.id,
-            ("job_id", "pool_id", "state", "created_at", "payload"),
-            (
-                reservation.job_id,
-                reservation.pool_id,
-                reservation.state.value,
-                reservation.created_at.isoformat(),
-                _dump(reservation),
-            ),
-            immutable_columns=("job_id", "pool_id"),
-        )
+        with self._lock, self._transaction():
+            self._execute_insert_idempotent(
+                "quota_reservations",
+                reservation.id,
+                ("job_id", "pool_id", "state", "created_at", "payload"),
+                (
+                    reservation.job_id,
+                    reservation.pool_id,
+                    reservation.state.value,
+                    reservation.created_at.isoformat(),
+                    _dump(reservation),
+                ),
+                immutable_columns=("job_id", "pool_id"),
+            )
 
     def reserve_quota(
         self,
@@ -1100,14 +1127,22 @@ class SQLiteStateStore:
         job: Job,
         transition: StateTransition,
         reservation_id: str,
+        *,
+        expected_job: Job,
+        run: RunRecord | None = None,
+        expected_run: RunRecord | None = None,
     ) -> QuotaReservation:
         if job.state is not JobState.METERING_PENDING:
             raise ValueError("Metering must transition the job to METERING_PENDING")
+        if (run is None) != (expected_run is None):
+            raise ValueError("Metering run and expected run must be provided together")
         with self._lock, self._transaction():
             reservation = self._reservation_for_usage(reservation_id, job.id)
             if reservation.state is not ReservationState.ACTIVE:
                 raise ValueError("Only an active reservation can begin metering")
-            self._save_job_in_transaction(job, transition)
+            self._save_job_in_transaction(job, transition, expected_job)
+            if run is not None and expected_run is not None:
+                self._save_run_in_transaction(run, expected_run)
             pending = replace(
                 reservation,
                 state=ReservationState.METERING_PENDING,
@@ -1196,19 +1231,64 @@ class SQLiteStateStore:
             )
             return settled
 
-    def save_workspace(self, workspace: WorkspaceLease) -> None:
-        self._upsert(
-            "workspaces",
-            workspace.id,
-            ("job_id", "state", "created_at", "payload"),
-            (
-                workspace.job_id,
-                workspace.state.value,
-                workspace.created_at.isoformat(),
-                _dump(workspace),
-            ),
-            immutable_columns=("job_id",),
-        )
+    def save_workspace(
+        self,
+        workspace: WorkspaceLease,
+        *,
+        expected: WorkspaceLease | None,
+    ) -> None:
+        with self._lock, self._transaction():
+            row = self._connection.execute(
+                "SELECT job_id, payload FROM workspaces WHERE id = ?",
+                (workspace.id,),
+            ).fetchone()
+            if expected is None:
+                if row is not None:
+                    raise ConcurrentStateError(
+                        f"Workspace {workspace.id} already exists"
+                    )
+                self._connection.execute(
+                    "INSERT INTO workspaces(id, job_id, state, created_at, payload) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        workspace.id,
+                        workspace.job_id,
+                        workspace.state.value,
+                        workspace.created_at.isoformat(),
+                        _dump(workspace),
+                    ),
+                )
+                return
+
+            if expected.id != workspace.id:
+                raise ValueError(
+                    "Expected and updated workspaces must have the same identifier"
+                )
+            if row is None:
+                raise EntityNotFoundError(f"Workspace {workspace.id} does not exist")
+            persisted = _load(row["payload"], WorkspaceLease.from_dict)
+            if persisted != expected:
+                raise ConcurrentStateError(
+                    f"Workspace {workspace.id} changed concurrently"
+                )
+            if expected.job_id != workspace.job_id:
+                raise ValueError(f"Workspace {workspace.id} cannot change ownership")
+            cursor = self._connection.execute(
+                "UPDATE workspaces SET state = ?, created_at = ?, payload = ? "
+                "WHERE id = ? AND job_id = ? AND payload = ?",
+                (
+                    workspace.state.value,
+                    workspace.created_at.isoformat(),
+                    _dump(workspace),
+                    workspace.id,
+                    expected.job_id,
+                    row["payload"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentStateError(
+                    f"Workspace {workspace.id} changed concurrently"
+                )
 
     def get_workspace(self, workspace_id: str) -> WorkspaceLease:
         row = self._one(
@@ -1238,24 +1318,57 @@ class SQLiteStateStore:
             for row in self._all(query, args)
         ]
 
-    def save_run(self, run: RunRecord) -> None:
+    def save_run(self, run: RunRecord, *, expected: RunRecord | None) -> None:
         with self._lock, self._transaction():
-            self._save_run_in_transaction(run)
+            self._save_run_in_transaction(run, expected)
 
-    def _save_run_in_transaction(self, run: RunRecord) -> None:
+    def _save_run_in_transaction(
+        self,
+        run: RunRecord,
+        expected: RunRecord | None,
+    ) -> None:
         self._validate_run_links(run)
-        self._execute_upsert(
-            "runs",
-            run.id,
-            ("job_id", "state", "started_at", "payload"),
+        row = self._connection.execute(
+            "SELECT job_id, payload FROM runs WHERE id = ?", (run.id,)
+        ).fetchone()
+        if expected is None:
+            if row is not None:
+                raise ConcurrentStateError(f"Run {run.id} already exists")
+            self._connection.execute(
+                "INSERT INTO runs(id, job_id, state, started_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    run.id,
+                    run.job_id,
+                    run.state.value,
+                    run.started_at.isoformat(),
+                    _dump(run),
+                ),
+            )
+            return
+        if expected.id != run.id:
+            raise ValueError("Expected and updated runs must have the same identifier")
+        if row is None:
+            raise EntityNotFoundError(f"Run {run.id} does not exist")
+        persisted = _load(row["payload"], RunRecord.from_dict)
+        if persisted != expected or row["job_id"] != expected.job_id:
+            raise ConcurrentStateError(f"Run {run.id} changed concurrently")
+        if expected.job_id != run.job_id:
+            raise ValueError(f"Run {run.id} cannot change ownership")
+        cursor = self._connection.execute(
+            "UPDATE runs SET state = ?, started_at = ?, payload = ? "
+            "WHERE id = ? AND job_id = ? AND payload = ?",
             (
-                run.job_id,
                 run.state.value,
                 run.started_at.isoformat(),
                 _dump(run),
+                run.id,
+                expected.job_id,
+                row["payload"],
             ),
-            immutable_columns=("job_id",),
         )
+        if cursor.rowcount != 1:
+            raise ConcurrentStateError(f"Run {run.id} changed concurrently")
 
     def _validate_run_links(self, run: RunRecord) -> None:
         if run.contract.job_id != run.job_id:
@@ -1340,7 +1453,12 @@ class SQLiteStateStore:
             _load(row["payload"], RunRecord.from_dict) for row in self._all(query, args)
         ]
 
-    def save_driver_session(self, session: DriverSession) -> None:
+    def save_driver_session(
+        self,
+        session: DriverSession,
+        *,
+        expected: DriverSession | None,
+    ) -> None:
         with self._lock, self._transaction():
             run_row = self._connection.execute(
                 "SELECT payload FROM runs WHERE id = ?", (session.run_id,)
@@ -1354,37 +1472,64 @@ class SQLiteStateStore:
                 "SELECT payload FROM driver_sessions WHERE run_id = ?",
                 (session.run_id,),
             ).fetchone()
-            registered = session
-            if existing_row is not None:
-                existing = _load(existing_row["payload"], DriverSession.from_dict)
-                if existing.driver != session.driver:
-                    raise ValueError("Driver session cannot change ownership")
-                registered = replace(
-                    session,
-                    id=existing.id,
-                    created_at=existing.created_at,
+            if expected is None:
+                if existing_row is not None:
+                    raise ConcurrentStateError(
+                        f"Driver session for run {session.run_id} already exists"
+                    )
+                self._connection.execute(
+                    "INSERT INTO driver_sessions("
+                    "id, run_id, driver, observation_cursor, active, updated_at, "
+                    "payload"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session.id,
+                        session.run_id,
+                        session.driver,
+                        session.observation_cursor,
+                        int(session.active),
+                        session.updated_at.isoformat(),
+                        _dump(session),
+                    ),
                 )
-            self._execute_upsert(
-                "driver_sessions",
-                registered.id,
+                return
+
+            if expected.run_id != session.run_id or expected.id != session.id:
+                raise ValueError(
+                    "Expected and updated driver sessions must have the same identity"
+                )
+            if existing_row is None:
+                raise EntityNotFoundError(
+                    f"Driver session for run {session.run_id} does not exist"
+                )
+            existing = _load(existing_row["payload"], DriverSession.from_dict)
+            if existing != expected:
+                raise ConcurrentStateError(
+                    f"Driver session for run {session.run_id} changed concurrently"
+                )
+            if (
+                expected.driver != session.driver
+                or expected.created_at != session.created_at
+            ):
+                raise ValueError("Driver session cannot change ownership")
+            cursor = self._connection.execute(
+                "UPDATE driver_sessions SET observation_cursor = ?, active = ?, "
+                "updated_at = ?, payload = ? "
+                "WHERE run_id = ? AND driver = ? AND payload = ?",
                 (
-                    "run_id",
-                    "driver",
-                    "observation_cursor",
-                    "active",
-                    "updated_at",
-                    "payload",
+                    session.observation_cursor,
+                    int(session.active),
+                    session.updated_at.isoformat(),
+                    _dump(session),
+                    session.run_id,
+                    expected.driver,
+                    existing_row["payload"],
                 ),
-                (
-                    registered.run_id,
-                    registered.driver,
-                    registered.observation_cursor,
-                    int(registered.active),
-                    registered.updated_at.isoformat(),
-                    _dump(registered),
-                ),
-                immutable_columns=("run_id", "driver"),
             )
+            if cursor.rowcount != 1:
+                raise ConcurrentStateError(
+                    f"Driver session for run {session.run_id} changed concurrently"
+                )
 
     def get_driver_session(self, run_id: str) -> DriverSession:
         row = self._one(
@@ -1658,7 +1803,7 @@ class SQLiteStateStore:
                 raise ValueError(
                     f"Checkpoint {checkpoint.id} belongs to another run's job"
                 )
-            self._execute_upsert(
+            self._execute_insert_idempotent(
                 "checkpoints",
                 checkpoint.id,
                 ("job_id", "run_id", "created_at", "payload"),
@@ -1689,7 +1834,7 @@ class SQLiteStateStore:
             )
         ]
 
-    def _upsert(
+    def _execute_insert_idempotent(
         self,
         table: str,
         entity_id: str,
@@ -1698,14 +1843,29 @@ class SQLiteStateStore:
         *,
         immutable_columns: tuple[str, ...] = (),
     ) -> None:
-        with self._lock:
-            self._execute_upsert(
-                table,
-                entity_id,
-                columns,
-                values,
-                immutable_columns=immutable_columns,
-            )
+        """Insert an append-only/bootstrap entity or verify an exact retry."""
+
+        selected = ", ".join(columns)
+        existing = self._connection.execute(
+            f"SELECT {selected} FROM {table} WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if existing is not None:
+            supplied = dict(zip(columns, values, strict=True))
+            if any(existing[name] != supplied[name] for name in immutable_columns):
+                raise ValueError(f"{table} {entity_id} cannot change ownership")
+            if any(
+                existing[name] != value
+                for name, value in zip(columns, values, strict=True)
+            ):
+                raise ConcurrentStateError(f"{table} {entity_id} already differs")
+            return
+        names = ("id", *columns)
+        marks = ", ".join("?" for _ in names)
+        self._connection.execute(
+            f"INSERT INTO {table} ({', '.join(names)}) VALUES ({marks})",
+            (entity_id, *values),
+        )
 
     def _execute_upsert(
         self,

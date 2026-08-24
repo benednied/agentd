@@ -76,6 +76,8 @@ class LifecycleCoordinator(Protocol):
 
     def execution_contract(self, run_id: str) -> ExecutionContract: ...
 
+    def is_managed_run(self, run_id: str) -> bool: ...
+
 
 class ControlPlane:
     """Application facade for commands and queries."""
@@ -116,7 +118,7 @@ class ControlPlane:
             else "job accepted into the ready queue"
         )
         ready, event = transition_job(job, target, reason)
-        self._store.save_job(ready, event)
+        self._store.save_job(ready, event, expected=job)
         if target is JobState.PLANNING:
             reconnaissance = compile_reconnaissance(
                 ready,
@@ -135,7 +137,7 @@ class ControlPlane:
                 JobState.READY,
                 "bounded reconnaissance slice queued",
             )
-            self._store.save_job(queued, queued_event)
+            self._store.save_job(queued, queued_event, expected=reconnaissance)
         return ready
 
     def reconnaissance_for(self, job_id: str) -> list[Job]:
@@ -169,7 +171,7 @@ class ControlPlane:
             JobState.READY,
             "reconnaissance bounded the job for normal execution",
         )
-        self._store.save_job(ready, event)
+        self._store.save_job(ready, event, expected=parent)
         return ready
 
     def inspect_job(self, job_id: str) -> Job:
@@ -248,7 +250,7 @@ class ControlPlane:
         if job.state is not JobState.READY:
             raise ValueError(f"Only a ready job can return to backlog, not {job.state}")
         deferred, event = transition_job(job, JobState.BACKLOG, reason)
-        self._store.save_job(deferred, event)
+        self._store.save_job(deferred, event, expected=job)
         return deferred
 
     def requeue(self, job_id: str) -> Job:
@@ -262,7 +264,7 @@ class ControlPlane:
             JobState.READY,
             "job returned from backlog",
         )
-        self._store.save_job(ready, event)
+        self._store.save_job(ready, event, expected=job)
         return ready
 
     def degrade(self, job_id: str, *, harness: str, model_class: str) -> Job:
@@ -290,7 +292,7 @@ class ControlPlane:
             selected_model_class=None,
             updated_at=self._clock(),
         )
-        self._store.save_job(degraded)
+        self._store.save_job(degraded, expected=job)
         return degraded
 
     def evaluate_tail(self, job_id: str, consumed: float) -> TailDecision:
@@ -344,6 +346,9 @@ class ControlPlane:
 
     def assignment(self, run_id: str) -> ExecutionContract:
         return self._lifecycle().execution_contract(run_id)
+
+    def is_managed_run(self, run_id: str) -> bool:
+        return self._lifecycle().is_managed_run(run_id)
 
     def _lifecycle(self) -> LifecycleCoordinator:
         if self._coordinator is None:

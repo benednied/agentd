@@ -16,7 +16,11 @@ from agentd.domain.models import (
     UsageApplication,
     UsageSample,
 )
-from agentd.harness.app_server import AppServerEvent, AppServerMetadata
+from agentd.harness.app_server import (
+    AppServerEvent,
+    AppServerMetadata,
+    OpenAICodexClient,
+)
 from agentd.harness.codex_sdk import CodexSdkDriver
 from agentd.harness.supervisor import RunSupervisor
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
@@ -50,10 +54,18 @@ class MemorySupervisorStore:
         except KeyError as error:
             raise EntityNotFoundError(run_id) from error
 
-    def save_driver_session(self, session: DriverSession) -> None:
+    def save_driver_session(
+        self,
+        session: DriverSession,
+        *,
+        expected: DriverSession | None,
+    ) -> None:
         existing = self.sessions.get(session.run_id)
-        if existing is not None:
-            session = replace(session, id=existing.id, created_at=existing.created_at)
+        if expected is None:
+            if existing is not None:
+                raise ConcurrentStateError(session.run_id)
+        elif existing != expected:
+            raise ConcurrentStateError(session.run_id)
         self.sessions[session.run_id] = session
 
     def get_driver_session(self, run_id: str) -> DriverSession:
@@ -210,6 +222,25 @@ class ScriptedAppServerClient:
 
     async def account_rate_limits(self) -> dict[str, JsonValue]:
         raise AssertionError("run client must not query account rate limits")
+
+
+@dataclass(frozen=True, slots=True)
+class RawNotification:
+    method: str
+    payload: dict[str, JsonValue]
+
+
+@dataclass(slots=True)
+class ScriptedNotificationTransport:
+    notifications: list[RawNotification]
+    unregistered: list[str] = field(default_factory=list)
+
+    async def next_turn_notification(self, turn_id: str) -> RawNotification:
+        assert turn_id == "turn-1"
+        return self.notifications.pop(0)
+
+    def unregister_turn_notifications(self, turn_id: str) -> None:
+        self.unregistered.append(turn_id)
 
 
 def _usage_event(
@@ -584,6 +615,88 @@ def test_failed_terminal_without_usage_is_observable_but_telemetry_invalid(
         assert observation.result == result
         assert observation.run_state is RunState.FAILED
         assert store.samples == []
+
+    asyncio.run(scenario())
+
+
+def test_retryable_error_does_not_end_the_managed_turn(
+    execution_contract: ExecutionContract,
+) -> None:
+    execution = replace(
+        execution_contract,
+        allowed_filesystem_scope=(execution_contract.working_directory,),
+    )
+
+    async def scenario() -> None:
+        completed = _completed_events("turn-1")
+        client = ScriptedAppServerClient(
+            "turn-1",
+            (
+                completed[0],
+                AppServerEvent(
+                    "error",
+                    {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "willRetry": True,
+                        "error": {"message": "temporary provider overload"},
+                    },
+                ),
+                *completed[1:],
+            ),
+        )
+        store = MemorySupervisorStore()
+        driver = CodexSdkDriver(
+            RunSupervisor(store, client_factory=lambda _execution: client)
+        )
+
+        handle = await driver.start_managed("run-1", execution)
+        result = await driver.collect(handle)
+        observation = driver.observe("run-1")
+
+        assert result.outcome is RunOutcome.COMPLETED
+        assert result.summary == "implementation ready for review"
+        assert observation is not None and observation.terminal
+        assert observation.run_state is RunState.COMPLETED
+        assert store.sessions["run-1"].observation_cursor == "6"
+        assert client.closed
+
+    asyncio.run(scenario())
+
+
+def test_app_server_adapter_streams_past_retryable_error() -> None:
+    async def scenario() -> None:
+        transport = ScriptedNotificationTransport(
+            [
+                RawNotification(
+                    "error",
+                    {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "willRetry": True,
+                        "error": {"message": "temporary provider overload"},
+                    },
+                ),
+                RawNotification(
+                    "turn/completed",
+                    {
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": None,
+                        }
+                    },
+                ),
+            ]
+        )
+        client = object.__new__(OpenAICodexClient)
+        client._client = transport
+
+        events = [event async for event in client.events("turn-1")]
+
+        assert [event.method for event in events] == ["error", "turn/completed"]
+        assert events[0].payload["willRetry"] is True
+        assert transport.unregistered == ["turn-1"]
 
     asyncio.run(scenario())
 

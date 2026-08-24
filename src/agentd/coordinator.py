@@ -11,6 +11,7 @@ from agentd.domain.enums import (
     PreemptionPolicy,
     QoSClass,
     QuotaMode,
+    ReservationState,
     RunOutcome,
     RunState,
     WorkspaceState,
@@ -70,6 +71,11 @@ from agentd.workspaces.base import WorkspaceManager, WorkspaceReleaseError
 
 class LifecycleError(RuntimeError):
     pass
+
+
+_MANAGED_TELEMETRY_VALID = "agentd_terminal_telemetry_valid"
+_MANAGED_FINALIZATION_TARGET = "agentd_finalization_target"
+_MANAGED_FINALIZATION_TURN = "agentd_finalization_turn"
 
 
 class SchedulerCoordinator:
@@ -176,7 +182,7 @@ class SchedulerCoordinator:
         log.info("dispatch_started")
 
         try:
-            reservation = self._quota.reserve(job)
+            reservation = self._quota.reserve(self._job_for_next_reservation(job))
             node = self._store.get_node(placement.node_id)
             allocation = self._resources.allocate(job, node)
             allocation_id = allocation.id
@@ -188,7 +194,8 @@ class SchedulerCoordinator:
                 and not self._workspaces.is_available(workspace)
             ):
                 self._store.save_workspace(
-                    replace(workspace, state=WorkspaceState.FAILED)
+                    replace(workspace, state=WorkspaceState.FAILED),
+                    expected=workspace,
                 )
                 workspace = None
             if workspace is None or workspace.state is not WorkspaceState.LEASED:
@@ -196,7 +203,7 @@ class SchedulerCoordinator:
                     job,
                     base_ref=self._base_ref(job),
                 )
-                self._store.save_workspace(workspace)
+                self._store.save_workspace(workspace, expected=None)
                 workspace_created = True
 
             if self._provisioner is not None:
@@ -212,7 +219,7 @@ class SchedulerCoordinator:
                 JobState.ADMITTED,
                 f"admitted on node {placement.node_id} with {placement.harness}",
             )
-            self._store.save_job(candidate, event)
+            self._store.save_job(candidate, event, expected=job)
             admitted = candidate
 
             contract = self._build_contract(admitted, workspace)
@@ -233,7 +240,7 @@ class SchedulerCoordinator:
                 ),
                 state=RunState.STARTING,
             )
-            self._store.save_run(run)
+            self._store.save_run(run, expected=None)
             if isinstance(driver, ManagedHarnessDriver):
                 handle = await driver.start_managed(run.id, contract)
             elif backend is not None:
@@ -243,15 +250,23 @@ class SchedulerCoordinator:
             # Persist the externally meaningful handle before publishing RUNNING.
             # A reconciler can now identify and stop a process even if the job/run
             # transition below is interrupted.
-            run = replace(run, handle=handle)
-            self._store.save_run(run)
-            run = replace(run, state=RunState.RUNNING)
+            updated_run = replace(run, handle=handle)
+            self._store.save_run(updated_run, expected=run)
+            run = updated_run
+            running_run = replace(run, state=RunState.RUNNING)
             running, running_event = transition_job(
                 admitted,
                 JobState.RUNNING,
                 f"harness run {run.id} started",
             )
-            self._store.save_job_and_run(running, running_event, run)
+            self._store.save_job_and_run(
+                running,
+                running_event,
+                running_run,
+                expected_job=admitted,
+                expected_run=run,
+            )
+            run = running_run
             log.bind(run_id=run.id).info("dispatch_succeeded")
             return run
         except BaseException as error:
@@ -298,9 +313,15 @@ class SchedulerCoordinator:
                             summary="dispatch failed before the run became active",
                         ),
                     )
-                    self._store.save_job_and_run(ready, event, cancelled_run)
+                    self._store.save_job_and_run(
+                        ready,
+                        event,
+                        cancelled_run,
+                        expected_job=admitted,
+                        expected_run=run,
+                    )
                 else:
-                    self._store.save_job(ready, event)
+                    self._store.save_job(ready, event, expected=admitted)
             for cleanup_error in cleanup_errors:
                 error.add_note(f"Cleanup also failed: {cleanup_error}")
             if cleanup_errors:
@@ -369,6 +390,15 @@ class SchedulerCoordinator:
                 run_id=run.id,
                 driver=run.driver,
             )
+            try:
+                await self._prepare_recovery_workspace(job, run)
+            except BaseException as error:
+                log.bind(error_type=type(error).__name__).error(
+                    "managed_run_workspace_revalidation_failed"
+                )
+                if first_error is None:
+                    first_error = error
+                continue
             repair_request = self._pending_repair(run.id)
             if repair_request is not None:
                 try:
@@ -396,7 +426,7 @@ class SchedulerCoordinator:
                         ended_at=None,
                         result=None,
                     )
-                    self._store.save_run(recovered)
+                    self._store.save_run(recovered, expected=run)
                     self._acknowledge_repair(repair_request, recovered)
                     log.info("repair_recovered")
                     continue
@@ -408,16 +438,42 @@ class SchedulerCoordinator:
                         first_error = error
                     continue
             observation = driver.observe(run.id)
-            if observation is not None and observation.terminal:
+            if (
+                observation is not None
+                and observation.terminal
+                and run.state is not RunState.STARTING
+                and job.state is not JobState.ADMITTED
+            ):
                 continue
             try:
-                await driver.recover(
+                handle = await driver.recover(
                     run.id,
                     run.contract,
                     "The control-plane transport restarted. Resume the durable "
                     "thread from the existing workspace and return a structured "
                     "review handoff at the next safe boundary.",
                 )
+                recovered = replace(
+                    run,
+                    handle=handle,
+                    state=RunState.RUNNING,
+                    ended_at=None,
+                )
+                if job.state is JobState.ADMITTED:
+                    running, event = transition_job(
+                        job,
+                        JobState.RUNNING,
+                        f"recovered managed run {run.id} published",
+                    )
+                    self._store.save_job_and_run(
+                        running,
+                        event,
+                        recovered,
+                        expected_job=job,
+                        expected_run=run,
+                    )
+                else:
+                    self._store.save_run(recovered, expected=run)
                 log.info("managed_run_recovered")
             except (EntityNotFoundError, LookupError) as error:
                 try:
@@ -446,6 +502,23 @@ class SchedulerCoordinator:
         now = at or utc_now()
         finalized: list[Job] = []
         first_error: BaseException | None = None
+        for job in self._store.list_jobs(frozenset({JobState.METERING_PENDING})):
+            run = self._store.latest_run(job.id)
+            if run is None or run.result is None:
+                continue
+            marker = run.result.metadata.get(_MANAGED_TELEMETRY_VALID)
+            if not isinstance(marker, bool):
+                continue
+            driver = self._drivers.get(run.driver)
+            if not isinstance(driver, ManagedHarnessDriver):
+                continue
+            try:
+                recovered = self._resume_managed_finalization(job, run)
+                if recovered.state is not JobState.METERING_PENDING:
+                    finalized.append(recovered)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         try:
             await self._start_pending_repairs()
         except BaseException as error:
@@ -526,6 +599,14 @@ class SchedulerCoordinator:
 
     async def suspend(self, job_id: str, capsule: ResumeCapsule) -> Job:
         job = self._store.get_job(job_id)
+        if job.state is JobState.SUSPENDED:
+            run = self._require_latest_run(job_id)
+            if run.state is not RunState.SUSPENDED or run.result is None:
+                raise LifecycleError(
+                    f"Job {job_id} has no durable suspended lifecycle marker"
+                )
+            self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, run))
+            return job
         if job.state not in {
             JobState.RUNNING,
             JobState.DRAINING,
@@ -543,8 +624,15 @@ class SchedulerCoordinator:
                 JobState.DRAINING,
                 "suspension requested; draining to a safe checkpoint",
             )
-            run = replace(run, state=RunState.DRAINING)
-            self._store.save_job_and_run(draining, event, run)
+            draining_run = replace(run, state=RunState.DRAINING)
+            self._store.save_job_and_run(
+                draining,
+                event,
+                draining_run,
+                expected_job=job,
+                expected_run=run,
+            )
+            run = draining_run
             job = draining
 
         if job.state is JobState.DRAINING:
@@ -560,8 +648,9 @@ class SchedulerCoordinator:
                 # discard the queued instruction.
                 result = run.result or await driver.collect(run.handle)
                 result = self._result_with_workspace_commit(run, result)
-                run = replace(run, result=result)
-                self._store.save_run(run)
+                collected_run = replace(run, result=result)
+                self._store.save_run(collected_run, expected=run)
+                run = collected_run
             capsule = self._capsule_with_workspace_commit(run, capsule)
             checkpoint = self._store.latest_checkpoint(job_id)
             if (
@@ -580,8 +669,15 @@ class SchedulerCoordinator:
                 JobState.CHECKPOINTED,
                 f"durable checkpoint {checkpoint.id} recorded",
             )
-            run = replace(run, state=RunState.CHECKPOINTED)
-            self._store.save_job_and_run(checkpointed, event, run)
+            checkpointed_run = replace(run, state=RunState.CHECKPOINTED)
+            self._store.save_job_and_run(
+                checkpointed,
+                event,
+                checkpointed_run,
+                expected_job=job,
+                expected_run=run,
+            )
+            run = checkpointed_run
             job = checkpointed
 
         result = run.result
@@ -589,27 +685,34 @@ class SchedulerCoordinator:
             await driver.interrupt(run.handle)
             result = await driver.collect(run.handle)
         result = self._result_with_workspace_commit(run, result)
-        run = replace(run, result=result)
-        # Record usage and the durable handoff before making capacity available.
-        self._store.save_run(run)
-        self._resources.release(run.allocation_id)
-        self._quota.release(
-            run.reservation_id,
-            consumed=result.consumed_quota,
-        )
         suspended, event = transition_job(
             job,
             JobState.SUSPENDED,
-            "checkpoint durable; scarce execution resources released",
+            "checkpoint durable; execution capacity cleanup pending",
         )
-        final_run = replace(run, state=RunState.SUSPENDED, ended_at=utc_now())
-        self._store.save_job_and_run(suspended, event, final_run)
+        final_run = replace(
+            run,
+            state=RunState.SUSPENDED,
+            ended_at=utc_now(),
+            result=result,
+        )
+        self._store.save_job_and_run(
+            suspended,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
+        self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, final_run))
         return suspended
 
     async def resume(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
         if job.state is not JobState.SUSPENDED:
             raise LifecycleError(f"Job {job_id} is not suspended")
+        maximum = job.quota_budget.maximum
+        if maximum is not None and self._job_consumed(job.id) >= maximum - 1e-9:
+            raise LifecycleError(f"Job {job_id} exhausted its cumulative quota maximum")
         return self._transition(
             job,
             JobState.READY,
@@ -618,6 +721,14 @@ class SchedulerCoordinator:
 
     async def request_review(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
+        if job.state is JobState.REVIEW:
+            run = self._require_latest_run(job_id)
+            if run.state is not RunState.SUSPENDED or run.result is None:
+                raise LifecycleError(
+                    f"Job {job_id} has no durable review lifecycle marker"
+                )
+            self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, run))
+            return job
         if job.state is not JobState.RUNNING:
             raise LifecycleError(f"Job {job_id} is not running")
         run = self._require_active_run(job_id)
@@ -626,22 +737,25 @@ class SchedulerCoordinator:
         result = run.result or await driver.collect(run.handle)
         result = self._review_handoff_result(result)
         result = self._result_with_workspace_commit(run, result)
-        run = replace(run, result=result)
-        # The adapter is quiescent and its usage is durable before capacity is
-        # released. Retrying this operation is therefore safe and idempotent.
-        self._store.save_run(run)
-        self._resources.release(run.allocation_id)
-        self._quota.release(
-            run.reservation_id,
-            consumed=result.consumed_quota,
-        )
         review, event = transition_job(
             job,
             JobState.REVIEW,
             f"run {run.id} handed off for review",
         )
-        final_run = replace(run, state=RunState.SUSPENDED, ended_at=utc_now())
-        self._store.save_job_and_run(review, event, final_run)
+        final_run = replace(
+            run,
+            state=RunState.SUSPENDED,
+            ended_at=utc_now(),
+            result=result,
+        )
+        self._store.save_job_and_run(
+            review,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
+        self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, final_run))
         return review
 
     def promote_suspended_to_review(self, job_id: str) -> Job:
@@ -668,7 +782,13 @@ class SchedulerCoordinator:
             JobState.REVIEW,
             "operator promoted completed checkpoint after independent validation",
         )
-        self._store.save_job_and_run(review, event, final_run)
+        self._store.save_job_and_run(
+            review,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
         return review
 
     async def complete(self, job_id: str) -> Job:
@@ -681,6 +801,7 @@ class SchedulerCoordinator:
                         job_id,
                         latest,
                         completed=job.state is JobState.COMPLETED,
+                        cancelled=job.state is JobState.CANCELLED,
                     )
                 )
             return job
@@ -695,10 +816,11 @@ class SchedulerCoordinator:
         if result is None:
             result = await self._drivers.get(run.driver).collect(run.handle)
             result = self._result_with_workspace_commit(run, result)
-            run = replace(run, result=result)
+            collected_run = replace(run, result=result)
             # Collect is an external effect. Persist it while the run remains
             # retryable, before attempting the atomic terminal transition.
-            self._store.save_run(run)
+            self._store.save_run(collected_run, expected=run)
+            run = collected_run
 
         target = {
             RunOutcome.COMPLETED: JobState.COMPLETED,
@@ -724,12 +846,19 @@ class SchedulerCoordinator:
         )
         # The run and its audit transition are one SQLite transaction. No
         # external cleanup happens if this persistence step fails.
-        self._store.save_job_and_run(completed, event, final_run)
+        self._store.save_job_and_run(
+            completed,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
         self._raise_cleanup_errors(
             self._cleanup_job_resources(
                 job_id,
                 final_run,
                 completed=target is JobState.COMPLETED,
+                cancelled=target is JobState.CANCELLED,
             )
         )
         return completed
@@ -742,7 +871,12 @@ class SchedulerCoordinator:
 
         if job.terminal:
             self._raise_cleanup_errors(
-                self._cleanup_job_resources(job_id, run, completed=False)
+                self._cleanup_job_resources(
+                    job_id,
+                    run,
+                    completed=False,
+                    cancelled=job.state is JobState.CANCELLED,
+                )
             )
             return job
 
@@ -776,16 +910,6 @@ class SchedulerCoordinator:
                 else {}
             ),
         )
-        if run is not None:
-            run = replace(run, result=result)
-            self._store.save_run(run)
-
-        cleanup_errors = self._cleanup_job_resources(
-            job_id,
-            run,
-            completed=False,
-            cancelled=True,
-        )
         cancelled, event = transition_job(job, JobState.CANCELLED, "cancel requested")
         if run is not None:
             final_run = replace(
@@ -794,18 +918,35 @@ class SchedulerCoordinator:
                 ended_at=utc_now(),
                 result=result,
             )
-            self._store.save_job_and_run(cancelled, event, final_run)
+            self._store.save_job_and_run(
+                cancelled,
+                event,
+                final_run,
+                expected_job=job,
+                expected_run=run,
+            )
         else:
-            self._store.save_job(cancelled, event)
+            final_run = None
+            self._store.save_job(cancelled, event, expected=job)
+        cleanup_errors = self._cleanup_job_resources(
+            job_id,
+            final_run,
+            completed=False,
+            cancelled=True,
+        )
         self._raise_cleanup_errors(cleanup_errors)
         return cancelled
 
     def execution_contract(self, run_id: str) -> ExecutionContract:
         return self._store.get_run(run_id).contract
 
+    def is_managed_run(self, run_id: str) -> bool:
+        run = self._store.get_run(run_id)
+        return isinstance(self._drivers.get(run.driver), ManagedHarnessDriver)
+
     def _transition(self, job: Job, state: JobState, reason: str) -> Job:
         updated, event = transition_job(job, state, reason)
-        self._store.save_job(updated, event)
+        self._store.save_job(updated, event, expected=job)
         return updated
 
     def _require_active_run(self, job_id: str) -> RunRecord:
@@ -881,6 +1022,42 @@ class SchedulerCoordinator:
             ),
         )
 
+    async def _prepare_recovery_workspace(
+        self,
+        job: Job,
+        run: RunRecord,
+    ) -> WorkspaceLease:
+        """Re-establish trusted workspace ownership before opening transport."""
+
+        workspace = self._store.get_workspace(run.workspace_id)
+        registered = self._store.find_workspace(job.id)
+        if (
+            workspace.job_id != job.id
+            or workspace.repository != job.repository
+            or workspace.state is not WorkspaceState.LEASED
+            or registered is None
+            or registered.id != workspace.id
+        ):
+            raise LifecycleError(
+                f"Run {run.id} does not own the registered leased workspace"
+            )
+        if (
+            run.contract.job_id != job.id
+            or run.contract.working_directory != workspace.working_directory
+            or run.contract.allowed_filesystem_scope != (workspace.working_directory,)
+            or run.contract.environment != workspace.environment
+        ):
+            raise LifecycleError(
+                f"Run {run.id} execution contract no longer matches its workspace"
+            )
+        if not self._workspaces.is_available(workspace):
+            raise LifecycleError(
+                f"Run {run.id} workspace ownership or branch is unavailable"
+            )
+        if self._provisioner is not None:
+            await self._provisioner.prepare(workspace)
+        return workspace
+
     def _base_ref(self, job: Job) -> str:
         latest = self._store.latest_checkpoint(job.id)
         if latest is not None and latest.capsule.commit:
@@ -890,6 +1067,33 @@ class SchedulerCoordinator:
             if runs and runs[-1].result and runs[-1].result.commit:
                 return runs[-1].result.commit
         return job.base_ref
+
+    def _job_consumed(self, job_id: str) -> float:
+        return sum(
+            reservation.consumed
+            for reservation in self._store.list_reservations(job_id)
+        )
+
+    def _job_for_next_reservation(self, job: Job) -> Job:
+        """Cap this attempt without changing the job's cumulative policy."""
+
+        maximum = job.quota_budget.maximum
+        if maximum is None:
+            return job
+        remaining = maximum - self._job_consumed(job.id)
+        if remaining <= 1e-9:
+            raise QuotaAdmissionError(
+                f"Job {job.id} exhausted its cumulative quota maximum"
+            )
+        amount = min(job.quota_budget.expected_path, remaining)
+        attempt_budget = replace(
+            job.quota_budget,
+            implementation=amount,
+            review=0,
+            repair=0,
+            validation=0,
+        )
+        return replace(job, quota_budget=attempt_budget)
 
     def _capsule_with_workspace_commit(
         self,
@@ -966,6 +1170,36 @@ class SchedulerCoordinator:
                 errors.append(error)
         return errors
 
+    def _cleanup_execution_capacity(
+        self,
+        job_id: str,
+        run: RunRecord,
+        *,
+        cancelled: bool = False,
+    ) -> list[BaseException]:
+        """Release retry-safe allocation/quota effects while retaining workspace."""
+
+        errors: list[BaseException] = []
+        allocation = self._store.find_active_allocation(job_id)
+        if allocation is not None:
+            try:
+                self._resources.release(allocation.id)
+            except BaseException as error:
+                errors.append(error)
+        reservation = self._store.find_active_reservation(job_id)
+        if reservation is not None:
+            try:
+                self._quota.release(
+                    reservation.id,
+                    consumed=(
+                        run.result.consumed_quota if run.result is not None else 0
+                    ),
+                    cancelled=cancelled,
+                )
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
     @staticmethod
     def _raise_cleanup_errors(errors: list[BaseException]) -> None:
         if not errors:
@@ -1024,21 +1258,25 @@ class SchedulerCoordinator:
             raise LifecycleError("The two-repair-turn limit has been reached")
 
         capabilities = {item.name: item for item in self._drivers.capabilities()}
-        placements = [
-            placement
-            for placement in compatible_placements(
-                job,
-                self._store.list_nodes(),
-                capabilities,
-            )
-            if placement.harness == run.driver
-            and self._provider_allows_placement(job, placement)
-        ]
+        placements: list[tuple[Placement, WorkerBackend | None]] = []
+        for placement in compatible_placements(
+            job,
+            self._store.list_nodes(),
+            capabilities,
+        ):
+            if placement.harness != run.driver or not self._provider_allows_placement(
+                job, placement
+            ):
+                continue
+            backend = self._select_backend(placement.node_id)
+            if self._backends is not None and backend is None:
+                continue
+            placements.append((placement, backend))
         if not placements:
             raise QuotaAdmissionError(
                 "No policy-compliant capacity is available for repair"
             )
-        placement = placements[0]
+        placement, _backend = placements[0]
 
         maximum = job.quota_budget.maximum
         if maximum is None:
@@ -1067,6 +1305,7 @@ class SchedulerCoordinator:
         allocation = None
         handle: RunHandle | None = None
         running: Job | None = None
+        published_run: RunRecord | None = None
         try:
             node = self._store.get_node(placement.node_id)
             allocation = self._resources.allocate(job, node)
@@ -1108,10 +1347,18 @@ class SchedulerCoordinator:
                 JobState.RUNNING,
                 f"bounded repair turn {continuation_count + 1} requested",
             )
-            self._store.save_job_and_run(running, event, starting)
+            self._store.save_job_and_run(
+                running,
+                event,
+                starting,
+                expected_job=job,
+                expected_run=run,
+            )
+            published_run = starting
             handle = await driver.continue_turn(run.id, instruction.strip())
             active = replace(starting, handle=handle, state=RunState.RUNNING)
-            self._store.save_run(active)
+            self._store.save_run(active, expected=starting)
+            published_run = active
             self._acknowledge_repair(request, active)
             return active
         except BaseException:
@@ -1127,13 +1374,19 @@ class SchedulerCoordinator:
                 if allocation is not None:
                     self._resources.release(allocation.id)
                 self._quota.release(reservation.id, cancelled=True)
-                if running is not None:
+                if running is not None and published_run is not None:
                     review, event = transition_job(
                         running,
                         JobState.REVIEW,
                         "repair start failed; reviewed handoff restored",
                     )
-                    self._store.save_job_and_run(review, event, run)
+                    self._store.save_job_and_run(
+                        review,
+                        event,
+                        run,
+                        expected_job=running,
+                        expected_run=published_run,
+                    )
             raise
 
     def _pending_repair(self, run_id: str) -> RunCommand | None:
@@ -1218,6 +1471,11 @@ class SchedulerCoordinator:
             at=at,
             policy=self._usage_policy,
         )
+        if maximum_command is not None:
+            maximum_command = replace(
+                maximum_command,
+                id=f"{maximum_command.id}:{run.id}",
+            )
         if maximum_command is not None and not self._job_has_command(
             job.id,
             maximum_command.id,
@@ -1247,6 +1505,7 @@ class SchedulerCoordinator:
                 policy=self._usage_policy,
             )
             if interrupt is not None:
+                interrupt = replace(interrupt, id=f"{interrupt.id}:{run.id}")
                 self._store.enqueue_run_command(interrupt)
 
     def _first_hard_cap_at(self, job: Job) -> datetime | None:
@@ -1291,11 +1550,6 @@ class SchedulerCoordinator:
                 metadata={"telemetry_valid": False},
             )
         result = self._trusted_workspace_result(run, result)
-        self._store.save_run(replace(run, result=result))
-
-        allocation = self._store.find_active_allocation(job.id)
-        if allocation is not None:
-            self._resources.release(allocation.id)
 
         observed_cumulative = observation.normalized_cumulative_quota
         matching_samples = [
@@ -1313,40 +1567,11 @@ class SchedulerCoordinator:
             and observation.usage is not None
             and ledger_valid
         )
-        if not telemetry_valid:
-            final_run = replace(
-                run,
-                state=RunState.SUSPENDED,
-                ended_at=utc_now(),
-                result=result,
-            )
-            self._store.save_run(final_run)
-            self._quota.begin_metering(
-                job.id,
-                reason=(
-                    "Codex turn ended without valid terminal token telemetry; "
-                    "acceptance blocked pending reconciliation"
-                ),
-            )
-            return self._store.get_job(job.id)
-
-        if result.outcome is RunOutcome.COMPLETED:
+        if telemetry_valid and result.outcome is RunOutcome.COMPLETED:
             result = self._trusted_workspace_commit_result(run, result)
-            run = replace(run, result=result)
-            # The Git ref is an external effect. Persist its trusted value while
-            # terminal reconciliation remains retryable, before entering REVIEW.
-            self._store.save_run(run)
 
-        reservation = self._store.get_reservation(run.reservation_id)
-        self._quota.release(
-            reservation.id,
-            consumed=reservation.consumed,
-            cancelled=result.outcome is RunOutcome.CANCELLED,
-        )
         commands = self._store.list_run_commands(run.id)
-        job_consumed = sum(
-            item.consumed for item in self._store.list_reservations(job.id)
-        )
+        job_consumed = self._job_consumed(job.id)
         suspension_requested = any(
             command.action in {"checkpoint", "suspend"} for command in commands
         ) or should_checkpoint_for_maximum(
@@ -1354,45 +1579,144 @@ class SchedulerCoordinator:
             job.quota_budget.maximum,
             self._usage_policy,
         )
-        if suspension_requested:
-            return self._finalize_managed_suspension(job, run, result)
-
-        if result.outcome is RunOutcome.COMPLETED:
-            review, event = transition_job(
-                job,
-                JobState.REVIEW,
-                f"Codex turn {observation.turn_id} is ready for explicit review",
-            )
-            final_run = replace(
-                run,
-                state=RunState.SUSPENDED,
-                ended_at=utc_now(),
-                result=result,
-            )
-            self._store.save_job_and_run(review, event, final_run)
-            return review
-
-        target = (
-            JobState.CANCELLED
-            if result.outcome is RunOutcome.CANCELLED
-            else JobState.FAILED
+        if not telemetry_valid:
+            target = JobState.METERING_PENDING
+        elif suspension_requested:
+            target = JobState.SUSPENDED
+        elif result.outcome is RunOutcome.COMPLETED:
+            target = JobState.REVIEW
+        elif result.outcome is RunOutcome.CANCELLED:
+            target = JobState.CANCELLED
+        else:
+            target = JobState.FAILED
+        result = replace(
+            result,
+            metadata={
+                **result.metadata,
+                _MANAGED_TELEMETRY_VALID: telemetry_valid,
+                _MANAGED_FINALIZATION_TARGET: target.value,
+                _MANAGED_FINALIZATION_TURN: observation.turn_id,
+            },
         )
-        final, event = transition_job(
-            job,
-            target,
-            f"Codex turn {observation.turn_id} reported {result.outcome.value}",
-        )
-        final_run = replace(
+
+        pending_run = replace(
             run,
-            state=(
-                RunState.CANCELLED
-                if result.outcome is RunOutcome.CANCELLED
-                else RunState.FAILED
-            ),
+            state=RunState.SUSPENDED,
             ended_at=utc_now(),
             result=result,
         )
-        self._store.save_job_and_run(final, event, final_run)
+        reason = (
+            "Codex turn quiesced; terminal usage reconciliation pending"
+            if telemetry_valid
+            else (
+                "Codex turn ended without valid terminal token telemetry; "
+                "acceptance blocked pending reconciliation"
+            )
+        )
+        self._quota.begin_metering(
+            job.id,
+            reason=reason,
+            run=pending_run,
+            expected_run=run,
+        )
+        job = self._store.get_job(job.id)
+        run = pending_run
+        return self._resume_managed_finalization(job, run)
+
+    def _resume_managed_finalization(self, job: Job, run: RunRecord) -> Job:
+        """Complete or safely hold one durable managed metering marker."""
+
+        if job.state is not JobState.METERING_PENDING:
+            return job
+        if run.state is not RunState.SUSPENDED or run.result is None:
+            raise LifecycleError(
+                f"Job {job.id} has a malformed managed metering marker"
+            )
+        telemetry_valid = run.result.metadata.get(_MANAGED_TELEMETRY_VALID)
+        target_value = run.result.metadata.get(_MANAGED_FINALIZATION_TARGET)
+        turn_id = run.result.metadata.get(_MANAGED_FINALIZATION_TURN)
+        if not isinstance(telemetry_valid, bool) or not isinstance(target_value, str):
+            raise LifecycleError(
+                f"Job {job.id} has an incomplete managed metering marker"
+            )
+
+        allocation = self._store.find_active_allocation(job.id)
+        if allocation is not None:
+            self._resources.release(allocation.id)
+        if not telemetry_valid:
+            if target_value != JobState.METERING_PENDING.value:
+                raise LifecycleError(
+                    f"Job {job.id} has an inconsistent invalid-telemetry marker"
+                )
+            reservation = self._store.get_reservation(run.reservation_id)
+            if reservation.state is not ReservationState.METERING_PENDING:
+                raise LifecycleError(
+                    f"Job {job.id} invalid telemetry no longer holds quota"
+                )
+            return job
+
+        try:
+            target = JobState(target_value)
+        except ValueError as error:
+            raise LifecycleError(
+                f"Job {job.id} has an unknown managed finalization target"
+            ) from error
+        if target not in {
+            JobState.REVIEW,
+            JobState.SUSPENDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
+            raise LifecycleError(
+                f"Job {job.id} has an invalid managed finalization target {target}"
+            )
+
+        reservation = self._store.get_reservation(run.reservation_id)
+        if reservation.state is ReservationState.METERING_PENDING:
+            reservation = self._quota.settle(
+                reservation.id,
+                cancelled=target is JobState.CANCELLED,
+            )
+        expected_reservation_state = (
+            ReservationState.CANCELLED
+            if target is JobState.CANCELLED
+            else ReservationState.RELEASED
+        )
+        if reservation.state is not expected_reservation_state:
+            raise LifecycleError(
+                f"Job {job.id} quota settlement does not match its finalization target"
+            )
+
+        if target is JobState.SUSPENDED:
+            return self._finalize_managed_suspension(job, run, run.result)
+
+        reason_turn = turn_id if isinstance(turn_id, str) and turn_id else "unknown"
+        reason = (
+            f"Codex turn {reason_turn} is ready for explicit review"
+            if target is JobState.REVIEW
+            else f"Codex turn {reason_turn} reported {run.result.outcome.value}"
+        )
+        final, event = transition_job(job, target, reason)
+        final_run = replace(
+            run,
+            state=(
+                RunState.SUSPENDED
+                if target is JobState.REVIEW
+                else (
+                    RunState.CANCELLED
+                    if target is JobState.CANCELLED
+                    else RunState.FAILED
+                )
+            ),
+            ended_at=run.ended_at or utc_now(),
+        )
+        self._store.save_job_and_run(
+            final,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
         return final
 
     def _finalize_managed_suspension(
@@ -1408,22 +1732,6 @@ class SchedulerCoordinator:
                 Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
             )
 
-        if job.state is JobState.RUNNING:
-            job, event = transition_job(
-                job,
-                JobState.DRAINING,
-                "Codex stopped at a control-plane safe boundary",
-            )
-            run = replace(run, state=RunState.DRAINING, result=result)
-            self._store.save_job_and_run(job, event, run)
-        if job.state is JobState.DRAINING:
-            job, event = transition_job(
-                job,
-                JobState.CHECKPOINTED,
-                "structured Codex checkpoint capsule persisted",
-            )
-            run = replace(run, state=RunState.CHECKPOINTED, result=result)
-            self._store.save_job_and_run(job, event, run)
         suspended, event = transition_job(
             job,
             JobState.SUSPENDED,
@@ -1435,7 +1743,13 @@ class SchedulerCoordinator:
             ended_at=utc_now(),
             result=result,
         )
-        self._store.save_job_and_run(suspended, event, final_run)
+        self._store.save_job_and_run(
+            suspended,
+            event,
+            final_run,
+            expected_job=job,
+            expected_run=run,
+        )
         return suspended
 
     def _trusted_workspace_result(
@@ -1464,7 +1778,10 @@ class SchedulerCoordinator:
         workspace = self._store.get_workspace(run.workspace_id)
         commit = self._workspaces.commit_changes(workspace)
         if workspace.commit != commit:
-            self._store.save_workspace(replace(workspace, commit=commit))
+            self._store.save_workspace(
+                replace(workspace, commit=commit),
+                expected=workspace,
+            )
         return replace(result, commit=commit)
 
     @staticmethod
@@ -1496,17 +1813,22 @@ class SchedulerCoordinator:
             ended_at=utc_now(),
             result=result,
         )
-        self._store.save_run(cancelled_run)
-        self._raise_cleanup_errors(
-            self._cleanup_job_resources(job.id, cancelled_run, completed=False)
-        )
         target = JobState.READY if job.state is JobState.ADMITTED else JobState.FAILED
         updated, event = transition_job(
             job,
             target,
             "startup reconciliation found no durable managed-driver session",
         )
-        self._store.save_job_and_run(updated, event, cancelled_run)
+        self._store.save_job_and_run(
+            updated,
+            event,
+            cancelled_run,
+            expected_job=job,
+            expected_run=run,
+        )
+        self._raise_cleanup_errors(
+            self._cleanup_job_resources(job.id, cancelled_run, completed=False)
+        )
 
     def _job_has_command(self, job_id: str, command_id: str) -> bool:
         return any(
@@ -1533,7 +1855,7 @@ class SchedulerCoordinator:
             if not retain_on_failure:
                 raise
             retained = replace(workspace, state=WorkspaceState.RETAINED)
-            self._store.save_workspace(retained)
+            self._store.save_workspace(retained, expected=workspace)
             return retained
-        self._store.save_workspace(released)
+        self._store.save_workspace(released, expected=workspace)
         return released

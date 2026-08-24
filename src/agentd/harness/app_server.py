@@ -23,7 +23,12 @@ PINNED_OPENAI_CODEX_VERSION = "0.144.4"
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_PERMISSION_PROFILE = "agentd-workspace"
-TERMINAL_EVENT_METHODS = frozenset({"turn/completed", "turn/failed", "error"})
+# Error notifications describe a turn-level problem, but they are not a final
+# turn result.  In particular, ``ErrorNotification.willRetry`` may be true and
+# the App Server can continue the same turn after emitting one.  Match the
+# pinned SDK's turn collector and keep the stream open until a definitive turn
+# notification arrives.
+TERMINAL_EVENT_METHODS = frozenset({"turn/completed", "turn/failed"})
 
 
 @dataclass(frozen=True, slots=True)

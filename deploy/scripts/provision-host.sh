@@ -43,13 +43,16 @@ fi
 config_source=$SCRIPT_DIR/../container/config.toml
 [ -f "$config_source" ] && [ ! -L "$config_source" ] \
     || die "reviewed nonsecret Codex config.toml is missing"
-config_tmp=$AGENTD_CODEX_HOME/.config.toml.install-$$
-trap 'case "$config_tmp" in /home/bened/.local/share/agentd/codex-home/.config.toml.install-*) rm -f -- "$config_tmp" ;; esac' EXIT HUP INT TERM
-install -o 1000 -g 1000 -m 0600 "$config_source" "$config_tmp"
-mv -f "$config_tmp" "$AGENTD_CODEX_HOME/config.toml"
-chown 1000:1000 "$AGENTD_CODEX_HOME/config.toml"
-chmod 0600 "$AGENTD_CODEX_HOME/config.toml"
-trap - EXIT HUP INT TERM
+if [ -e "$AGENTD_CODEX_CONFIG" ] || [ -L "$AGENTD_CODEX_CONFIG" ]; then
+    # Release activation owns updates after the initial install so its backup
+    # captures the policy paired with the release being replaced.
+    require_safe_codex_config
+    config_status=preserved
+else
+    install_config_atomically "$config_source" \
+        || die "failed to install reviewed Codex config"
+    config_status=installed
+fi
 
 if [ -r /proc/sys/kernel/unprivileged_userns_clone ]; then
     [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = 1 ] \
@@ -97,5 +100,5 @@ install -o 1000 -g 1000 -m 0644 \
     "$unit_dir/agentd.service"
 
 printf '%s\n' \
-    "Provisioned exact agentd paths, reviewed config.toml, and auth.json." \
+    "Provisioned exact agentd paths, $config_status reviewed config.toml, and auth.json." \
     "As UID 1000, run: systemctl --user daemon-reload"

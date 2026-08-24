@@ -14,7 +14,7 @@ bounty commitment is currently offered.
 
 ## Supported revisions
 
-Until the project publishes versioned releases, only the current `main` branch is
+Until the project publishes versioned releases, only the current `master` branch is
 supported. Deployment-specific paths and policies in `deploy/` describe the
 reviewed single-host installation; they are not a general multi-tenant security
 boundary.

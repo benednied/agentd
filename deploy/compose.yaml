@@ -9,6 +9,12 @@
       "read_only": true,
       "privileged": false,
       "init": true,
+      "entrypoint": [
+        "/bin/sh",
+        "-ec",
+        "/opt/agentd/venv/bin/python /opt/agentd/security/runtime_sandbox_probe.py && exec /opt/agentd/venv/bin/agentd \"$@\"",
+        "agentd-entrypoint"
+      ],
       "restart": "unless-stopped",
       "stop_grace_period": "45s",
       "pids_limit": 512,

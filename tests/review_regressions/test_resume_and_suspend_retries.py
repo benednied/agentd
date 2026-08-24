@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
@@ -9,10 +10,18 @@ from agentd.domain.enums import (
     AllocationState,
     JobState,
     ReservationState,
+    RunOutcome,
     RunState,
     WorkspaceState,
 )
-from agentd.domain.models import Job, QuotaPool, ResumeCapsule, RunHandle, WorkerNode
+from agentd.domain.models import (
+    Job,
+    QuotaPool,
+    ResumeCapsule,
+    RunHandle,
+    RunResult,
+    WorkerNode,
+)
 from agentd.harness import FakeHarnessCall, FakeHarnessDriver
 
 
@@ -152,5 +161,79 @@ def test_resume_recreates_missing_workspace_from_checkpoint_commit(
         assert rig.store.get_workspace(second_run.workspace_id).state is (
             WorkspaceState.RELEASED
         )
+
+    asyncio.run(scenario())
+
+
+def test_resumed_attempt_reserves_only_remaining_cumulative_quota(
+    make_regression_rig,
+    make_regression_job: Callable[..., Job],
+    regression_node: WorkerNode,
+    regression_pool: QuotaPool,
+) -> None:
+    rig = make_regression_rig(
+        result=RunResult(
+            outcome=RunOutcome.COMPLETED,
+            summary="first attempt",
+            commit="a" * 40,
+            consumed_quota=10,
+        )
+    )
+    original = make_regression_job()
+    job = replace(
+        original,
+        quota_budget=replace(original.quota_budget, maximum=12),
+    )
+
+    async def scenario() -> None:
+        rig.plane.register_node(regression_node)
+        rig.plane.register_quota_pool(regression_pool)
+        rig.plane.submit(job)
+        first = await rig.plane.dispatch_next()
+        assert first is not None
+        await rig.plane.pause(job.id, ResumeCapsule(current=("continue",)))
+        assert (await rig.plane.resume(job.id)).state is JobState.READY
+
+        second = await rig.plane.dispatch_next()
+
+        assert second is not None
+        assert rig.store.get_reservation(first.reservation_id).consumed == 10
+        assert rig.store.get_reservation(second.reservation_id).amount == 2
+
+    asyncio.run(scenario())
+
+
+def test_resume_rejects_exhausted_cumulative_quota(
+    make_regression_rig,
+    make_regression_job: Callable[..., Job],
+    regression_node: WorkerNode,
+    regression_pool: QuotaPool,
+) -> None:
+    rig = make_regression_rig(
+        result=RunResult(
+            outcome=RunOutcome.COMPLETED,
+            summary="quota exhausted",
+            commit="b" * 40,
+            consumed_quota=12,
+        )
+    )
+    original = make_regression_job()
+    job = replace(
+        original,
+        quota_budget=replace(original.quota_budget, maximum=12),
+    )
+
+    async def scenario() -> None:
+        rig.plane.register_node(regression_node)
+        rig.plane.register_quota_pool(regression_pool)
+        rig.plane.submit(job)
+        assert await rig.plane.dispatch_next() is not None
+        await rig.plane.pause(job.id, ResumeCapsule(current=("continue",)))
+
+        with pytest.raises(RuntimeError, match="exhausted its cumulative quota"):
+            await rig.plane.resume(job.id)
+
+        assert rig.plane.inspect_job(job.id).state is JobState.SUSPENDED
+        assert len(rig.store.list_reservations(job.id)) == 1
 
     asyncio.run(scenario())

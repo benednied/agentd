@@ -15,6 +15,7 @@ from agentd.domain.models import (
     QuotaPool,
     QuotaReservation,
     QuotaResetEvent,
+    RunRecord,
     UsageApplication,
     UsageSample,
     utc_now,
@@ -237,6 +238,8 @@ class QuotaManager:
         job_id: str,
         *,
         reason: str = "run quiesced; final usage reconciliation pending",
+        run: RunRecord | None = None,
+        expected_run: RunRecord | None = None,
     ) -> QuotaReservation:
         """Atomically enter the durable job/reservation metering phase."""
 
@@ -252,7 +255,14 @@ class QuotaManager:
         if reservation is None:
             raise LookupError(f"Job {job_id} has no outstanding reservation")
         pending, event = transition_job(job, JobState.METERING_PENDING, reason)
-        return self._store.begin_metering(pending, event, reservation.id)
+        return self._store.begin_metering(
+            pending,
+            event,
+            reservation.id,
+            expected_job=job,
+            run=run,
+            expected_run=expected_run,
+        )
 
     def settle(
         self,

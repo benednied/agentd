@@ -152,7 +152,10 @@ Provisioning requires an explicitly selected, reviewed `auth.json` source. It
 validates that the source is a small, non-symlink JSON object, backs up an existing
 target, and installs only that `auth.json` from the supplied source with mode
 `0600` into the `0700` dedicated Codex home. Separately, it installs the reviewed,
-nonsecret `deploy/container/config.toml` with mode `0600`; it never imports a
+nonsecret `deploy/container/config.toml` with mode `0600` when the file is initially
+absent. A repeat provisioning run validates and preserves the existing
+release-coupled copy; deployment owns later policy changes so it can back up the
+policy paired with the release being replaced. Provisioning never imports a
 general Codex configuration, shell history, or session history. The auth source
 is never copied into the repository, release, Docker build context, image,
 environment file, or command line:
@@ -170,9 +173,9 @@ AGENTD_AUTH_SOURCE=/home/bened/.codex/auth.json \
 ```
 
 Follow the host's reviewed `sudo` environment policy. Do not use a source inside
-the repository or a shell-history/config directory. Re-run the reviewed
-provisioning step when a release intentionally changes the pinned service
-`config.toml`; the runtime check rejects a host copy that differs from the image.
+the repository or a shell-history/config directory. Each deployment atomically
+installs its committed `config.toml`; the runtime check rejects a host copy that
+differs from the image.
 
 Then, as UID 1000:
 
@@ -196,11 +199,17 @@ release under:
 ```
 
 Before changing the atomic `current` symlink, it stops an active service and takes
-a SQLite online backup with an integrity check and checksum under:
+a SQLite online backup plus the release-coupled Codex `config.toml`, with integrity
+checks and checksums, under:
 
 ```text
 /home/bened/.local/state/agentd/backups/<timestamp>-before-<SHA>-<pid>/
 ```
+
+Activation then atomically installs the target release's committed Codex policy
+and switches `current`. If policy installation, link replacement, or service
+startup fails, deployment stops any candidate containers before restoring the
+backed-up database and policy and the prior release link.
 
 Deploy from the reviewed agentd checkout. Goldenage remains a separately mounted
 test repository. The optional source and image-repository arguments are shown
@@ -226,8 +235,9 @@ reviewed operator action.
 Rollback is explicit: choose an installed target SHA and a backup whose
 `release.sha` manifest matches that target. The script first creates another
 safety backup of the current state, stops the service, validates the selected
-backup checksum and SQLite integrity, restores it atomically, switches `current`,
-and starts the target release:
+backup checksums and SQLite integrity, restores the database and Codex policy via
+verified temporary files and atomic replacements, switches `current`, and starts
+the target release:
 
 ```bash
 ./deploy/scripts/rollback.sh \
@@ -235,9 +245,10 @@ and starts the target release:
   20260809T180000Z-before-fedcba9876543210fedcba9876543210fedcba98-1234
 ```
 
-If target startup fails, the script restores the pre-rollback state and prior
-release when available. Rollback never deletes a release or backup. Repository and
-worktree data are intentionally not overwritten by a state rollback.
+If target startup fails, the script restores the pre-rollback database, Codex
+policy, and prior release when available. Rollback never deletes a release or
+backup. Repository and worktree data are intentionally not overwritten by a state
+rollback.
 
 ## Verification
 

@@ -44,13 +44,22 @@ class StateStore(Protocol):
 
     def create_job(self, job: Job, transition: StateTransition) -> None: ...
 
-    def save_job(self, job: Job, transition: StateTransition | None = None) -> None: ...
+    def save_job(
+        self,
+        job: Job,
+        transition: StateTransition | None = None,
+        *,
+        expected: Job,
+    ) -> None: ...
 
     def save_job_and_run(
         self,
         job: Job,
         transition: StateTransition,
         run: RunRecord,
+        *,
+        expected_job: Job,
+        expected_run: RunRecord | None,
     ) -> None: ...
 
     def get_job(self, job_id: str) -> Job: ...
@@ -153,6 +162,10 @@ class StateStore(Protocol):
         job: Job,
         transition: StateTransition,
         reservation_id: str,
+        *,
+        expected_job: Job,
+        run: RunRecord | None = None,
+        expected_run: RunRecord | None = None,
     ) -> QuotaReservation: ...
 
     def settle_quota_usage(
@@ -164,7 +177,12 @@ class StateStore(Protocol):
         maximum: float | None = None,
     ) -> QuotaReservation: ...
 
-    def save_workspace(self, workspace: WorkspaceLease) -> None: ...
+    def save_workspace(
+        self,
+        workspace: WorkspaceLease,
+        *,
+        expected: WorkspaceLease | None,
+    ) -> None: ...
 
     def get_workspace(self, workspace_id: str) -> WorkspaceLease: ...
 
@@ -172,7 +190,7 @@ class StateStore(Protocol):
 
     def list_workspaces(self, job_id: str | None = None) -> list[WorkspaceLease]: ...
 
-    def save_run(self, run: RunRecord) -> None: ...
+    def save_run(self, run: RunRecord, *, expected: RunRecord | None) -> None: ...
 
     def get_run(self, run_id: str) -> RunRecord: ...
 
@@ -182,7 +200,12 @@ class StateStore(Protocol):
 
     def list_runs(self, job_id: str | None = None) -> list[RunRecord]: ...
 
-    def save_driver_session(self, session: DriverSession) -> None: ...
+    def save_driver_session(
+        self,
+        session: DriverSession,
+        *,
+        expected: DriverSession | None,
+    ) -> None: ...
 
     def get_driver_session(self, run_id: str) -> DriverSession: ...
 

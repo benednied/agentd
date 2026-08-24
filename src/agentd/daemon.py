@@ -134,11 +134,8 @@ class AgentDaemon:
         loop owns admission and dispatch only.
         """
 
-        if isinstance(self._control_plane, _RecoverableControlPlane):
-            try:
-                await self._control_plane.recover_managed_runs()
-            except Exception as error:
-                self._record_error(error, operation="managed_run_recovery")
+        if not await self._recover_before_serving(stop):
+            return
 
         while not stop.is_set():
             try:
@@ -152,6 +149,36 @@ class AgentDaemon:
                 await asyncio.wait_for(stop.wait(), timeout=self._poll_interval)
             except TimeoutError:
                 continue
+
+    async def _recover_before_serving(self, stop: asyncio.Event) -> bool:
+        """Recover durable managed runs before admitting any new work.
+
+        Startup transport failures can be transient.  Retrying with a capped
+        exponential delay keeps existing allocations from being stranded while
+        also preventing the daemon from entering its normal dispatch loop before
+        recovery has succeeded.
+        """
+
+        if not isinstance(self._control_plane, _RecoverableControlPlane):
+            return True
+        delay_seconds = self._dispatch_retry_base_seconds
+        while not stop.is_set():
+            try:
+                await self._control_plane.recover_managed_runs()
+            except Exception as error:
+                self._record_error(error, operation="managed_run_recovery")
+            else:
+                return True
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay_seconds)
+            except TimeoutError:
+                delay_seconds = min(
+                    self._dispatch_retry_max_seconds,
+                    delay_seconds * 2,
+                )
+            else:
+                return False
+        return False
 
     def _record_error(self, error: Exception, *, operation: str) -> None:
         self._last_error = error

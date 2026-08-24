@@ -66,7 +66,7 @@ def test_sqlite_rejects_caller_forged_invalid_transition(
 
     try:
         with pytest.raises((ConcurrentStateError, InvalidStateTransition)):
-            store.save_job(forged_job, forged_transition)
+            store.save_job(forged_job, forged_transition, expected=job)
 
         assert store.get_job(job.id) == job
         assert store.list_transitions(job.id) == [initial]

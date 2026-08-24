@@ -76,7 +76,7 @@ def _runtime(
             working_directory=f"/workspaces/{job.id}",
             base_ref="HEAD",
         )
-        store.save_workspace(workspace)
+        store.save_workspace(workspace, expected=None)
         links.append(
             {
                 "workspace": workspace,
@@ -135,7 +135,7 @@ def test_run_persistence_rejects_cross_job_runtime_links(
     )
     for invalid in invalid_runs:
         with pytest.raises(ValueError):
-            store.save_run(invalid)
+            store.save_run(invalid, expected=None)
 
     assert store.list_runs(job_a.id) == []
     assert store.get_allocation(foreign_allocation.id).state is AllocationState.ACTIVE
@@ -143,7 +143,7 @@ def test_run_persistence_rejects_cross_job_runtime_links(
         ReservationState.ACTIVE
     )
 
-    store.save_run(valid)
+    store.save_run(valid, expected=None)
     assert store.get_run(valid.id) == valid
 
 
@@ -153,8 +153,8 @@ def test_checkpoint_must_belong_to_its_runs_job(
     store, job_a, job_b, _node, links_a, links_b = _runtime(make_job)
     run_a = _run(job_a, links_a, run_id="run-a")
     run_b = _run(job_b, links_b, run_id="run-b")
-    store.save_run(run_a)
-    store.save_run(run_b)
+    store.save_run(run_a, expected=None)
+    store.save_run(run_b, expected=None)
     checkpoint = Checkpoint(
         id="checkpoint",
         job_id=job_a.id,
@@ -186,17 +186,20 @@ def test_generic_upserts_cannot_reassign_job_ownership(
     assert isinstance(reservation, QuotaReservation)
 
     with pytest.raises(ValueError, match="cannot change ownership"):
-        store.save_workspace(replace(workspace, job_id=job_b.id))
+        store.save_workspace(
+            replace(workspace, job_id=job_b.id),
+            expected=workspace,
+        )
     with pytest.raises(ValueError, match="cannot change ownership"):
         store.save_allocation(replace(allocation, job_id=job_b.id))
     with pytest.raises(ValueError, match="cannot change ownership"):
         store.save_reservation(replace(reservation, job_id=job_b.id))
 
     run = _run(job_a, links_a, run_id="run")
-    store.save_run(run)
+    store.save_run(run, expected=None)
     reassigned = _run(job_b, links_b, run_id=run.id)
     with pytest.raises(ValueError, match="cannot change ownership"):
-        store.save_run(reassigned)
+        store.save_run(reassigned, expected=run)
 
     assert store.get_workspace(workspace.id).job_id == job_a.id
     assert store.get_allocation(allocation.id).job_id == job_a.id
