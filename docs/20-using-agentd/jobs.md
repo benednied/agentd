@@ -34,6 +34,9 @@ Valid terminal telemetry creates a trusted handoff commit and moves the job to
 `REVIEW`. A caller or operator then accepts the result or requests a bounded repair
 turn. `agentd` never merges the handoff.
 
+A completed, quiescent suspended checkpoint can instead be promoted to `REVIEW`
+after independent operator validation with the `review` operation.
+
 Generic drivers may complete directly. If terminal usage is absent or inconsistent,
 the job enters `METERING_PENDING`, capacity is released, and acceptance remains
 blocked instead of guessing a charge.

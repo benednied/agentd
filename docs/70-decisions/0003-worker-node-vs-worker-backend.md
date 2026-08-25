@@ -6,9 +6,8 @@
 ## Context
 
 Scheduling needs to reason about operating systems, architectures, labels,
-capabilities, resources, harnesses, and model classes. Physical execution may later
-use a different transport, but the local MVP must not imply that a logical node is
-already a remote worker.
+capabilities, resources, harnesses, and model classes. The current implementation
+executes locally, so a logical node must not be presented as a remote worker.
 
 ## Decision
 
@@ -23,11 +22,11 @@ the former; the latter performs execution. The MVP implements only
   transport and could incorrectly promise remote execution.
 - Make every registered node a process worker: rejected because registration is
   durable metadata, not worker provisioning.
-- Add a remote protocol now: deferred until the local lifecycle and security
-  invariants have a supported transport requirement.
+- Add a remote execution protocol: out of scope for the current product boundary;
+  this repository contains no roadmap item for it.
 
 ## Consequences
 
-The architecture can add a remote backend without changing placement policy. In
-the current MVP, selected nodes account capacity but all harnesses run on the
-controller host.
+Placement remains independent of the current local transport. Selected nodes
+account capacity, but all harnesses run on the controller host; this ADR does not
+promise or plan remote execution.

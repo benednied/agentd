@@ -37,7 +37,9 @@ The common managed path is:
 BACKLOG -> READY -> ADMITTED -> RUNNING -> REVIEW -> COMPLETED
                                   |          |
                                   |          +-> RUNNING (repair) -> REVIEW
-                                  +-> CHECKPOINTED -> SUSPENDED -> READY
+                                  +-> CHECKPOINTED -> SUSPENDED -> READY (resume)
+                                                        |
+                                                        +-> REVIEW (validated checkpoint)
 RUNNING -> METERING_PENDING when terminal usage cannot be trusted
 ```
 

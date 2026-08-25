@@ -15,8 +15,12 @@ Suspension is a durable handoff:
 
 ```text
 RUNNING -> DRAINING -> CHECKPOINTED -> SUSPENDED -> READY -> new run
+                                      |
+                                      +-> REVIEW (after independent validation)
 ```
 
 The driver stops at a safe boundary, publishes a resume capsule, records usage,
 releases capacity, and retains the Git lease. Resuming creates a new run attempt
-with the latest capsule. Recovery resumes intent, not the interrupted process.
+with the latest capsule. The `review` operation promotes only a completed,
+quiescent checkpoint after independent validation. Recovery resumes intent, not the
+interrupted process.

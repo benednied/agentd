@@ -1,6 +1,7 @@
 # Limitations
 
-These are current product boundaries, not hidden roadmap claims:
+These are current product boundaries. This repository does not publish a roadmap;
+the limitations below are not commitments to future capabilities.
 
 - One active scheduling daemon is supported per SQLite database. There is no
   leader election, distributed ownership protocol, or transactional outbox.
