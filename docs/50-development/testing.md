@@ -26,3 +26,16 @@ uv run pytest tests/deployment -q
 
 Before merging, report what was actually tested, including relevant manual
 verification and any untested risk.
+
+## Documentation checks
+
+Run the repository documentation checks with:
+
+```bash
+uv run python tools/check_docs.py
+```
+
+The check validates local Markdown links and anchors, parses documented `agentd`
+CLI examples through `build_parser()`, compares the reference state-machine table
+with `ALLOWED_TRANSITIONS`, and checks that the configuration reference covers the
+environment variables read by `ServiceConfig`.

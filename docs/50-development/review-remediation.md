@@ -1,7 +1,8 @@
 # Code-review remediation status
 
-This document revalidates the findings in `agentd-code-review.md` from baseline
-commit `c9724043e46a` (2026-08-09). Remediation was committed as `37049aa` on
+This document revalidates the findings in the historical
+[`agentd-code-review.md` baseline](https://github.com/benednied/agentd/commit/c9724043e46a)
+from commit `c9724043e46a` (2026-08-09). Remediation was committed as `37049aa` on
 branch `codex/agentd-control-plane`. It records implemented safeguards and items
 deliberately left alone; the historical metrics are not current repository claims.
 

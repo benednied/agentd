@@ -1,27 +1,45 @@
-# Configuration
+# Operational configuration
 
-`ServiceConfig` derives portable defaults from `HOME` and XDG directories. CLI
-path flags override the corresponding environment-derived values.
+Configuration has two separate concerns:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AGENTD_DB` | `$XDG_STATE_HOME/agentd/state.sqlite` | SQLite control-plane state |
-| `AGENTD_WORKSPACE_ROOT` | `$XDG_DATA_HOME/agentd/workspaces` | Parent for leased Git worktrees |
-| `AGENTD_CODEX_HOME` | `$XDG_DATA_HOME/agentd/codex-home` | Dedicated Codex authentication and session state |
-| `UV_CACHE_DIR` | `$XDG_CACHE_HOME/uv` | Shared uv cache and managed toolchain |
-| `AGENTD_CODEX_MODEL` | `gpt-5.6-terra` | SDK model; trusted `serve` enforces production policy |
-| `AGENTD_CODEX_REASONING_EFFORT` | `medium` | SDK effort; trusted `serve` enforces production policy |
-| `AGENTD_POLL_SECONDS` | `1` | Daemon polling interval |
-| `AGENTD_ACCOUNT_POLL_SECONDS` | `60` | Provider telemetry refresh interval |
-| `AGENTD_ACCOUNT_STALE_SECONDS` | `300` | Age after which telemetry restricts admission |
-| `AGENTD_QUOTA_TOP_UP_TOKENS` | `25000` | Increment for extending an active reservation |
-| `AGENTD_HARD_CAP_GRACE_SECONDS` | `120` | Grace period before a hard-cap interrupt |
-| `AGENTD_LOG_LEVEL` | `INFO` | Loguru level |
-| `AGENTD_LOG_FORMAT` | `json` | `json` for production or `text` for diagnosis |
+1. `ServiceConfig` defines portable paths and policy values for a local control
+   plane.
+2. The reviewed deployment composition supplies exact host paths, credentials,
+   mounts, and production policy at its trust boundary.
 
-Unset XDG variables fall back under `~/.local/state`, `~/.local/share`, and
-`~/.cache`. Numeric policy values must be positive.
+The complete list of supported variables, defaults, and validation rules lives in
+the normative [configuration reference](../80-reference/configuration.md). This
+page explains how operators use those values; it intentionally does not repeat the
+reference table.
 
-The configuration type supports non-production model and reasoning choices. The
-trusted production composition, not the portable configuration type, enforces the
-reviewed model policy.
+## Local development
+
+For the fake path, use a project-local database and a workspace root outside the
+repository checkout. CLI path flags override the corresponding environment values:
+
+```bash
+uv run agentd \
+  --db /absolute/path/to/state.sqlite \
+  --workspace-root /absolute/path/to/agentd-workspaces \
+  init
+```
+
+The fake path does not require a Codex home or authenticated provider account.
+
+## Reviewed service deployment
+
+The deployment profile uses dedicated state, workspaces, Codex home, uv cache, and
+repository paths. The host-specific values are defined in `deploy/env/` and
+validated by the Compose security checks; they are not portable `src/agentd`
+defaults.
+
+Trusted `serve` composition enforces the reviewed production model and reasoning
+policy. The portable configuration type can still represent non-production values
+for tests and local integrations. See [deployment](deployment.md) and
+[security](security.md) for the operational boundary.
+
+## Configuration changes
+
+When adding or renaming a supported variable, update the source, the normative
+reference, and the documentation check in the same change. Keep literal defaults in
+the reference page rather than copying them into operational guides.

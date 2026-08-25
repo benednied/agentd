@@ -7,5 +7,6 @@ detail source.
 - [CLI](cli.md)
 - [Configuration](configuration.md)
 - [Python API](python-api.md)
+- [Domain models](domain-models.md)
 - [State machine](state-machine.md)
 - [Glossary](glossary.md)

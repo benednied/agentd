@@ -103,6 +103,68 @@ contact an LLM.
 
 The reviewed service path requires Linux, Bubblewrap, unprivileged user
 namespaces, and a dedicated authenticated Codex home. Follow the [deployment
-guide](../40-operations/deployment.md), run the read-only [preflight](../40-operations/troubleshooting.md),
-then use the [CLI reference](../80-reference/cli.md) for registration and
-service commands.
+guide](../40-operations/deployment.md), then run the read-only preflight with the
+same paths that the service will use:
+
+```bash
+uv run agentd \
+  --db .agentd/state.sqlite \
+  --workspace-root /absolute/path/to/agentd-workspaces \
+  --codex-home /absolute/path/to/dedicated-codex-home \
+  doctor
+```
+
+Register a token-denominated pool and a compatible local node:
+
+```bash
+uv run agentd --db .agentd/state.sqlite register-quota codex \
+  --provider openai-codex-chatgpt \
+  --remaining 500000 \
+  --interactive-reserve 50000 \
+  --unit tokens
+uv run agentd --db .agentd/state.sqlite register-node local \
+  --cpu 8 --ram-gb 16 --harness codex
+```
+
+Submit a job with a cumulative maximum. The reviewed container profile mounts the
+repository at `/home/bened/goldenage`; another repository requires its own reviewed
+mount policy.
+
+```bash
+uv run agentd --db .agentd/state.sqlite submit \
+  --project example \
+  --repository /home/bened/goldenage \
+  --objective "Implement and validate the bounded change" \
+  --p50 25000 --p90 75000 --p99 100000 \
+  --quota 75000 --quota-maximum 100000 --quota-pool codex \
+  --harness codex --model-class gpt-5.6-terra \
+  --accept "Tests pass"
+```
+
+Start the foreground daemon and inspect the managed run:
+
+```bash
+uv run agentd \
+  --db .agentd/state.sqlite \
+  --workspace-root /absolute/path/to/agentd-workspaces \
+  --codex-home /absolute/path/to/dedicated-codex-home \
+  serve
+
+CODEX_HOME=/absolute/path/to/dedicated-codex-home \
+  uv run agentd --db .agentd/state.sqlite \
+  codex-status --pool codex
+uv run agentd --db .agentd/state.sqlite usage --job JOB_ID
+```
+
+If review requests a repair, use one of at most two same-thread repair turns and
+then explicitly accept the result:
+
+```bash
+uv run agentd --db .agentd/state.sqlite repair JOB_ID \
+  --instruction "Address the review findings and rerun validation"
+uv run agentd --db .agentd/state.sqlite accept JOB_ID
+```
+
+Managed completion creates a trusted handoff commit and waits in `REVIEW`; agentd
+does not merge the result. The [CLI reference](../80-reference/cli.md) contains the
+complete option surface.

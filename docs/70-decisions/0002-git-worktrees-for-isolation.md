@@ -1,7 +1,10 @@
 # ADR 0002: Use Git worktrees for job isolation
 
 - Status: Accepted
-- Date: 2026-08-25
+- Decision date: Predates ADR repository
+- Recorded: 2026-08-25
+- Supersedes: None
+- Superseded by: None
 
 ## Context
 
