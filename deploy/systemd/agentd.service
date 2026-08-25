@@ -1,6 +1,6 @@
 [Unit]
 Description=agentd hardened container control plane
-Documentation=file:///home/bened/.local/share/agentd/current/docs/deployment.md
+Documentation=file:///home/bened/.local/share/agentd/current/docs/40-operations/deployment.md
 After=docker.service
 ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd/current
 
