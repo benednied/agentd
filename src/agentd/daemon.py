@@ -213,11 +213,9 @@ class AgentDaemon:
             return None
         persisted = list(list_snapshots(current.pool_id, current.bucket_id))
         matching = [snapshot for snapshot in persisted if precedes(snapshot)]
-        return max(
-            matching,
-            key=lambda item: (item.observed_at, item.id),
-            default=None,
-        )
+        if not matching:
+            return None
+        return max(matching, key=lambda item: (item.observed_at, item.id))
 
     async def serve(self, stop: asyncio.Event) -> None:
         """Dispatch ready work until ``stop`` is set.

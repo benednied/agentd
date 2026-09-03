@@ -66,6 +66,7 @@ class LocalWorkerBackend:
         )
         self._node_id = node_id
         self._drivers: dict[str, HarnessDriver] = {}
+        self._handles: dict[str, RunHandle] = {}
         self._capabilities = WorkerBackendCapabilities(
             name=name,
             supported_operating_systems=frozenset({current_os}),
@@ -120,8 +121,10 @@ class LocalWorkerBackend:
         else:
             handle = await driver.start(contract)
         self._drivers[handle.id] = driver
+        self._handles[handle.id] = handle
         if run_id is not None:
             self._drivers[run_id] = driver
+            self._handles[run_id] = handle
         return handle
 
     async def observe(self, run_id: str) -> RunObservation | None:
@@ -138,25 +141,27 @@ class LocalWorkerBackend:
         status_method = getattr(driver, "status", None)
         if status_method is None:
             return {"known": True, "terminal": False, "result": None}
-        handle = run
-        if isinstance(run, str):
-            handle = RunHandle(id=run, driver=driver.capabilities().name)
+        handle = run if isinstance(run, RunHandle) else self._handles[run]
         raw_status = status_method(handle)
         if isawaitable(raw_status):
             raw_status = await raw_status
         return validate_status_payload(raw_status)
 
-    async def steer(self, run: RunHandle, instruction: str) -> None:
-        await self._driver_for(run).steer(run, instruction)
+    async def steer(self, run: RunHandle | str, instruction: str) -> None:
+        driver, handle = self._driver_and_handle(run)
+        await driver.steer(handle, instruction)
 
-    async def interrupt(self, run: RunHandle) -> None:
-        await self._driver_for(run).interrupt(run)
+    async def interrupt(self, run: RunHandle | str) -> None:
+        driver, handle = self._driver_and_handle(run)
+        await driver.interrupt(handle)
 
-    async def cancel(self, run: RunHandle) -> None:
-        await self._driver_for(run).cancel(run)
+    async def cancel(self, run: RunHandle | str) -> None:
+        driver, handle = self._driver_and_handle(run)
+        await driver.cancel(handle)
 
-    async def collect(self, run: RunHandle) -> RunResult:
-        return await self._driver_for(run).collect(run)
+    async def collect(self, run: RunHandle | str) -> RunResult:
+        driver, handle = self._driver_and_handle(run)
+        return await driver.collect(handle)
 
     async def heartbeat(self) -> dict[str, object]:
         return {
@@ -170,8 +175,14 @@ class LocalWorkerBackend:
         # no transport to close here, so this is intentionally a no-op.
         return None
 
-    def _driver_for(self, run: RunHandle) -> HarnessDriver:
+    def _driver_and_handle(
+        self,
+        run: RunHandle | str,
+    ) -> tuple[HarnessDriver, RunHandle]:
+        run_id = run if isinstance(run, str) else run.id
         try:
-            return self._drivers[run.id]
+            driver = self._drivers[run_id]
+            handle = run if isinstance(run, RunHandle) else self._handles[run_id]
+            return driver, handle
         except KeyError as error:
-            raise KeyError(f"Unknown local worker run {run.id!r}") from error
+            raise KeyError(f"Unknown local worker run {run_id!r}") from error

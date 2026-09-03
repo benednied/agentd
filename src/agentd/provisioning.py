@@ -57,7 +57,7 @@ async def _run_command(
             os.killpg(process.pid, signal.SIGKILL)
         await process.wait()
         raise
-    return process.returncode, stdout, stderr
+    return await process.wait(), stdout, stderr
 
 
 @dataclass(frozen=True, slots=True)

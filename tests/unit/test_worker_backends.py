@@ -26,6 +26,12 @@ from agentd.workers import (
 )
 
 
+class _StatusFakeHarnessDriver(FakeHarnessDriver):
+    def status(self, run: RunHandle) -> dict[str, object]:
+        self.execution_for(run)
+        return {"known": True, "terminal": False, "result": None}
+
+
 def _node(
     *,
     node_id: str = "local-1",
@@ -103,15 +109,20 @@ def test_local_dispatch_is_a_thin_harness_start(tmp_path: Path) -> None:
 
 def test_local_backend_lifecycle_helpers_remain_driver_typed(tmp_path: Path) -> None:
     backend = LocalWorkerBackend(operating_system="linux", architecture="x86_64")
-    driver = FakeHarnessDriver(id_factory=lambda: "run-1")
+    driver = _StatusFakeHarnessDriver(id_factory=lambda: "run-1")
     contract = _contract(tmp_path)
 
     async def lifecycle() -> tuple[RunResult, tuple[str, ...]]:
         handle = await backend.dispatch(driver, contract, run_id="durable-1")
         assert await backend.observe("durable-1") is None
-        await backend.steer(handle, "keep going")
+        assert await backend.status("durable-1") == {
+            "known": True,
+            "terminal": False,
+            "result": None,
+        }
+        await backend.steer("durable-1", "keep going")
         await backend.interrupt(handle)
-        await backend.cancel(handle)
+        await backend.cancel("durable-1")
         result = await backend.collect(handle)
         return result, tuple(call.operation for call in driver.calls_for(handle))
 

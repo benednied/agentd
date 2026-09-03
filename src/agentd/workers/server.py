@@ -94,7 +94,7 @@ class WorkerServer:
         else:
             registry = DriverRegistry(drivers)
         self._service = ExecutionService(registry, journal)
-        self._server: asyncio.AbstractServer | None = None
+        self._server: asyncio.Server | None = None
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._client_tasks: set[asyncio.Task[object]] = set()
         self._client_writers: set[asyncio.StreamWriter] = set()
@@ -104,9 +104,13 @@ class WorkerServer:
 
     @property
     def address(self) -> tuple[str, int] | None:
-        if self._server is None or not self._server.sockets:
+        server = self._server
+        if server is None:
             return None
-        sockname = self._server.sockets[0].getsockname()
+        sockets = server.sockets
+        if not sockets:
+            return None
+        sockname = sockets[0].getsockname()
         return str(sockname[0]), int(sockname[1])
 
     async def start(self) -> tuple[str, int]:

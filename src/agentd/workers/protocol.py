@@ -117,19 +117,19 @@ class WorkerBackend(Protocol):
         """Return one current managed-run observation, when supported."""
         ...
 
-    async def steer(self, run: RunHandle, instruction: str) -> None:
+    async def steer(self, run: RunHandle | str, instruction: str) -> None:
         """Deliver a bounded instruction to a running worker."""
         ...
 
-    async def interrupt(self, run: RunHandle) -> None:
+    async def interrupt(self, run: RunHandle | str) -> None:
         """Ask a worker to stop at its next safe boundary."""
         ...
 
-    async def cancel(self, run: RunHandle) -> None:
+    async def cancel(self, run: RunHandle | str) -> None:
         """Cancel a worker run idempotently."""
         ...
 
-    async def collect(self, run: RunHandle) -> RunResult:
+    async def collect(self, run: RunHandle | str) -> RunResult:
         """Collect one terminal worker result."""
         ...
 

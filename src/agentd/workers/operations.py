@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol, TypeGuard, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -29,6 +29,7 @@ from agentd.domain.models import (
     DeployImageOperation,
     ExecutionContract,
     HarnessCapabilities,
+    JsonValue,
     ProducedArtifact,
     RunHandle,
     RunResult,
@@ -181,7 +182,10 @@ class SubprocessCommandRunner:
         try:
             stdout, stderr = await asyncio.wait_for(
                 asyncio.gather(
-                    read_bounded(process.stdout), read_bounded(process.stderr)
+                    # PIPE guarantees both streams, but asyncio's Process type
+                    # cannot correlate those arguments with its attributes.
+                    read_bounded(cast(asyncio.StreamReader, process.stdout)),
+                    read_bounded(cast(asyncio.StreamReader, process.stderr)),
                 ),
                 timeout=limit,
             )
@@ -403,7 +407,7 @@ def _validate_repository_transport(source: str) -> None:
         raise OperationError("repository file URL must include a path")
 
 
-def _digest_from_metadata(value: Any) -> str | None:
+def _digest_from_metadata(value: object) -> str | None:
     """Read only Buildx's authoritative output-manifest digest fields.
 
     Build metadata may also contain source, config, or attestation digests. A
@@ -437,11 +441,11 @@ def _digest_from_metadata(value: Any) -> str | None:
     return candidates[0]
 
 
-def _is_canonical_oci_image(value: Any) -> bool:
+def _is_canonical_oci_image(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and _OCI_IMAGE_REF_RE.fullmatch(value) is not None
 
 
-def _canonical_json_digest(value: Mapping[str, Any]) -> str:
+def _canonical_json_digest(value: Mapping[str, object]) -> str:
     try:
         encoded = json.dumps(
             value,
@@ -459,8 +463,10 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value}")
 
 
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError(f"duplicate JSON key {key!r}")
@@ -487,7 +493,7 @@ class DockerImageBuilder:
                 "build source commit does not match checked out commit"
             )
         self._check_registry(operation.registry_repository)
-        provenance = {
+        provenance: dict[str, JsonValue] = {
             "source_repository": operation.source_repository,
             "source_commit": workspace.commit.value,
             "registry_repository": operation.registry_repository,
@@ -579,7 +585,7 @@ class DockerImageBuilder:
 
     @staticmethod
     def _cache_matches(
-        artifact: ProducedArtifact, provenance: Mapping[str, Any]
+        artifact: ProducedArtifact, provenance: Mapping[str, JsonValue]
     ) -> bool:
         if artifact.ref.kind is not ArtifactKind.OCI_IMAGE:
             return False
@@ -777,7 +783,7 @@ class DockerComposeDeployer:
         return state.with_suffix(".pending.json")
 
     @staticmethod
-    def _validate_state_marker(value: Any, *, label: str) -> dict[str, str]:
+    def _validate_state_marker(value: object, *, label: str) -> dict[str, str]:
         if not isinstance(value, dict) or set(value) != _DEPLOYMENT_STATE_FIELDS:
             raise OperationError(f"{label} fields are invalid")
         image = value["image"]
@@ -798,7 +804,7 @@ class DockerComposeDeployer:
         }
 
     @classmethod
-    def _decode_json_file(cls, path: Path, *, label: str) -> Any:
+    def _decode_json_file(cls, path: Path, *, label: str) -> object:
         try:
             return json.loads(
                 path.read_text(encoding="utf-8"),
@@ -857,7 +863,7 @@ class DockerComposeDeployer:
             os.close(descriptor)
 
     @classmethod
-    def _atomic_write_json(cls, path: Path, value: Mapping[str, Any]) -> None:
+    def _atomic_write_json(cls, path: Path, value: Mapping[str, object]) -> None:
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise OperationError("deployment marker path is invalid")
         encoded = json.dumps(
@@ -894,12 +900,12 @@ class DockerComposeDeployer:
     def _write_pending(
         cls,
         pending: Path,
-        value: Mapping[str, Any],
+        value: Mapping[str, object],
     ) -> None:
         cls._atomic_write_json(pending, value)
 
     @classmethod
-    def _write_state(cls, state: Path, value: Mapping[str, Any]) -> None:
+    def _write_state(cls, state: Path, value: Mapping[str, object]) -> None:
         cls._atomic_write_json(state, value)
 
     @classmethod

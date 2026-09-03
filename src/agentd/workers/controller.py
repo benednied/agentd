@@ -15,7 +15,7 @@ import ssl
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 from agentd.domain.models import (
     ExecutionContract,
@@ -287,7 +287,7 @@ class OperationsHarnessDescriptor:
             checkpointing=False,
         )
 
-    def _fail(self) -> None:
+    def _fail(self) -> Never:
         raise WorkerOperationError(
             "the operations descriptor is capability-only and cannot run locally"
         )
@@ -441,8 +441,8 @@ class RemoteWorkerController:
     def drivers(self) -> tuple[HarnessDriver, ...]:
         return (self._operations,) if self._endpoints else ()
 
-    async def heartbeat(self) -> tuple[dict[str, Any], ...]:
-        snapshots = []
+    async def heartbeat(self) -> tuple[dict[str, object], ...]:
+        snapshots: list[dict[str, object]] = []
         for backend in self._backends:
             snapshots.append(await backend.heartbeat())
         return tuple(snapshots)

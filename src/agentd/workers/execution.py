@@ -13,7 +13,7 @@ from agentd.domain.models import (
     RunObservation,
     RunResult,
 )
-from agentd.harness.protocol import ManagedHarnessDriver
+from agentd.harness.protocol import HarnessDriver, ManagedHarnessDriver
 from agentd.harness.registry import DriverRegistry
 from agentd.workers.errors import WorkerOperationError, WorkerProtocolError
 from agentd.workers.journal import JournalEntry, OperationJournal
@@ -25,7 +25,7 @@ from agentd.workers.remote_protocol import Envelope, payload_hash
 class _RunState:
     run_id: str
     start_fingerprint: str
-    driver: Any
+    driver: HarnessDriver
     handle: RunHandle
     managed: bool
     last_observation: RunObservation | None = None
@@ -347,12 +347,15 @@ class ExecutionService:
             driver = self._drivers.get(driver_name)
         except Exception as error:
             raise WorkerProtocolError("start contract or driver is invalid") from error
-        if managed and not isinstance(driver, ManagedHarnessDriver):
-            # Reject before claiming the durable run id; this safe validation
-            # failure must not create a permanent unresolved tombstone.
-            raise WorkerOperationError(
-                f"driver {driver_name!r} does not support managed starts"
-            )
+        managed_driver: ManagedHarnessDriver | None = None
+        if managed:
+            if not isinstance(driver, ManagedHarnessDriver):
+                # Reject before claiming the durable run id; this safe validation
+                # failure must not create a permanent unresolved tombstone.
+                raise WorkerOperationError(
+                    f"driver {driver_name!r} does not support managed starts"
+                )
+            managed_driver = driver
         if not self._journal.claim_run(
             run_id=request.run_id,
             start_hash=fingerprint,
@@ -365,8 +368,8 @@ class ExecutionService:
             raise WorkerOperationError("operation outcome is unknown")
         self._start_attempts[request.run_id] = fingerprint
         try:
-            if managed:
-                handle = await driver.start_managed(request.run_id, contract)
+            if managed_driver is not None:
+                handle = await managed_driver.start_managed(request.run_id, contract)
             else:
                 handle = await driver.start(contract)
         except BaseException:

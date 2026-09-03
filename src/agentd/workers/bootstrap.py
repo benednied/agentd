@@ -15,7 +15,7 @@ import os
 import re
 import signal
 import ssl
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,7 +97,11 @@ def _safe_registry(value: object) -> str:
     return value
 
 
-def _csv_values(raw: str | None, name: str, validator: Any) -> frozenset[str]:
+def _csv_values(
+    raw: str | None,
+    name: str,
+    validator: Callable[[object], str],
+) -> frozenset[str]:
     if raw is None:
         raise ValueError(f"{name} is required")
     values = tuple(item.strip() for item in raw.split(","))

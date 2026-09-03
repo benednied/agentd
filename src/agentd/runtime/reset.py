@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
 from math import isfinite
+from typing import TypedDict
 
 from agentd.domain.enums import QuotaMode
 from agentd.domain.models import (
@@ -39,6 +40,21 @@ class ProviderResetPolicy:
 
 
 DEFAULT_PROVIDER_RESET_POLICY = ProviderResetPolicy()
+
+
+class _DecisionBase(TypedDict):
+    provider: str
+    pool_id: str
+    bucket_id: str
+    previous_reset_at: datetime | None
+    reset_at: datetime | None
+    confidence: float
+
+
+class _DecisionFractions(TypedDict):
+    previous_used_fraction: float
+    current_used_fraction: float
+    used_fraction_drop: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +91,9 @@ def _fresh(
     return timedelta(0) <= age <= policy.snapshot_stale_after
 
 
-def _window_evidence(
+def _window_marker(
     previous: ProviderQuotaSnapshot, current: ProviderQuotaSnapshot
-) -> bool:
+) -> str | None:
     previous_reset = previous.reset_at
     current_reset = current.reset_at
     moved_forward = (
@@ -88,17 +104,16 @@ def _window_evidence(
     previous_expired = (
         previous_reset is not None and current.observed_at > previous_reset
     )
-    return moved_forward or previous_expired
+    if not (moved_forward or previous_expired):
+        return None
+    if current_reset is not None:
+        return current_reset.isoformat()
+    if previous_reset is not None:
+        return f"after:{previous_reset.isoformat()}"
+    return None  # pragma: no cover - implied by the evidence predicates above
 
 
-def _event_identity(
-    previous: ProviderQuotaSnapshot, current: ProviderQuotaSnapshot
-) -> str:
-    window_marker = (
-        current.reset_at.isoformat()
-        if current.reset_at is not None
-        else f"after:{previous.reset_at.isoformat()}"
-    )
+def _event_identity(current: ProviderQuotaSnapshot, window_marker: str) -> str:
     material = "|".join(
         (current.provider, current.pool_id, current.bucket_id, window_marker)
     )
@@ -125,14 +140,14 @@ def detect_provider_reset(
         and previous.pool_id == current.pool_id
         and previous.bucket_id == current.bucket_id
     )
-    base = dict(
-        provider=current.provider,
-        pool_id=current.pool_id,
-        bucket_id=current.bucket_id,
-        previous_reset_at=previous.reset_at,
-        reset_at=current.reset_at,
-        confidence=min(previous.confidence, current.confidence),
-    )
+    base: _DecisionBase = {
+        "provider": current.provider,
+        "pool_id": current.pool_id,
+        "bucket_id": current.bucket_id,
+        "previous_reset_at": previous.reset_at,
+        "reset_at": current.reset_at,
+        "confidence": min(previous.confidence, current.confidence),
+    }
     if not same_bucket:
         return ProviderResetDecision(
             confirmed=False,
@@ -165,12 +180,13 @@ def detect_provider_reset(
     previous_fraction = previous_used / 100
     current_fraction = current_used / 100
     drop = previous_fraction - current_fraction
-    fractions = dict(
-        previous_used_fraction=previous_fraction,
-        current_used_fraction=current_fraction,
-        used_fraction_drop=drop,
-    )
-    if not _window_evidence(previous, current):
+    fractions: _DecisionFractions = {
+        "previous_used_fraction": previous_fraction,
+        "current_used_fraction": current_fraction,
+        "used_fraction_drop": drop,
+    }
+    window_marker = _window_marker(previous, current)
+    if window_marker is None:
         return ProviderResetDecision(
             confirmed=False,
             reason="no clearly evidenced new provider window",
@@ -186,7 +202,7 @@ def detect_provider_reset(
         )
     return ProviderResetDecision(
         confirmed=True,
-        event_id=_event_identity(previous, current),
+        event_id=_event_identity(current, window_marker),
         reason="fresh new provider window with a material used-fraction decrease",
         **fractions,
         **base,

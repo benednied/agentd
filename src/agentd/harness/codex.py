@@ -29,14 +29,17 @@ from agentd.harness.errors import RunNotActiveError, UnknownRunError
 class ManagedProcess(Protocol):
     """The small subprocess surface used by :class:`CodexDriver`."""
 
-    pid: int | None
-    returncode: int | None
+    @property
+    def pid(self) -> int | None: ...
+
+    @property
+    def returncode(self) -> int | None: ...
 
     async def communicate(self) -> tuple[bytes, bytes]: ...
 
     async def wait(self) -> int: ...
 
-    def send_signal(self, sig: int) -> None: ...
+    def send_signal(self, sig: int, /) -> None: ...
 
     def terminate(self) -> None: ...
 
@@ -563,9 +566,7 @@ def _parse_output(output: str) -> _ParsedOutput:
     return parsed
 
 
-def _merge_usage(
-    target: dict[str, JsonValue], incoming: Mapping[object, object]
-) -> None:
+def _merge_usage(target: dict[str, JsonValue], incoming: Mapping[str, object]) -> None:
     for raw_key, value in incoming.items():
         key = str(raw_key)
         previous = target.get(key)

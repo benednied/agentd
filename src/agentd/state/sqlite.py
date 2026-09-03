@@ -14,7 +14,7 @@ from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, cast
 
 from agentd.domain.enums import (
     AllocationState,
@@ -802,7 +802,9 @@ class SQLiteStateStore:
                     _dump(replace(owned, sequence=0)),
                 ),
             )
-            sequence = int(cursor.lastrowid)
+            # This INSERT targets an INTEGER PRIMARY KEY and therefore has a rowid;
+            # DB-API types the attribute as optional for statements without one.
+            sequence = cast(int, cursor.lastrowid)
             persisted = replace(owned, sequence=sequence)
             self._connection.execute(
                 "UPDATE agent_messages SET payload = ? WHERE sequence = ?",

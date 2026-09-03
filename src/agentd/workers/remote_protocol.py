@@ -8,6 +8,7 @@ is considered.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -402,7 +403,7 @@ class ReplayGuard:
         if key in self._seen:
             raise WorkerAuthenticationError("message nonce was already used")
         if len(self._seen) >= self._max_entries:
-            oldest = min(self._seen, key=self._seen.get)
+            oldest = min(self._seen, key=self._seen.__getitem__)
             del self._seen[oldest]
         self._seen[key] = timestamp
 
@@ -547,7 +548,7 @@ def encode_frame(envelope: Envelope) -> bytes:
 
 
 async def write_frame(
-    writer: Any,
+    writer: asyncio.StreamWriter,
     envelope: Envelope,
     *,
     max_frame_size: int = MAX_FRAME_SIZE,
@@ -560,7 +561,7 @@ async def write_frame(
 
 
 async def read_frame(
-    reader: Any,
+    reader: asyncio.StreamReader,
     *,
     max_frame_size: int = MAX_FRAME_SIZE,
 ) -> Envelope:

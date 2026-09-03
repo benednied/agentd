@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
 
 from agentd.domain.enums import NodeState
 from agentd.domain.models import (
@@ -143,8 +142,8 @@ class RemoteWorkerBackend:
             self._healthy = False
             raise
 
-    async def observe(self, run: RunHandle | str) -> RunObservation | None:
-        return await self._client.observe(self._remote_run_id(run))
+    async def observe(self, run_id: RunHandle | str) -> RunObservation | None:
+        return await self._client.observe(self._remote_run_id(run_id))
 
     async def steer(self, run: RunHandle | str, instruction: str) -> None:
         await self._client.steer(
@@ -161,7 +160,7 @@ class RemoteWorkerBackend:
     async def collect(self, run: RunHandle | str) -> RunResult:
         return await self._client.collect(self._remote_run_id(run))
 
-    async def heartbeat(self) -> dict[str, Any]:
+    async def heartbeat(self) -> dict[str, object]:
         try:
             snapshot = await self._client.heartbeat()
             features = self._validate_heartbeat(snapshot)

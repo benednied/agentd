@@ -76,7 +76,7 @@ from agentd.runtime.governor import (
 )
 from agentd.runtime.quota import QuotaAdmissionError, QuotaManager
 from agentd.runtime.resources import ResourceManager
-from agentd.scheduling.burn import burn_order_key
+from agentd.scheduling.burn import BurnOrderKey, burn_order_key
 from agentd.scheduling.placement import Placement, compatible_placements
 from agentd.scheduling.readiness import gang_readiness
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError, StateStore
@@ -144,7 +144,7 @@ class SchedulerCoordinator:
         states = {job.id: job.state for job in all_jobs}
         capabilities = {item.name: item for item in self._drivers.capabilities()}
 
-        def candidate_key(job: Job) -> object:
+        def candidate_key(job: Job) -> BurnOrderKey:
             try:
                 mode = self._store.get_quota_pool(job.quota_budget.pool_id).mode
             except LookupError:
@@ -669,7 +669,7 @@ class SchedulerCoordinator:
                         result=None,
                     )
                     self._store.save_run(recovered, expected=run)
-                    self._acknowledge_repair(repair_request, recovered)
+                    self._acknowledge_repair(repair_request, recovered, driver)
                     log.info("repair_recovered")
                     continue
                 except BaseException as error:
@@ -848,6 +848,10 @@ class SchedulerCoordinator:
             return
         if raw_result is None:
             result = await backend.collect(run.id)
+        elif not isinstance(raw_result, dict):
+            raise LifecycleError(
+                f"Remote run {run.id} returned malformed terminal result"
+            )
         else:
             try:
                 result = RunResult.from_dict(raw_result)
@@ -2278,7 +2282,7 @@ class SchedulerCoordinator:
             active = replace(starting, handle=handle, state=RunState.RUNNING)
             self._store.save_run(active, expected=starting)
             published_run = active
-            self._acknowledge_repair(request, active)
+            self._acknowledge_repair(request, active, driver)
             return active
         except BaseException:
             quiesced = handle is None
@@ -2322,8 +2326,9 @@ class SchedulerCoordinator:
         self,
         request: RunCommand,
         run: RunRecord,
+        driver: ManagedHarnessDriver,
     ) -> None:
-        observation = self._drivers.get(run.driver).observe(run.id)
+        observation = driver.observe(run.id)
         self._store.acknowledge_run_command(
             RunCommandAck(
                 command_id=request.id,
