@@ -16,5 +16,5 @@ application, integration, harness, deployment, runtime, and review-regression
 behavior. Keep changes focused and preserve the existing Python API and state
 compatibility unless a change explicitly documents otherwise.
 
-The project uses Ruff for linting and formatting. See [testing](testing.md) for
-the authoritative commands.
+The project uses `ty` for static type checking and Ruff for linting and formatting.
+See [testing](testing.md) for the authoritative commands.

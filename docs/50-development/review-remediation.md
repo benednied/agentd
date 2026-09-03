@@ -51,7 +51,8 @@ deliberately left alone; the historical metrics are not current repository claim
 
 ### Change discipline
 
-- Do not weaken locked dependency, Ruff, formatting, or full-test gates.
+- Do not weaken locked dependency, static type checking, Ruff, formatting, or
+  full-test gates.
 - Add focused regression tests before changing compensation, recovery, accounting,
   migration, workspace cleanup, or security-boundary code.
 - Do not split complex lifecycle functions solely to lower a metric; preserve their
@@ -72,6 +73,7 @@ deliberately left alone; the historical metrics are not current repository claim
 The authoritative commands are:
 
 ```bash
+uv run ty check
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest --cov=agentd --cov-report=term-missing

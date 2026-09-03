@@ -3,6 +3,7 @@
 Run the pass/fail local checks:
 
 ```bash
+uv run ty check
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest --cov=agentd --cov-report=term-missing
