@@ -1,15 +1,19 @@
 """Persistence interface for control-plane execution state."""
 
+from collections.abc import Iterable
 from typing import Protocol
 
 from agentd.domain.enums import JobState
 from agentd.domain.models import (
+    AgentRequestRecord,
+    ArtifactRecord,
     Checkpoint,
     DriverSession,
     Job,
     ProviderQuotaSnapshot,
     QuotaPool,
     QuotaReservation,
+    QuotaResetEvent,
     ResourceAllocation,
     RunCommand,
     RunCommandAck,
@@ -62,6 +66,44 @@ class StateStore(Protocol):
         expected_run: RunRecord | None,
     ) -> None: ...
 
+    def save_job_and_run_with_artifacts(
+        self,
+        job: Job,
+        transition: StateTransition,
+        run: RunRecord,
+        artifacts: Iterable[ArtifactRecord],
+        *,
+        expected_job: Job,
+        expected_run: RunRecord | None,
+    ) -> None: ...
+
+    def publish_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord: ...
+
+    def register_external_artifact(
+        self, artifact: ArtifactRecord
+    ) -> ArtifactRecord: ...
+
+    def publish_artifacts(
+        self, artifacts: Iterable[ArtifactRecord]
+    ) -> tuple[ArtifactRecord, ...]: ...
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord: ...
+
+    def list_artifacts(
+        self,
+        *,
+        job_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[ArtifactRecord]: ...
+
+    def append_agent_request(
+        self, request: AgentRequestRecord
+    ) -> AgentRequestRecord: ...
+
+    def list_agent_requests(
+        self, run_id: str, *, limit: int | None = None
+    ) -> list[AgentRequestRecord]: ...
+
     def get_job(self, job_id: str) -> Job: ...
 
     def list_jobs(self, states: frozenset[JobState] | None = None) -> list[Job]: ...
@@ -110,6 +152,14 @@ class StateStore(Protocol):
         expected_pool: QuotaPool,
         updated_pool: QuotaPool,
     ) -> None: ...
+
+    def apply_reset_event(self, event: QuotaResetEvent) -> QuotaPool: ...
+
+    def get_reset_event(self, event_id: str) -> QuotaResetEvent: ...
+
+    def list_reset_events(
+        self, pool_id: str | None = None
+    ) -> list[QuotaResetEvent]: ...
 
     def get_quota_pool(self, pool_id: str) -> QuotaPool: ...
 

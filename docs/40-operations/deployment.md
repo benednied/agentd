@@ -2,7 +2,8 @@
 
 This profile is for the reviewed single-user Linux host layout. Commands run only
 where the operator invokes them; scripts do not use SSH or copy files to another
-host.
+host. `deploy.sh` remains the legacy single-host release/rollback path; it does
+not provision or deploy a remote-worker fleet.
 
 ## Prerequisites
 

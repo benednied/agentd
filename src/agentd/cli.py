@@ -55,6 +55,23 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("serve", help="run the continuous local scheduler service")
     commands.add_parser("doctor", help="run read-only service prerequisite checks")
 
+    worker = commands.add_parser(
+        "worker-serve",
+        help="run one authenticated remote worker daemon",
+    )
+    worker.add_argument("--host")
+    worker.add_argument("--port", type=int)
+    worker.add_argument("--node-id")
+    worker.add_argument("--session-epoch")
+    worker.add_argument("--journal")
+    worker.add_argument("--psk-file")
+    worker.add_argument("--tls-cert")
+    worker.add_argument("--tls-key")
+    worker.add_argument("--operations-config")
+    worker.add_argument("--cache-root")
+    worker.add_argument("--operation-state-root")
+    worker.add_argument("--allow-insecure-loopback", action="store_true")
+
     submit = commands.add_parser("submit", help="submit a job")
     submit.add_argument("--project", required=True)
     submit.add_argument("--repository", required=True)
@@ -180,6 +197,8 @@ def _run_process_command(
 ) -> int | None:
     if args.command == "serve":
         return asyncio.run(_serve_service(config))
+    if args.command == "worker-serve":
+        return _serve_worker(args)
     if args.command == "doctor":
         from agentd.doctor import run_doctor
 
@@ -200,6 +219,35 @@ def _run_process_command(
             _print_model(snapshot)
         return 0
     return None
+
+
+def _serve_worker(args: argparse.Namespace) -> int:
+    from agentd.workers.bootstrap import WorkerServeConfig, run_worker_server
+
+    values = dict(os.environ)
+    overrides = {
+        "AGENTD_WORKER_HOST": args.host,
+        "AGENTD_WORKER_PORT": str(args.port) if args.port is not None else None,
+        "AGENTD_WORKER_NODE_ID": args.node_id,
+        "AGENTD_WORKER_SESSION_EPOCH": args.session_epoch,
+        "AGENTD_WORKER_JOURNAL": args.journal,
+        "AGENTD_WORKER_PSK_FILE": args.psk_file,
+        "AGENTD_WORKER_TLS_CERT": args.tls_cert,
+        "AGENTD_WORKER_TLS_KEY": args.tls_key,
+        "AGENTD_WORKER_OPERATIONS_CONFIG": args.operations_config,
+        "AGENTD_WORKER_CACHE_ROOT": args.cache_root,
+        "AGENTD_WORKER_OPERATION_STATE_ROOT": args.operation_state_root,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            values[name] = value
+    if args.allow_insecure_loopback:
+        values["AGENTD_WORKER_ALLOW_INSECURE_LOOPBACK"] = "1"
+    config = WorkerServeConfig.from_environment(values)
+    event_logger(component="worker").info("worker_starting")
+    result = asyncio.run(run_worker_server(config, values=values))
+    event_logger(component="worker").info("worker_stopped")
+    return result
 
 
 def _run_lifecycle_command(args: argparse.Namespace) -> int | None:
@@ -404,14 +452,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 async def _serve_service(config: ServiceConfig) -> int:
     from agentd.bootstrap import create_local_runtime
     from agentd.daemon import AgentDaemon
+    from agentd.workers.controller import RemoteWorkerController
 
-    runtime = create_local_runtime(
-        config.database,
-        config.workspace_root,
-        config=config,
-        trusted_provisioning=True,
-        enforce_codex_account_policy=True,
-    )
+    remote_workers = RemoteWorkerController.from_environment(os.environ)
+    for endpoint in remote_workers.endpoints:
+        if endpoint.psk_env is not None:
+            # Clients retain the key in memory. Child processes started for
+            # local Git/Codex work must never inherit a worker transport PSK.
+            os.environ.pop(endpoint.psk_env, None)
+    try:
+        runtime = create_local_runtime(
+            config.database,
+            config.workspace_root,
+            config=config,
+            trusted_provisioning=True,
+            enforce_codex_account_policy=True,
+            additional_drivers=remote_workers.drivers,
+            worker_backends=remote_workers.backends,
+        )
+    except BaseException:
+        await remote_workers.close()
+        raise
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for received in (signal.SIGINT, signal.SIGTERM):
@@ -422,6 +483,8 @@ async def _serve_service(config: ServiceConfig) -> int:
         poll_interval=config.poll_interval_seconds,
         account_oracle=runtime.account_oracle,
         account_poll_seconds=config.account_poll_seconds,
+        worker_heartbeat_seconds=config.worker_heartbeat_seconds,
+        provider_reset_remaining=config.provider_reset_remaining,
     )
     event_logger(component="daemon").info("service_started")
     try:

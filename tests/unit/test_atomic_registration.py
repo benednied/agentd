@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 
@@ -9,6 +10,7 @@ from agentd.domain.models import (
     QuotaPool,
     QuotaResetEvent,
     ResourceVector,
+    WorkerHeartbeat,
     WorkerNode,
 )
 from agentd.domain.transitions import initial_transition
@@ -72,6 +74,25 @@ def test_registration_preserves_live_counters_and_releasability(
     assert store.get_quota_pool("default").reserved == 0
 
 
+def test_manual_node_registration_preserves_last_authenticated_heartbeat(
+    make_job: Callable[..., Job],
+) -> None:
+    job = make_job()
+    store, node = _runtime(job)
+    heartbeat = WorkerHeartbeat(
+        session_epoch="epoch-1",
+        drivers=frozenset({"operations"}),
+        active_runs=2,
+        observed_at=datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    store.register_node(replace(node, heartbeat=heartbeat))
+
+    updated = store.register_node(replace(node, labels={"zone": "new"}))
+
+    assert updated.heartbeat == heartbeat
+    assert WorkerNode.from_dict(updated.to_dict()).heartbeat == heartbeat
+
+
 def test_stale_quota_mutation_cannot_erase_live_reservation(
     make_job: Callable[..., Job],
 ) -> None:
@@ -101,18 +122,14 @@ class ReserveDuringResetStore(SQLiteStateStore):
         self.job = job
         self.injected = False
 
-    def update_quota_pool(
-        self,
-        expected_pool: QuotaPool,
-        updated_pool: QuotaPool,
-    ) -> None:
+    def apply_reset_event(self, event: QuotaResetEvent) -> QuotaPool:
         if not self.injected:
             self.injected = True
             QuotaManager(self).reserve(self.job)
-        super().update_quota_pool(expected_pool, updated_pool)
+        return super().apply_reset_event(event)
 
 
-def test_reset_event_retries_concurrent_reservation_without_lost_counter(
+def test_reset_event_preserves_reservation_created_before_atomic_application(
     make_job: Callable[..., Job],
 ) -> None:
     job = make_job()

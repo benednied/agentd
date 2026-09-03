@@ -247,7 +247,12 @@ class SelectiveBackend:
         self,
         driver: FakeHarnessDriver,
         contract: ExecutionContract,
+        *,
+        run_id: str | None = None,
+        managed: bool = False,
     ) -> RunHandle:
+        if managed:
+            return await driver.start_managed(run_id or contract.job_id, contract)
         return await driver.start(contract)
 
 
@@ -789,9 +794,80 @@ def test_provider_pressure_enqueues_exactly_once_checkpoint_for_active_runs(
     asyncio.run(rig.coordinator.reconcile_managed_runs(snapshot, at=NOW))
 
     commands = rig.store.list_run_commands(run.id)
+    expected_actions = ["checkpoint", "interrupt"] if reached else ["checkpoint"]
+    assert sorted(command.action for command in commands) == sorted(expected_actions)
+    assert len({command.id for command in commands}) == len(commands)
+    checkpoint = next(command for command in commands if command.action == "checkpoint")
+    assert checkpoint.id.startswith(f"provider-quota-checkpoint:{run.id}:")
+
+
+@pytest.mark.parametrize(
+    ("used_percent", "hard_stop"),
+    ((97.99, False), (98.0, True), (100.0, True)),
+)
+def test_provider_two_percent_hard_stop_boundary_is_exact_and_idempotent(
+    make_reconciliation_rig: Callable[..., ReconciliationRig],
+    used_percent: float,
+    hard_stop: bool,
+) -> None:
+    rig = make_reconciliation_rig()
+    _register_capacity(rig)
+    run = _dispatch(rig, _job())
+    assert run is not None
+    rig.driver.observations[run.id] = _observation(run, terminal=False)
+    snapshot = ProviderQuotaSnapshot(
+        id=f"provider-tail-{used_percent}",
+        pool_id="default",
+        bucket_id="codex",
+        primary_used_percent=used_percent,
+        observed_at=NOW,
+    )
+
+    asyncio.run(rig.coordinator.reconcile_managed_runs(snapshot, at=NOW))
+    asyncio.run(rig.coordinator.reconcile_managed_runs(snapshot, at=NOW))
+
+    stops = [
+        command
+        for command in rig.store.list_run_commands(run.id)
+        if command.id.startswith("provider-hard-stop:")
+    ]
+    assert len(stops) == int(hard_stop)
+    if stops:
+        assert stops[0].action == "interrupt"
+        assert stops[0].payload["threshold_fraction"] == 0.02
+
+
+@pytest.mark.parametrize(
+    ("effort_consumed", "action"),
+    ((10.01, "steer"), (12.51, "checkpoint"), (20.01, "checkpoint")),
+)
+def test_tail_governor_enqueues_one_durable_command_from_exact_effort(
+    make_reconciliation_rig: Callable[..., ReconciliationRig],
+    effort_consumed: float,
+    action: str,
+) -> None:
+    rig = make_reconciliation_rig()
+    _register_capacity(rig)
+    run = _dispatch(rig, _job())
+    assert run is not None
+    rig.driver.observations[run.id] = replace(
+        _observation(run, terminal=False),
+        metadata={
+            "effort_consumed": effort_consumed,
+            "effort_unit": "agent-minutes",
+        },
+    )
+
+    asyncio.run(rig.coordinator.reconcile_managed_runs(at=NOW))
+    asyncio.run(rig.coordinator.reconcile_managed_runs(at=NOW))
+
+    commands = [
+        command
+        for command in rig.store.list_run_commands(run.id)
+        if command.id.startswith("tail-governor:")
+    ]
     assert len(commands) == 1
-    assert commands[0].action == "checkpoint"
-    assert commands[0].id.startswith(f"provider-quota-checkpoint:{run.id}:")
+    assert commands[0].action == action
 
 
 @pytest.mark.parametrize(

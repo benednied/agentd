@@ -306,35 +306,6 @@ class QuotaManager:
         if event.mode == QuotaMode.RESET_CONFIRMED:
             if event.new_remaining is None:
                 raise ValueError("A confirmed reset must include the new quota amount")
-            if event.new_remaining < 0:
-                raise ValueError("Reset quota cannot be negative")
-
-        conflict: ConcurrentStateError | None = None
-        for _attempt in range(_MAX_OPTIMISTIC_ATTEMPTS):
-            pool = self._store.get_quota_pool(event.pool_id)
-            remaining = pool.remaining
-            reset_at = event.expected_reset_at
-            confidence = event.confidence
-            if event.mode == QuotaMode.RESET_CONFIRMED:
-                remaining = event.new_remaining
-                reset_at = None
-                confidence = 1
-            updated = replace(
-                pool,
-                mode=event.mode,
-                remaining=remaining,
-                reset_at=reset_at,
-                reset_confidence=confidence,
-                updated_at=utc_now(),
-            )
-            try:
-                self._store.update_quota_pool(pool, updated)
-            except ConcurrentStateError as error:
-                conflict = error
-                continue
-            return updated
-
-        raise ConcurrentStateError(
-            f"Could not register reset event for pool {event.pool_id} "
-            "after concurrent updates"
-        ) from conflict
+            if not isfinite(event.new_remaining) or event.new_remaining < 0:
+                raise ValueError("Reset quota must be finite and non-negative")
+        return self._store.apply_reset_event(event)

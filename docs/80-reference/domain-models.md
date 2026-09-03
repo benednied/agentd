@@ -5,6 +5,53 @@ This page is the field-level reference for the frozen dataclasses in
 format. Enum values are listed in their persisted form. Defaults below describe
 the Python constructors; required fields have no default.
 
+## Artifact and operation models
+
+### `ArtifactRef`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `kind` | `ArtifactKind` | `git_commit` or `oci_image`. |
+| `value` | `str` | Lowercase full Git SHA or canonical `registry/repository@sha256:<digest>`. |
+
+### `ArtifactSelector`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `producer_job_id` | `str` | Completed dependency that owns the output. |
+| `spec_name` | `str` | Declared producer output slot. |
+| `kind` | `ArtifactKind` | Required artifact family. |
+
+### `ArtifactSpec`
+
+| Field | Type / default | Meaning |
+| --- | --- | --- |
+| `name` | `str` | Stable output slot name. |
+| `kind` | `ArtifactKind` | Required artifact family. |
+| `media_type` | `str \| None`, `None` | Optional compact media type. |
+
+`ArtifactRecord` adds the persisted producer job/run, verification status and
+timestamp, and `external` marker. External refs are accepted only when the
+operator registers them as verified. Build outputs become verified records only
+after the typed operation backend returns a valid output; cache hits are
+reverified against the expected registry and provenance. The same immutable
+digest ref may have multiple provenance rows, including rows from different
+producers. A producer may publish a slot only once; selectors remain keyed by
+`producer_job_id` plus `spec_name`, never by digest alone.
+
+### `BuildImageOperation`
+
+Fields are `source_input` (`ArtifactRef` or `ArtifactSelector`), `output_name`,
+`registry_repository`, `context` (default `.`), `dockerfile` (default
+`Dockerfile`), `platforms` (default empty tuple), and `source_repository`.
+Dispatch resolves the source selector to an immutable Git ref before building.
+
+### `DeployImageOperation`
+
+Fields are `image_input` (`ArtifactRef` or `ArtifactSelector`), `target`,
+`config_revision` (direct Git `ArtifactRef`), and `deployment_name`. Deploy accepts
+only digest-pinned OCI refs and has no output slots.
+
 ## Planning and quota models
 
 ### `EffortEstimate`
@@ -80,6 +127,9 @@ Required fields are `project`, `repository`, `objective`, `quota_budget`, and
 | `preemption_policy` | `PreemptionPolicy`, `CHECKPOINT` | Safe preemption policy. |
 | `checkpoint_policy` | `CheckpointPolicy`, `ON_REQUEST` | Checkpoint policy. |
 | `acceptance_criteria` | `tuple[str, ...]`, `()` | Conditions for review or acceptance. |
+| `artifact_inputs` | `tuple[ArtifactRef \| ArtifactSelector, ...]`, `()` | Immutable inputs or producer-output selectors; selectors must name dependencies. |
+| `artifact_outputs` | `tuple[ArtifactSpec, ...]`, `()` | Declared immutable output slots. |
+| `operation` | `BuildImageOperation \| DeployImageOperation \| None`, `None` | Optional typed artifact operation; it is not a shell command. |
 | `required_capabilities` | `frozenset[str]`, empty | Harness/node capabilities required by the job. |
 | `resources` | `ResourceVector`, one CPU/one GiB | Requested resources. |
 | `burn` | `BurnPolicy`, empty | Pre-reset burn eligibility and checkpointability. |
@@ -108,8 +158,23 @@ The `terminal` property is true only for `COMPLETED`, `FAILED`, or
 | `capabilities` | `frozenset[str]`, empty | Features such as `browser` or `desktop`. |
 | `state` | `NodeState`, `ONLINE` | `ONLINE`, `DRAINING`, or `OFFLINE`. |
 | `updated_at` | `datetime`, current UTC | Last node snapshot update. |
+| `heartbeat` | `WorkerHeartbeat \| None`, `None` | Last authenticated remote-worker status persisted on this node. |
 
 `available` is derived as `capacity - allocated`.
+
+### `WorkerHeartbeat`
+
+| Field | Type / default | Meaning |
+| --- | --- | --- |
+| `session_epoch` | `str` | Last authenticated worker session epoch. |
+| `drivers` | `frozenset[str]` | Drivers reported by the worker, including `operations` for the artifact worker. |
+| `active_runs` | `int` | Worker-reported active run count; informational and never converted into capacity. |
+| `observed_at` | `datetime`, current UTC | Time the controller persisted the authenticated status. |
+
+`WorkerNode.state` remains an administrative placement state. A remote backend
+must pass its authenticated heartbeat and node binding before it is compatible
+for dispatch. Heartbeat status is persisted on the existing node; it never
+changes the node's declared `capacity`, `allocated`, `harnesses`, or capabilities.
 
 ### `ResourceAllocation`
 
@@ -241,6 +306,9 @@ balances, node identity, QoS rank, scarcity, and scheduler rationale.
 | `environment` | `dict[str, str]` | Assignment environment. |
 | `model_class` | `str` | Selected model class. |
 | `resume` | `ResumeCapsule \| None` | Optional resume context. |
+| `artifact_inputs` | `tuple[ArtifactRef, ...]`, `()` | Resolved immutable inputs passed to the worker. |
+| `artifact_outputs` | `tuple[ArtifactSpec, ...]`, `()` | Output slots the coordinator expects to publish. |
+| `operation` | `BuildImageOperation \| DeployImageOperation \| None`, `None` | Resolved typed operation, if this is an artifact job. |
 
 ### `RunRecord`
 
@@ -273,9 +341,15 @@ with an invalid or absent normalized cumulative usage cannot be settled as a
 trusted usage sample.
 
 `RunResult` contains `outcome`, optional `summary`, optional `commit`,
-`consumed_quota`, metadata, and optional `TokenUsage`. `TokenUsage` contains
-integer cumulative `input_tokens`, `cached_input_tokens`, `output_tokens`, and
-`reasoning_output_tokens` counters.
+`consumed_quota`, metadata, optional `TokenUsage`, and `produced_artifacts`.
+Each `ProducedArtifact` contains a declared `spec_name`, immutable `ArtifactRef`,
+and optional metadata. The coordinator publishes Build outputs only when the
+selected backend advertises the `artifact-verification` capability and has
+returned a valid result; external input refs must be operator-verified. Cache
+hits are registry-reverified before they are accepted. This capability is the
+artifact-verification trust boundary, not a claim that arbitrary worker output
+is trusted. `TokenUsage` contains integer cumulative `input_tokens`,
+`cached_input_tokens`, `output_tokens`, and `reasoning_output_tokens` counters.
 
 ## Persisted enum values
 

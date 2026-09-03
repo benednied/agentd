@@ -6,19 +6,24 @@ state only: execution requirements, allocations, runs, and durable checkpoints.
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from math import isfinite
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from agentd.domain.enums import (
+    AgentRequestKind,
     AllocationState,
+    ArtifactKind,
     CheckpointPolicy,
     JobState,
     NodeState,
+    OperationKind,
     PreemptionPolicy,
     QoSClass,
     QuotaMode,
@@ -68,6 +73,350 @@ class Serializable:
         if not isinstance(encoded, dict):  # pragma: no cover - defensive invariant
             raise TypeError("A serializable model must encode to an object")
         return encoded
+
+
+_GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_OCI_IMAGE_RE = re.compile(
+    r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"@sha256:[0-9a-f]{64}\Z"
+)
+_OCI_REPOSITORY_RE = re.compile(
+    r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*\Z"
+)
+_STABLE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+_PLATFORM_RE = re.compile(r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*\Z")
+
+
+def _require_stable_name(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} must be a non-empty stable name")
+    if _STABLE_NAME_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must contain only lowercase name characters")
+    return value
+
+
+def _require_relative_path(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} must be a non-empty relative path")
+    if (
+        "\0" in value
+        or "\\" in value
+        or value.startswith("/")
+        or value.startswith("-")
+        or any(part == ".." for part in value.split("/"))
+        or any(char.isspace() or char in ";|&$`<>" for char in value)
+    ):
+        raise ValueError(f"{label} must be a confined relative path")
+    return value
+
+
+def _require_registry_repository(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or _OCI_REPOSITORY_RE.fullmatch(value) is None
+    ):
+        raise ValueError(
+            "registry_repository must be a lowercase registry/repository without "
+            "a tag or digest"
+        )
+    return value
+
+
+def _require_source_repository(value: str) -> str:
+    """Validate repository identity without accepting shell or URL credentials."""
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("source_repository must be a non-empty URL or path")
+    if (
+        "\0" in value
+        or value.startswith("-")
+        or any(char.isspace() or char in ";|&$`<>" for char in value)
+    ):
+        raise ValueError("source_repository must not be option-like or shell-like")
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"https", "file"}:
+            raise ValueError("source_repository URL must use HTTPS or a local file URL")
+        if parsed.scheme == "https" and not parsed.hostname:
+            raise ValueError("source_repository HTTPS URL must include a host")
+        if parsed.scheme == "file" and not parsed.path:
+            raise ValueError("source_repository file URL must include a path")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("source_repository URL cannot embed credentials")
+    elif re.match(r"^[^/]+@[^/]+:", value):
+        raise ValueError("source_repository cannot use an SSH/scp-style transport")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRef(Serializable):
+    """A canonical immutable Git commit or OCI image reference."""
+
+    kind: ArtifactKind
+    value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ArtifactKind):
+            raise TypeError("Artifact kind must be an ArtifactKind")
+        if not isinstance(self.value, str) or not self.value:
+            raise ValueError("Artifact reference must be a non-empty string")
+        if self.value != self.value.strip() or self.value != self.value.lower():
+            raise ValueError("Artifact reference must be lowercase and untrimmed")
+        if "\0" in self.value:
+            raise ValueError("Artifact reference cannot contain NUL")
+        pattern = (
+            _GIT_COMMIT_RE if self.kind is ArtifactKind.GIT_COMMIT else _OCI_IMAGE_RE
+        )
+        if pattern.fullmatch(self.value) is None:
+            expected = (
+                "a complete lowercase 40- or 64-character Git SHA"
+                if self.kind is ArtifactKind.GIT_COMMIT
+                else "a canonical lowercase registry/repository@sha256:<digest>"
+            )
+            raise ValueError(f"Artifact reference must be {expected}")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArtifactRef:
+        return cls(
+            kind=ArtifactKind(data["kind"]),
+            value=str(data["value"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSelector(Serializable):
+    """An unresolved dependency binding for a declared producer output."""
+
+    producer_job_id: str
+    spec_name: str
+    kind: ArtifactKind
+
+    def __post_init__(self) -> None:
+        if not self.producer_job_id.strip():
+            raise ValueError("Artifact selector requires a producer job")
+        _require_stable_name(self.spec_name, "Artifact selector spec name")
+        if not isinstance(self.kind, ArtifactKind):
+            raise TypeError("Artifact selector kind must be an ArtifactKind")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArtifactSelector:
+        return cls(
+            producer_job_id=str(data["producer_job_id"]),
+            spec_name=str(data["spec_name"]),
+            kind=ArtifactKind(data["kind"]),
+        )
+
+
+ArtifactInput = ArtifactRef | ArtifactSelector
+
+
+def artifact_input_from_dict(data: dict[str, Any]) -> ArtifactInput:
+    """Decode a concrete ref or an explicitly unresolved selector."""
+
+    if not isinstance(data, dict):
+        raise TypeError("Artifact input must be an object")
+    if "value" in data:
+        return ArtifactRef.from_dict(data)
+    if "producer_job_id" in data:
+        return ArtifactSelector.from_dict(data)
+    raise ValueError("Artifact input must be a ref or selector")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSpec(Serializable):
+    """A stable output slot with a required artifact family."""
+
+    name: str
+    kind: ArtifactKind
+    media_type: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_stable_name(self.name, "Artifact spec name")
+        if not isinstance(self.kind, ArtifactKind):
+            raise TypeError("Artifact spec kind must be an ArtifactKind")
+        if self.media_type is not None and (
+            not self.media_type
+            or self.media_type != self.media_type.strip()
+            or any(char.isspace() or char in ";|&$`<>" for char in self.media_type)
+        ):
+            raise ValueError("Artifact media type must be a compact token")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArtifactSpec:
+        return cls(
+            name=str(data["name"]),
+            kind=ArtifactKind(data["kind"]),
+            media_type=(
+                str(data["media_type"]) if data.get("media_type") is not None else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BuildImageOperation(Serializable):
+    """Typed image-build intent; it contains no shell command fields."""
+
+    source_input: ArtifactInput
+    output_name: str
+    registry_repository: str
+    context: str = "."
+    dockerfile: str = "Dockerfile"
+    platforms: tuple[str, ...] = ()
+    source_repository: str = ""
+    kind: OperationKind = field(default=OperationKind.BUILD_IMAGE, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_input, (ArtifactRef, ArtifactSelector)):
+            raise TypeError("Build source_input must be an artifact input")
+        if self.source_input.kind is not ArtifactKind.GIT_COMMIT:
+            raise ValueError("Build source_input must reference a Git commit")
+        _require_source_repository(self.source_repository)
+        _require_stable_name(self.output_name, "Build output name")
+        _require_registry_repository(self.registry_repository)
+        _require_relative_path(self.context, "Build context")
+        _require_relative_path(self.dockerfile, "Build Dockerfile")
+        if any(
+            not isinstance(platform, str) or _PLATFORM_RE.fullmatch(platform) is None
+            for platform in self.platforms
+        ):
+            raise ValueError("Build platforms must use lowercase os/architecture names")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BuildImageOperation:
+        if data.get("kind") != OperationKind.BUILD_IMAGE.value:
+            raise ValueError("Build operation has an invalid kind discriminator")
+        return cls(
+            source_input=artifact_input_from_dict(data["source_input"]),
+            output_name=str(data["output_name"]),
+            registry_repository=str(data["registry_repository"]),
+            context=str(data.get("context", ".")),
+            dockerfile=str(data.get("dockerfile", "Dockerfile")),
+            platforms=tuple(str(item) for item in data.get("platforms", [])),
+            source_repository=str(data["source_repository"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeployImageOperation(Serializable):
+    """Typed digest-pinned deployment intent; it contains no shell fields."""
+
+    image_input: ArtifactInput
+    target: str
+    config_revision: ArtifactRef
+    deployment_name: str
+    kind: OperationKind = field(default=OperationKind.DEPLOY_IMAGE, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image_input, (ArtifactRef, ArtifactSelector)):
+            raise TypeError("Deploy image_input must be an artifact input")
+        if self.image_input.kind is not ArtifactKind.OCI_IMAGE:
+            raise ValueError("Deploy image_input must reference an OCI image digest")
+        if not isinstance(self.config_revision, ArtifactRef):
+            raise TypeError("Deploy config_revision must be an ArtifactRef")
+        if self.config_revision.kind is not ArtifactKind.GIT_COMMIT:
+            raise ValueError("Deploy config_revision must reference a Git commit")
+        _require_stable_name(self.target, "Deploy target")
+        _require_stable_name(self.deployment_name, "Deploy deployment name")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DeployImageOperation:
+        if data.get("kind") != OperationKind.DEPLOY_IMAGE.value:
+            raise ValueError("Deploy operation has an invalid kind discriminator")
+        return cls(
+            image_input=artifact_input_from_dict(data["image_input"]),
+            target=str(data["target"]),
+            config_revision=ArtifactRef.from_dict(data["config_revision"]),
+            deployment_name=str(data["deployment_name"]),
+        )
+
+
+JobOperation = BuildImageOperation | DeployImageOperation
+
+
+def operation_from_dict(data: dict[str, Any]) -> JobOperation:
+    """Decode a typed operation without accepting an untagged payload."""
+
+    if not isinstance(data, dict):
+        raise TypeError("A job operation must be an object")
+    kind = data.get("kind")
+    if kind == OperationKind.BUILD_IMAGE.value:
+        return BuildImageOperation.from_dict(data)
+    if kind == OperationKind.DEPLOY_IMAGE.value:
+        return DeployImageOperation.from_dict(data)
+    raise ValueError("A job operation requires a known kind discriminator")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRecord(Serializable):
+    """Append-only ledger entry for a produced or verified immutable artifact."""
+
+    ref: ArtifactRef
+    producer_job_id: str | None
+    producer_run_id: str | None
+    spec_name: str
+    verified: bool = False
+    verified_at: datetime | None = None
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utc_now)
+    external: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, ArtifactRef):
+            raise TypeError("Artifact record ref must be an ArtifactRef")
+        if self.external:
+            if self.producer_job_id is not None or self.producer_run_id is not None:
+                raise ValueError("External artifacts cannot have producer identifiers")
+            if not self.verified or self.verified_at is None:
+                raise ValueError("External artifacts must be verified at registration")
+        elif (
+            not isinstance(self.producer_job_id, str)
+            or not self.producer_job_id.strip()
+            or not isinstance(self.producer_run_id, str)
+            or not self.producer_run_id.strip()
+        ):
+            raise ValueError("A produced artifact requires producer identifiers")
+        if not isinstance(self.external, bool):
+            raise TypeError("Artifact external must be a bool")
+        _require_stable_name(self.spec_name, "Artifact spec name")
+        if not isinstance(self.verified, bool):
+            raise TypeError("Artifact verified must be a bool")
+        if self.verified and self.verified_at is None:
+            raise ValueError("A verified artifact requires verified_at")
+        if not self.verified and self.verified_at is not None:
+            raise ValueError("An unverified artifact cannot have verified_at")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArtifactRecord:
+        verified_at = data.get("verified_at")
+        return cls(
+            id=str(data["id"]),
+            ref=ArtifactRef.from_dict(data["ref"]),
+            producer_job_id=(
+                str(data["producer_job_id"])
+                if data.get("producer_job_id") is not None
+                else None
+            ),
+            producer_run_id=(
+                str(data["producer_run_id"])
+                if data.get("producer_run_id") is not None
+                else None
+            ),
+            spec_name=str(data["spec_name"]),
+            verified=bool(data.get("verified", False)),
+            verified_at=(
+                datetime.fromisoformat(str(verified_at))
+                if verified_at is not None
+                else None
+            ),
+            metadata=dict(data.get("metadata", {})),
+            created_at=datetime.fromisoformat(str(data["created_at"])),
+            external=bool(data.get("external", False)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +738,9 @@ class Job(Serializable):
     selected_model_class: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    artifact_inputs: tuple[ArtifactInput, ...] = ()
+    artifact_outputs: tuple[ArtifactSpec, ...] = ()
+    operation: JobOperation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_ref, str):
@@ -401,6 +753,25 @@ class Job(Serializable):
             or "\0" in self.base_ref
         ):
             raise ValueError("A job base ref must be non-empty and not option-like")
+        if not all(
+            isinstance(item, (ArtifactRef, ArtifactSelector))
+            for item in self.artifact_inputs
+        ):
+            raise TypeError(
+                "Job artifact_inputs must contain ArtifactRef or "
+                "ArtifactSelector values"
+            )
+        if len(set(self.artifact_inputs)) != len(self.artifact_inputs):
+            raise ValueError("Job artifact_inputs cannot contain duplicates")
+        if any(not isinstance(item, ArtifactSpec) for item in self.artifact_outputs):
+            raise TypeError("Job artifact_outputs must contain ArtifactSpec values")
+        output_names = tuple(item.name for item in self.artifact_outputs)
+        if len(set(output_names)) != len(output_names):
+            raise ValueError("Job artifact_outputs must have unique names")
+        if self.operation is not None and not isinstance(
+            self.operation, (BuildImageOperation, DeployImageOperation)
+        ):
+            raise TypeError("Job operation must be a supported typed operation")
 
     @property
     def terminal(self) -> bool:
@@ -465,6 +836,52 @@ class Job(Serializable):
             ),
             created_at=datetime.fromisoformat(str(data["created_at"])),
             updated_at=datetime.fromisoformat(str(data["updated_at"])),
+            artifact_inputs=tuple(
+                artifact_input_from_dict(item)
+                for item in data.get("artifact_inputs", [])
+            ),
+            artifact_outputs=tuple(
+                ArtifactSpec.from_dict(item)
+                for item in data.get("artifact_outputs", [])
+            ),
+            operation=(
+                operation_from_dict(data["operation"])
+                if data.get("operation") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerHeartbeat(Serializable):
+    """Last authenticated status reported by a configured remote worker."""
+
+    session_epoch: str
+    drivers: frozenset[str]
+    active_runs: int
+    observed_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_epoch, str) or not self.session_epoch.strip():
+            raise ValueError("A worker heartbeat requires a session epoch")
+        if any(
+            not isinstance(driver, str) or not driver.strip() for driver in self.drivers
+        ):
+            raise ValueError("Worker heartbeat drivers must be non-empty names")
+        if (
+            isinstance(self.active_runs, bool)
+            or not isinstance(self.active_runs, int)
+            or self.active_runs < 0
+        ):
+            raise ValueError("Worker heartbeat active_runs must be non-negative")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkerHeartbeat:
+        return cls(
+            session_epoch=str(data["session_epoch"]),
+            drivers=frozenset(str(item) for item in data.get("drivers", [])),
+            active_runs=int(data["active_runs"]),
+            observed_at=datetime.fromisoformat(str(data["observed_at"])),
         )
 
 
@@ -478,6 +895,7 @@ class WorkerNode(Serializable):
     capabilities: frozenset[str] = frozenset()
     state: NodeState = NodeState.ONLINE
     updated_at: datetime = field(default_factory=utc_now)
+    heartbeat: WorkerHeartbeat | None = None
 
     @property
     def available(self) -> ResourceVector:
@@ -496,6 +914,11 @@ class WorkerNode(Serializable):
             capabilities=frozenset(str(item) for item in data.get("capabilities", [])),
             state=NodeState(data.get("state", NodeState.ONLINE)),
             updated_at=datetime.fromisoformat(str(data["updated_at"])),
+            heartbeat=(
+                WorkerHeartbeat.from_dict(data["heartbeat"])
+                if data.get("heartbeat") is not None
+                else None
+            ),
         )
 
 
@@ -879,6 +1302,23 @@ class ExecutionContract(Serializable):
     environment: dict[str, str]
     model_class: str
     resume: ResumeCapsule | None = None
+    artifact_inputs: tuple[ArtifactRef, ...] = ()
+    artifact_outputs: tuple[ArtifactSpec, ...] = ()
+    operation: JobOperation | None = None
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(item, ArtifactRef) for item in self.artifact_inputs):
+            raise TypeError(
+                "ExecutionContract artifact_inputs must be resolved ArtifactRef values"
+            )
+        if self.operation is not None:
+            operation_input = (
+                self.operation.source_input
+                if isinstance(self.operation, BuildImageOperation)
+                else self.operation.image_input
+            )
+            if isinstance(operation_input, ArtifactSelector):
+                raise ValueError("ExecutionContract operation inputs must be resolved")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ExecutionContract:
@@ -908,6 +1348,18 @@ class ExecutionContract(Serializable):
             model_class=str(data["model_class"]),
             resume=(
                 ResumeCapsule.from_dict(data["resume"]) if data.get("resume") else None
+            ),
+            artifact_inputs=tuple(
+                ArtifactRef.from_dict(item) for item in data.get("artifact_inputs", [])
+            ),
+            artifact_outputs=tuple(
+                ArtifactSpec.from_dict(item)
+                for item in data.get("artifact_outputs", [])
+            ),
+            operation=(
+                operation_from_dict(data["operation"])
+                if data.get("operation") is not None
+                else None
             ),
         )
 
@@ -1017,6 +1469,28 @@ class RunObservation(Serializable):
 
 
 @dataclass(frozen=True, slots=True)
+class ProducedArtifact(Serializable):
+    """A run output tied to the stable output slot it satisfies."""
+
+    spec_name: str
+    ref: ArtifactRef
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_stable_name(self.spec_name, "Produced artifact spec name")
+        if not isinstance(self.ref, ArtifactRef):
+            raise TypeError("Produced artifact ref must be an ArtifactRef")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProducedArtifact:
+        return cls(
+            spec_name=str(data["spec_name"]),
+            ref=ArtifactRef.from_dict(data["ref"]),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult(Serializable):
     outcome: RunOutcome
     summary: str = ""
@@ -1024,6 +1498,7 @@ class RunResult(Serializable):
     consumed_quota: float = 0
     metadata: dict[str, JsonValue] = field(default_factory=dict)
     usage: TokenUsage | None = None
+    produced_artifacts: tuple[ProducedArtifact, ...] = ()
 
     def __post_init__(self) -> None:
         if self.consumed_quota < 0 or not isfinite(self.consumed_quota):
@@ -1044,6 +1519,16 @@ class RunResult(Serializable):
                     pass
                 else:
                     object.__setattr__(self, "usage", parsed)
+        if any(
+            not isinstance(artifact, ProducedArtifact)
+            for artifact in self.produced_artifacts
+        ):
+            raise TypeError(
+                "Run produced_artifacts must contain ProducedArtifact values"
+            )
+        spec_names = tuple(artifact.spec_name for artifact in self.produced_artifacts)
+        if len(set(spec_names)) != len(spec_names):
+            raise ValueError("Run produced_artifacts must have unique spec names")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunResult:
@@ -1055,6 +1540,10 @@ class RunResult(Serializable):
             consumed_quota=float(data.get("consumed_quota", 0)),
             metadata=dict(data.get("metadata", {})),
             usage=TokenUsage.from_dict(usage) if isinstance(usage, dict) else None,
+            produced_artifacts=tuple(
+                ProducedArtifact.from_dict(item)
+                for item in data.get("produced_artifacts", [])
+            ),
         )
 
 
@@ -1214,6 +1703,52 @@ class RunCommandAck(Serializable):
 
 
 @dataclass(frozen=True, slots=True)
+class AgentRequestRecord(Serializable):
+    """Append-only durable refinement or blocker message from a worker."""
+
+    request_id: str
+    sequence: int
+    run_id: str
+    kind: AgentRequestKind
+    message: str
+    created_at: datetime
+    retryable: bool | None = None
+    # Kept at the end with a default so callers of the original in-process
+    # record constructor retain positional compatibility. Durable stores fill
+    # this ownership field before persisting the record.
+    job_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.request_id.strip() or not self.run_id.strip():
+            raise ValueError("An agent request requires request and run identifiers")
+        if self.job_id and not self.job_id.strip():
+            raise ValueError("An agent request job identifier cannot be blank")
+        if self.sequence < 0:
+            raise ValueError("Agent request sequence cannot be negative")
+        if not isinstance(self.kind, AgentRequestKind):
+            raise TypeError("Agent request kind must be an AgentRequestKind")
+        if not self.message.strip():
+            raise ValueError("Agent request message cannot be empty")
+        if self.retryable is not None and not isinstance(self.retryable, bool):
+            raise TypeError("Agent request retryable must be a bool or None")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentRequestRecord:
+        return cls(
+            request_id=str(data["request_id"]),
+            sequence=int(data["sequence"]),
+            run_id=str(data["run_id"]),
+            kind=AgentRequestKind(data["kind"]),
+            message=str(data["message"]),
+            created_at=datetime.fromisoformat(str(data["created_at"])),
+            retryable=(
+                bool(data["retryable"]) if data.get("retryable") is not None else None
+            ),
+            job_id=str(data.get("job_id", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StateTransition(Serializable):
     job_id: str
     from_state: JobState | None
@@ -1244,3 +1779,24 @@ class QuotaResetEvent(Serializable):
     confidence: float = 0
     new_remaining: float | None = None
     source: str = "external-oracle"
+    id: str = field(default_factory=new_id)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QuotaResetEvent:
+        return cls(
+            id=str(data["id"]) if data.get("id") else new_id(),
+            pool_id=str(data["pool_id"]),
+            mode=QuotaMode(data["mode"]),
+            expected_reset_at=(
+                datetime.fromisoformat(str(data["expected_reset_at"]))
+                if data.get("expected_reset_at")
+                else None
+            ),
+            confidence=float(data.get("confidence", 0)),
+            new_remaining=(
+                float(data["new_remaining"])
+                if data.get("new_remaining") is not None
+                else None
+            ),
+            source=str(data.get("source", "external-oracle")),
+        )

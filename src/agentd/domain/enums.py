@@ -78,6 +78,27 @@ class QuotaUnit(StrEnum):
     TOKENS = "tokens"
 
 
+class ArtifactKind(StrEnum):
+    """Immutable artifact reference families supported by the control plane."""
+
+    GIT_COMMIT = "git_commit"
+    OCI_IMAGE = "oci_image"
+
+
+class OperationKind(StrEnum):
+    """Typed, non-shell operations a worker may execute."""
+
+    BUILD_IMAGE = "build_image"
+    DEPLOY_IMAGE = "deploy_image"
+
+
+class AgentRequestKind(StrEnum):
+    """Worker-to-control-plane communication record types."""
+
+    REFINEMENT = "refinement"
+    BLOCKER = "blocker"
+
+
 class WorkspaceState(StrEnum):
     LEASED = "LEASED"
     RETAINED = "RETAINED"

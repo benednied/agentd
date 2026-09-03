@@ -16,6 +16,31 @@ def _positive_float(values: Mapping[str, str], name: str, default: float) -> flo
     return value
 
 
+def _exact_fraction(
+    values: Mapping[str, str],
+    name: str,
+    required: float,
+) -> float:
+    raw = values.get(name)
+    value = required if raw is None else float(raw)
+    if not isfinite(value) or value != required:
+        raise ValueError(f"{name} must be exactly {required}")
+    return value
+
+
+def _optional_nonnegative_float(
+    values: Mapping[str, str],
+    name: str,
+) -> float | None:
+    raw = values.get(name)
+    if raw is None or not raw.strip():
+        return None
+    value = float(raw)
+    if not isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceConfig:
     """Host-local paths and conservative Codex policy controls.
@@ -32,16 +57,20 @@ class ServiceConfig:
     model: str = "gpt-5.6-terra"
     reasoning_effort: str = "medium"
     poll_interval_seconds: float = 1.0
+    worker_heartbeat_seconds: float = 15.0
     account_poll_seconds: float = 60.0
     account_stale_seconds: float = 300.0
     quota_top_up_tokens: float = 25_000.0
     hard_cap_grace_seconds: float = 120.0
+    provider_stop_remaining_fraction: float = 0.02
+    provider_reset_remaining: float | None = None
     log_level: str = "INFO"
     log_json: bool = True
 
     def __post_init__(self) -> None:
         numeric = {
             "poll_interval_seconds": self.poll_interval_seconds,
+            "worker_heartbeat_seconds": self.worker_heartbeat_seconds,
             "account_poll_seconds": self.account_poll_seconds,
             "account_stale_seconds": self.account_stale_seconds,
             "quota_top_up_tokens": self.quota_top_up_tokens,
@@ -50,6 +79,13 @@ class ServiceConfig:
         for name, value in numeric.items():
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.provider_stop_remaining_fraction != 0.02:
+            raise ValueError("provider_stop_remaining_fraction must be exactly 0.02")
+        if self.provider_reset_remaining is not None and (
+            not isfinite(self.provider_reset_remaining)
+            or self.provider_reset_remaining < 0
+        ):
+            raise ValueError("provider_reset_remaining must be finite and non-negative")
         if self.log_level.upper() not in {
             "TRACE",
             "DEBUG",
@@ -116,6 +152,11 @@ class ServiceConfig:
                 "AGENTD_POLL_SECONDS",
                 1.0,
             ),
+            worker_heartbeat_seconds=_positive_float(
+                values,
+                "AGENTD_WORKER_HEARTBEAT_SECONDS",
+                15.0,
+            ),
             account_poll_seconds=_positive_float(
                 values,
                 "AGENTD_ACCOUNT_POLL_SECONDS",
@@ -135,6 +176,15 @@ class ServiceConfig:
                 values,
                 "AGENTD_HARD_CAP_GRACE_SECONDS",
                 120.0,
+            ),
+            provider_stop_remaining_fraction=_exact_fraction(
+                values,
+                "AGENTD_PROVIDER_STOP_REMAINING_FRACTION",
+                0.02,
+            ),
+            provider_reset_remaining=_optional_nonnegative_float(
+                values,
+                "AGENTD_PROVIDER_RESET_REMAINING",
             ),
             log_level=values.get("AGENTD_LOG_LEVEL", "INFO"),
             log_json=log_format == "json",

@@ -1,17 +1,45 @@
 """Domain types and invariants owned by the agentd control plane."""
 
-from agentd.domain.enums import JobState, QoSClass, QuotaMode, QuotaUnit
+from agentd.domain.enums import (
+    AgentRequestKind,
+    ArtifactKind,
+    JobState,
+    OperationKind,
+    QoSClass,
+    QuotaMode,
+    QuotaUnit,
+)
 from agentd.domain.models import (
+    AgentRequestRecord,
+    ArtifactRecord,
+    ArtifactRef,
+    ArtifactSelector,
+    ArtifactSpec,
+    BuildImageOperation,
+    DeployImageOperation,
     Job,
+    ProducedArtifact,
     ProviderQuotaSnapshot,
     RunObservation,
     TokenUsage,
     UsageSample,
+    WorkerHeartbeat,
 )
 
 __all__ = [
+    "AgentRequestKind",
+    "AgentRequestRecord",
+    "ArtifactKind",
+    "ArtifactRecord",
+    "ArtifactRef",
+    "ArtifactSelector",
+    "ArtifactSpec",
+    "BuildImageOperation",
+    "DeployImageOperation",
     "Job",
     "JobState",
+    "OperationKind",
+    "ProducedArtifact",
     "ProviderQuotaSnapshot",
     "QoSClass",
     "QuotaMode",
@@ -19,4 +47,5 @@ __all__ = [
     "RunObservation",
     "TokenUsage",
     "UsageSample",
+    "WorkerHeartbeat",
 ]

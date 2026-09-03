@@ -1,7 +1,11 @@
+import asyncio
+import json
+import os
 from pathlib import Path
 
 import agentd.cli as cli
 from agentd.cli import build_parser, main
+from agentd.config import ServiceConfig
 from agentd.domain.enums import QuotaUnit
 from agentd.domain.models import UsageSample
 from agentd.state.sqlite import SQLiteStateStore
@@ -144,3 +148,70 @@ def test_serve_passes_validated_service_configuration(
     assert observed[0].database == database
     assert observed[0].workspace_root == workspaces
     assert observed[0].codex_home == codex_home
+
+
+def test_serve_service_composes_remote_workers_and_scrubs_transport_psk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "remote-workers.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "name": "remote-a",
+                        "host": "127.0.0.1",
+                        "port": 8765,
+                        "node_id": "node-a",
+                        "session_epoch": "epoch-a",
+                        "psk_env": "AGENTD_TEST_REMOTE_PSK",
+                        "allow_insecure_loopback": True,
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("AGENTD_REMOTE_WORKERS_CONFIG", str(config_path))
+    monkeypatch.setenv("AGENTD_TEST_REMOTE_PSK", "p" * 32)
+    observed: dict[str, object] = {}
+
+    class FakeRuntime:
+        control_plane = object()
+        account_oracle = None
+
+        async def aclose(self) -> None:
+            observed["closed"] = True
+
+    def create_runtime(*_args, **kwargs):
+        observed["runtime_kwargs"] = kwargs
+        observed["secret_at_composition"] = os.environ.get("AGENTD_TEST_REMOTE_PSK")
+        return FakeRuntime()
+
+    class FakeDaemon:
+        def __init__(self, _plane, **kwargs) -> None:
+            observed["daemon_kwargs"] = kwargs
+
+        async def serve(self, _stop: asyncio.Event) -> None:
+            observed["served"] = True
+
+    monkeypatch.setattr("agentd.bootstrap.create_local_runtime", create_runtime)
+    monkeypatch.setattr("agentd.daemon.AgentDaemon", FakeDaemon)
+    config = ServiceConfig.from_environment(
+        {
+            "HOME": str(tmp_path),
+            "AGENTD_DB": str(tmp_path / "state.sqlite"),
+            "AGENTD_WORKSPACE_ROOT": str(tmp_path / "workspaces"),
+        }
+    )
+
+    assert asyncio.run(cli._serve_service(config)) == 0
+
+    runtime_kwargs = observed["runtime_kwargs"]
+    assert isinstance(runtime_kwargs, dict)
+    assert len(runtime_kwargs["worker_backends"]) == 1
+    assert len(runtime_kwargs["additional_drivers"]) == 1
+    assert runtime_kwargs["additional_drivers"][0].capabilities().name == "operations"
+    assert observed["secret_at_composition"] is None
+    assert observed["served"] is True
+    assert observed["closed"] is True

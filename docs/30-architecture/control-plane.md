@@ -8,7 +8,7 @@
 | `SchedulerCoordinator` | Admission effects, compensation, and lifecycle sequencing | Harness command syntax or project authoring |
 | SQLite state store | Runtime snapshots, transitions, reservations, allocations, telemetry, and durable commands | Repository truth or live App Server transports |
 | Git workspace manager | Exclusive branch/worktree leases and commit inspection | Review acceptance, merges, or integration policy |
-| Worker backend | How and where a selected driver is physically started | Which job, node, harness, or model wins |
+| Worker backend | How and where a selected driver or typed operation is physically started | Which job, node, harness, or model wins |
 | Harness driver | Execution-contract translation and run control | Scheduler quota, QoS, scarcity, or preemption |
 | Run supervisor | App Server transport, streamed observations, usage normalization, and command delivery | Admission, repair count, review acceptance, or provider policy |
 | Account oracle | Provider windows, reset, and opaque-credit observations | Local token balances or admission decisions |
@@ -16,7 +16,10 @@
 
 `WorkerNode` and `WorkerBackend` are deliberately separate. Placement selects a
 node for compatibility and accounting; a backend turns that assignment into
-physical execution. The MVP has only `LocalWorkerBackend`.
+physical execution. `LocalWorkerBackend` handles ordinary local harnesses.
+`RemoteWorkerBackend` uses the authenticated worker protocol for typed
+Build/Deploy operations and is node-bound; it is not a general remote coding-agent
+transport.
 
 ## Admission effect ordering
 
@@ -30,6 +33,10 @@ Git and App Server effects cannot share a SQLite transaction. Intermediate state
 therefore durable and failures are compensated. If a started driver cannot be
 shown to be quiescent, allocations and reservations remain held rather than
 risking two live owners. Cleanup errors are attached to the original failure.
+Remote Git, Docker, and Compose subprocess effects are likewise outside SQLite
+atomicity: a remote effect and its control-plane lifecycle record can straddle a
+crash. The worker journal protects request replay, but there is no transactional
+outbox to close that orphan gap.
 
 ## APIs
 

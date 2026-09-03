@@ -134,3 +134,37 @@ validation. `accept` completes a job already in `REVIEW`.
 
 Pause/resume/cancel, tail evaluation, reconnaissance promotion, and quota-reset
 operations are Python `ControlPlane` operations rather than CLI commands.
+
+### Remote artifact worker
+
+`worker-serve` starts one authenticated, node-bound worker process. It exposes only
+the typed worker protocol and the allowlisted Build/Deploy operation driver.
+
+```bash
+AGENTD_WORKER_PSK_FILE=/secure/worker.psk \
+uv run agentd worker-serve \
+  --host 0.0.0.0 --port 8765 \
+  --node-id build-node-1 --session-epoch 2026-08-31T12:00Z \
+  --journal /var/lib/agentd/worker-journal.sqlite \
+  --tls-cert /etc/agentd/worker.crt \
+  --tls-key /etc/agentd/worker.key \
+  --operations-config /etc/agentd/operations.json \
+  --cache-root /var/lib/agentd/cache \
+  --operation-state-root /var/lib/agentd/operations
+```
+
+| Option | Required | Meaning |
+| --- | --- | --- |
+| `--host`, `--port` | no | bind address and port (environment defaults apply) |
+| `--node-id`, `--session-epoch` | yes unless supplied by environment | durable worker identity and epoch |
+| `--journal` | yes unless supplied by environment | operation journal path |
+| `--psk-file` | one PSK source | mode-`0600` pre-shared-key file |
+| `--tls-cert`, `--tls-key` | paired by default | TLS certificate and key |
+| `--operations-config` | no | strict operation allowlist document |
+| `--cache-root`, `--operation-state-root` | no | worker cache and deployment-state roots |
+| `--allow-insecure-loopback` | no | explicit plaintext exception restricted to loopback |
+
+The CLI worker command does not deploy a fleet and does not enable general remote
+code-agent execution. Configure a matching remote backend in the embedding
+control-plane runtime; the standalone administrative CLI does not infer one from
+`register-node`.

@@ -31,5 +31,6 @@ schema through `PRAGMA user_version`.
 ## Consequences
 
 The system has a small deployment footprint and strong local transaction semantics.
-Only one active scheduler is supported per database; there is no leader election or
-general migration chain yet.
+Only one active scheduler is supported per database; there is no leader election.
+The current schema is version 4. Version 0 bootstraps the base schema as version 1;
+the explicit idempotent upgrade chain is `v1 -> v2 -> v3 -> v4`.

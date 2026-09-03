@@ -122,3 +122,67 @@ def test_daemon_retries_startup_recovery_before_dispatching() -> None:
         assert "temporary App Server" in str(observed[0])
 
     asyncio.run(scenario())
+
+
+class HeartbeatRecordingControlPlane:
+    def __init__(self) -> None:
+        self.heartbeats = 0
+        self.dispatches = 0
+        self.fail_next_heartbeat = False
+
+    async def refresh_worker_heartbeats(self) -> tuple[dict[str, object], ...]:
+        self.heartbeats += 1
+        if self.fail_next_heartbeat:
+            self.fail_next_heartbeat = False
+            raise RuntimeError("remote worker unavailable")
+        return ({"node_id": "remote-1"},)
+
+    async def dispatch_next(self) -> None:
+        self.dispatches += 1
+
+
+def test_worker_heartbeats_are_rate_limited_and_failures_do_not_stop_dispatch() -> None:
+    async def scenario() -> None:
+        now = [datetime(2026, 8, 9, 12, tzinfo=UTC)]
+        plane = HeartbeatRecordingControlPlane()
+        observed: list[Exception] = []
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            worker_heartbeat_seconds=10,
+            clock=lambda: now[0],
+            on_error=observed.append,
+        )
+
+        await daemon.tick()
+        await daemon.tick()
+        assert plane.heartbeats == 1
+
+        now[0] += timedelta(seconds=10)
+        plane.fail_next_heartbeat = True
+        await daemon.tick()
+        assert plane.heartbeats == 2
+        assert plane.dispatches == 3
+        assert len(observed) == 1
+        assert str(observed[0]) == "remote worker unavailable"
+
+        # A failed attempt is still rate-limited; the next due interval can
+        # restore health without restarting the daemon.
+        await daemon.tick()
+        assert plane.heartbeats == 2
+        now[0] += timedelta(seconds=10)
+        await daemon.tick()
+        assert plane.heartbeats == 3
+
+    asyncio.run(scenario())
+
+
+def test_daemon_rejects_nonpositive_worker_heartbeat_interval() -> None:
+    stop = asyncio.Event()
+    plane = FlakyControlPlane(stop)
+
+    try:
+        AgentDaemon(cast(ControlPlane, plane), worker_heartbeat_seconds=0)
+    except ValueError as error:
+        assert "worker_heartbeat_seconds" in str(error)
+    else:
+        raise AssertionError("nonpositive heartbeat interval was accepted")

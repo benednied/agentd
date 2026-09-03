@@ -18,10 +18,13 @@ def test_service_config_has_portable_xdg_defaults() -> None:
     assert config.uv_python_install_directory == Path("/home/operator/.cache/uv/python")
     assert config.model == "gpt-5.6-terra"
     assert config.reasoning_effort == "medium"
+    assert config.worker_heartbeat_seconds == 15
     assert config.account_poll_seconds == 60
     assert config.account_stale_seconds == 300
     assert config.quota_top_up_tokens == 25_000
     assert config.hard_cap_grace_seconds == 120
+    assert config.provider_stop_remaining_fraction == 0.02
+    assert config.provider_reset_remaining is None
 
 
 def test_service_config_parses_explicit_environment() -> None:
@@ -34,10 +37,13 @@ def test_service_config_parses_explicit_environment() -> None:
             "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
             "AGENTD_CODEX_REASONING_EFFORT": "medium",
             "AGENTD_POLL_SECONDS": "2.5",
+            "AGENTD_WORKER_HEARTBEAT_SECONDS": "12.5",
             "AGENTD_ACCOUNT_POLL_SECONDS": "30",
             "AGENTD_ACCOUNT_STALE_SECONDS": "120",
             "AGENTD_QUOTA_TOP_UP_TOKENS": "50000",
             "AGENTD_HARD_CAP_GRACE_SECONDS": "90",
+            "AGENTD_PROVIDER_STOP_REMAINING_FRACTION": "0.02",
+            "AGENTD_PROVIDER_RESET_REMAINING": "750000",
             "AGENTD_LOG_LEVEL": "DEBUG",
             "AGENTD_LOG_FORMAT": "text",
         }
@@ -50,10 +56,13 @@ def test_service_config_parses_explicit_environment() -> None:
     assert config.uv_python_install_directory == Path("/uv-cache/python")
     assert config.reasoning_effort == "medium"
     assert config.poll_interval_seconds == 2.5
+    assert config.worker_heartbeat_seconds == 12.5
     assert config.account_poll_seconds == 30
     assert config.account_stale_seconds == 120
     assert config.quota_top_up_tokens == 50_000
     assert config.hard_cap_grace_seconds == 90
+    assert config.provider_stop_remaining_fraction == 0.02
+    assert config.provider_reset_remaining == 750_000
     assert config.log_level == "DEBUG"
     assert not config.log_json
 
@@ -62,6 +71,7 @@ def test_service_config_parses_explicit_environment() -> None:
     "name",
     [
         "AGENTD_POLL_SECONDS",
+        "AGENTD_WORKER_HEARTBEAT_SECONDS",
         "AGENTD_ACCOUNT_POLL_SECONDS",
         "AGENTD_ACCOUNT_STALE_SECONDS",
         "AGENTD_QUOTA_TOP_UP_TOKENS",
@@ -77,6 +87,7 @@ def test_service_config_rejects_nonpositive_controls(name: str) -> None:
     "name",
     [
         "AGENTD_POLL_SECONDS",
+        "AGENTD_WORKER_HEARTBEAT_SECONDS",
         "AGENTD_ACCOUNT_POLL_SECONDS",
         "AGENTD_ACCOUNT_STALE_SECONDS",
         "AGENTD_QUOTA_TOP_UP_TOKENS",
@@ -96,6 +107,7 @@ def test_service_config_rejects_nonfinite_environment_controls(
     "name",
     [
         "poll_interval_seconds",
+        "worker_heartbeat_seconds",
         "account_poll_seconds",
         "account_stale_seconds",
         "quota_top_up_tokens",
@@ -107,6 +119,30 @@ def test_service_config_rejects_nonfinite_programmatic_controls(name: str) -> No
 
     with pytest.raises(ValueError, match=name):
         replace(config, **{name: float("nan")})
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0", "-0.1", "0.01", "0.03", "1.1", "nan", "inf"],
+)
+def test_service_config_rejects_invalid_provider_stop_fraction(value: str) -> None:
+    with pytest.raises(ValueError, match="AGENTD_PROVIDER_STOP"):
+        ServiceConfig.from_environment(
+            {"AGENTD_PROVIDER_STOP_REMAINING_FRACTION": value}
+        )
+
+
+def test_service_config_rejects_invalid_programmatic_provider_stop_fraction() -> None:
+    config = ServiceConfig.from_environment({"HOME": "/home/operator"})
+
+    with pytest.raises(ValueError, match=r"exactly 0\.02"):
+        replace(config, provider_stop_remaining_fraction=0.03)
+
+
+@pytest.mark.parametrize("value", ["-0.1", "nan", "inf"])
+def test_service_config_rejects_invalid_provider_reset_remaining(value: str) -> None:
+    with pytest.raises(ValueError, match="AGENTD_PROVIDER_RESET_REMAINING"):
+        ServiceConfig.from_environment({"AGENTD_PROVIDER_RESET_REMAINING": value})
 
 
 def test_service_config_represents_nonproduction_model_policy() -> None:

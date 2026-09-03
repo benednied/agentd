@@ -323,6 +323,28 @@ def test_refinement_and_blocker_records_are_validated_bounded_and_auditable(
         api.request_history("not-a-run")
 
 
+def test_request_history_survives_a_new_api_instance(api_context: APIContext) -> None:
+    first_api = AgentAPI(
+        api_context.control_plane,
+        max_request_records=2,
+        clock=lambda: FIXED_TIME,
+        id_factory=_id_factory("durable"),
+    )
+    first_api.request_refinement(api_context.run.id, "Persist this question")
+    second = first_api.report_blocker(api_context.run.id, "Persist this blocker")
+    first_api.request_refinement(api_context.run.id, "Newest durable message")
+
+    restarted_api = AgentAPI(
+        api_context.control_plane,
+        max_request_records=2,
+        clock=lambda: FIXED_TIME,
+    )
+    history = restarted_api.request_history(api_context.run.id)
+    assert history[0] == second
+    assert history[0].message == "Persist this blocker"
+    assert history[1].message == "Newest durable message"
+
+
 def test_checkpoint_review_and_complete_delegate_without_leaking_job_fields(
     api_context: APIContext,
 ) -> None:

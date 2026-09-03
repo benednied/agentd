@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
@@ -67,6 +68,14 @@ def test_review_or_suspend_collects_and_persists_result_before_release(
         consumed_quota=4,
         metadata={"input_tokens": 21, "output_tokens": 5},
     )
+    trusted_result = replace(
+        result,
+        commit="f" * 40,
+        metadata={
+            **result.metadata,
+            "untrusted_reported_commit": result.commit,
+        },
+    )
     rig = make_regression_rig(
         driver_factory=lambda store: CollectObservingDriver(store, result)
     )
@@ -111,7 +120,7 @@ def test_review_or_suspend_collects_and_persists_result_before_release(
         assert final_job.state is expected_job_state
         stored_run = rig.store.get_run(run.id)
         assert stored_run.state is RunState.SUSPENDED
-        assert stored_run.result == result
+        assert stored_run.result == trusted_result
         assert stored_run.ended_at is not None
         assert rig.store.get_allocation(run.allocation_id).state is (
             AllocationState.RELEASED
@@ -133,17 +142,18 @@ def test_review_or_suspend_collects_and_persists_result_before_release(
     asyncio.run(scenario())
 
 
-def test_review_completion_hands_dependency_the_reviewed_commit(
+def test_review_completion_hands_dependency_the_trusted_workspace_commit(
     make_regression_rig,
     make_regression_job: Callable[..., Job],
     regression_node: WorkerNode,
     regression_pool: QuotaPool,
 ) -> None:
-    commit = "e" * 40
+    reported_commit = "e" * 40
+    trusted_commit = "f" * 40
     result = RunResult(
         outcome=RunOutcome.COMPLETED,
         summary="reviewed artifact",
-        commit=commit,
+        commit=reported_commit,
         consumed_quota=3,
     )
     rig = make_regression_rig(result=result)
@@ -165,10 +175,10 @@ def test_review_completion_hands_dependency_the_reviewed_commit(
 
         assert consumer_run is not None
         assert consumer_run.job_id == consumer.id
-        assert consumer_run.contract.dependency_results == {producer.id: commit}
+        assert consumer_run.contract.dependency_results == {producer.id: trusted_commit}
         assert rig.workspaces.allocations == [
             (producer.id, "HEAD"),
-            (consumer.id, commit),
+            (consumer.id, trusted_commit),
         ]
 
     asyncio.run(scenario())
@@ -246,6 +256,11 @@ def test_completion_can_be_retried_after_final_job_persistence_failure(
         commit="a" * 40,
         consumed_quota=4,
     )
+    trusted_result = replace(
+        result,
+        commit="f" * 40,
+        metadata={"untrusted_reported_commit": result.commit},
+    )
     rig = make_regression_rig(store=store, result=result)
     job = make_regression_job()
 
@@ -271,7 +286,7 @@ def test_completion_can_be_retried_after_final_job_persistence_failure(
         assert rig.store.get_job(job.id).state is JobState.COMPLETED
         stored_run = rig.store.get_run(run.id)
         assert stored_run.state is RunState.COMPLETED
-        assert stored_run.result == result
+        assert stored_run.result == trusted_result
         assert rig.store.get_allocation(run.allocation_id).state is (
             AllocationState.RELEASED
         )

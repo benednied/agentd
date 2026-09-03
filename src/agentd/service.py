@@ -12,9 +12,14 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
-from agentd.domain.enums import JobState, QoSClass, QuotaUnit
+from agentd.domain.enums import ArtifactKind, JobState, QoSClass, QuotaUnit
 from agentd.domain.models import (
+    ArtifactRecord,
+    ArtifactRef,
+    ArtifactSelector,
+    BuildImageOperation,
     Checkpoint,
+    DeployImageOperation,
     ExecutionContract,
     Job,
     ProviderQuotaSnapshot,
@@ -72,6 +77,8 @@ class LifecycleCoordinator(Protocol):
         at: datetime | None = None,
     ) -> tuple[Job, ...]: ...
 
+    async def refresh_worker_heartbeats(self) -> tuple[dict[str, object], ...]: ...
+
     def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None: ...
 
     def execution_contract(self, run_id: str) -> ExecutionContract: ...
@@ -103,6 +110,7 @@ class ControlPlane:
     def submit(self, job: Job) -> Job:
         if job.state != JobState.BACKLOG:
             raise ValueError("A submitted job must start in BACKLOG")
+        self._validate_artifact_intent(job)
         if "codex" in job.allowed_harnesses:
             if job.quota_budget.maximum is None:
                 raise ValueError("Codex jobs require a cumulative quota maximum")
@@ -139,6 +147,73 @@ class ControlPlane:
             )
             self._store.save_job(queued, queued_event, expected=reconnaissance)
         return ready
+
+    @staticmethod
+    def _validate_artifact_intent(job: Job) -> None:
+        """Validate artifact DAG shape before any durable submit side effect.
+
+        Submit deliberately performs no repository lookups: selectors are
+        resolved against verified ledger records when a worker is dispatched.
+        At this boundary we only ensure that every declared binding points into
+        the job's dependency list and that typed operations agree with the
+        declared inputs/outputs.
+        """
+
+        for artifact_input in job.artifact_inputs:
+            if isinstance(artifact_input, ArtifactSelector):
+                if artifact_input.producer_job_id == job.id:
+                    raise ValueError(
+                        "An artifact selector cannot point to the submitting job"
+                    )
+                if artifact_input.producer_job_id not in job.dependencies:
+                    raise ValueError(
+                        "Artifact selector producer must be listed in job dependencies"
+                    )
+            elif not isinstance(artifact_input, ArtifactRef):
+                raise TypeError("Job artifact inputs must be refs or selectors")
+
+        operation = job.operation
+        if operation is None:
+            return
+
+        declared_inputs = job.artifact_inputs
+        if isinstance(operation, BuildImageOperation):
+            if operation.source_input not in declared_inputs:
+                raise ValueError(
+                    "Build operation source_input must match a declared artifact input"
+                )
+            output_specs = [
+                spec
+                for spec in job.artifact_outputs
+                if spec.name == operation.output_name
+            ]
+            if (
+                len(job.artifact_outputs) != 1
+                or len(output_specs) != 1
+                or (output_specs[0].kind is not ArtifactKind.OCI_IMAGE)
+            ):
+                raise ValueError(
+                    "Build operation requires exactly one matching OCI_IMAGE "
+                    "output spec"
+                )
+            return
+
+        if isinstance(operation, DeployImageOperation):
+            if operation.image_input not in declared_inputs:
+                raise ValueError(
+                    "Deploy operation image_input must match a declared artifact input"
+                )
+            if job.artifact_outputs:
+                raise ValueError("Deploy operation cannot declare artifact outputs")
+            if not isinstance(operation.config_revision, ArtifactRef):
+                raise TypeError("Deploy config_revision must be a direct ArtifactRef")
+            if operation.config_revision.kind is not ArtifactKind.GIT_COMMIT:
+                raise ValueError(
+                    "Deploy config_revision must be a Git commit ArtifactRef"
+                )
+            return
+
+        raise TypeError("Job operation must be a supported typed operation")
 
     def reconnaissance_for(self, job_id: str) -> list[Job]:
         return [
@@ -197,6 +272,14 @@ class ControlPlane:
 
     def register_quota_event(self, event: QuotaResetEvent) -> QuotaPool:
         return self._quota.register_reset_event(event)
+
+    def register_external_artifact(
+        self,
+        artifact: ArtifactRecord,
+    ) -> ArtifactRecord:
+        """Register one independently verified immutable input artifact."""
+
+        return self._store.register_external_artifact(artifact)
 
     def inspect_workspace(self, job_id: str) -> WorkspaceLease | None:
         return self._store.find_workspace(job_id)
@@ -329,6 +412,11 @@ class ControlPlane:
         at: datetime | None = None,
     ) -> tuple[Job, ...]:
         return await self._lifecycle().reconcile_managed_runs(snapshot, at=at)
+
+    async def refresh_worker_heartbeats(self) -> tuple[dict[str, object], ...]:
+        """Refresh authenticated remote-worker liveness and durable timestamps."""
+
+        return await self._lifecycle().refresh_worker_heartbeats()
 
     def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None:
         self._lifecycle().apply_provider_snapshot(snapshot)

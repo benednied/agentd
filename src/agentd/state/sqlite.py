@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from math import isfinite
@@ -19,16 +19,20 @@ from typing import Any
 from agentd.domain.enums import (
     AllocationState,
     JobState,
+    QuotaMode,
     ReservationState,
     RunState,
 )
 from agentd.domain.models import (
+    AgentRequestRecord,
+    ArtifactRecord,
     Checkpoint,
     DriverSession,
     Job,
     ProviderQuotaSnapshot,
     QuotaPool,
     QuotaReservation,
+    QuotaResetEvent,
     ResourceAllocation,
     RunCommand,
     RunCommandAck,
@@ -200,7 +204,198 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Add append-only artifacts and worker messages in one transaction."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            value TEXT NOT NULL,
+            producer_job_id TEXT REFERENCES jobs(id),
+            producer_run_id TEXT REFERENCES runs(id),
+            spec_name TEXT NOT NULL,
+            verified INTEGER NOT NULL,
+            verified_at TEXT,
+            created_at TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            external INTEGER NOT NULL,
+            UNIQUE(kind, value)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_artifacts_producer_job
+            ON artifacts(producer_job_id, created_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_artifacts_producer_run
+            ON artifacts(producer_run_id, created_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            job_id TEXT NOT NULL REFERENCES jobs(id),
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_run
+            ON agent_messages(run_id, sequence)
+        """
+    )
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Add the exactly-once quota reset-event ledger."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quota_reset_events (
+            id TEXT PRIMARY KEY,
+            pool_id TEXT NOT NULL REFERENCES quota_pools(id),
+            mode TEXT NOT NULL,
+            expected_reset_at TEXT,
+            confidence REAL NOT NULL,
+            new_remaining REAL,
+            source TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_quota_reset_events_pool
+            ON quota_reset_events(pool_id, id)
+        """
+    )
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Allow one immutable digest to be published by multiple producers.
+
+    SQLite cannot remove a table-level UNIQUE constraint in place. Rebuild the
+    artifact table inside the caller's transaction. Legacy v3 databases could
+    already contain more than one record for a producer slot, so a new UNIQUE
+    index would make an otherwise valid database impossible to open. Preserve
+    those append-only rows and use an insert trigger to prevent any new slot
+    conflict after migration; the store also checks the invariant before insert.
+    """
+
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
+    ).fetchone()
+    if table is None:
+        # A few early v2 databases were bootstrapped with only SCHEMA and a
+        # manually assigned user_version. Make that legacy shape recoverable.
+        _migrate_v1_to_v2(connection)
+
+    ref_unique = False
+    for index in connection.execute("PRAGMA index_list('artifacts')"):
+        if not bool(index[2]):
+            continue
+        index_name = str(index[1]).replace('"', '""')
+        columns = tuple(
+            str(column[2])
+            for column in connection.execute(f'PRAGMA index_info("{index_name}")')
+        )
+        if columns == ("kind", "value"):
+            ref_unique = True
+            break
+
+    if ref_unique:
+        connection.execute("ALTER TABLE artifacts RENAME TO artifacts_v3")
+        connection.execute(
+            """
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                producer_job_id TEXT REFERENCES jobs(id),
+                producer_run_id TEXT REFERENCES runs(id),
+                spec_name TEXT NOT NULL,
+                verified INTEGER NOT NULL,
+                verified_at TEXT,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                external INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, kind, value, producer_job_id, producer_run_id, spec_name,
+                verified, verified_at, created_at, payload, external
+            )
+            SELECT
+                id, kind, value, producer_job_id, producer_run_id, spec_name,
+                verified, verified_at, created_at, payload, external
+            FROM artifacts_v3
+            """
+        )
+        connection.execute("DROP TABLE artifacts_v3")
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_artifacts_producer_job
+            ON artifacts(producer_job_id, created_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_artifacts_producer_run
+            ON artifacts(producer_run_id, created_at, id)
+        """
+    )
+    # A previous run of this unreleased migration may have created the unique
+    # index. Dropping it keeps this function idempotent and makes the corrected
+    # migration tolerant of legacy duplicates.
+    connection.execute("DROP INDEX IF EXISTS uq_artifacts_producer_slot")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_artifacts_producer_slot
+            ON artifacts(producer_job_id, spec_name)
+            WHERE producer_job_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS prevent_artifact_producer_slot_conflict
+        BEFORE INSERT ON artifacts
+        WHEN NEW.producer_job_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM artifacts
+              WHERE producer_job_id = NEW.producer_job_id
+                AND spec_name = NEW.spec_name
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'artifact producer slot already published');
+        END
+        """
+    )
+
+
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
+}
 
 
 def _dump(model: Serializable) -> str:
@@ -255,7 +450,18 @@ class SQLiteStateStore:
                 )
             if version == 0:
                 self._connection.executescript(SCHEMA)
-                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._connection.execute("PRAGMA user_version = 1")
+                version = 1
+            while version < SCHEMA_VERSION:
+                migration = _MIGRATIONS.get(version)
+                if migration is None:
+                    raise RuntimeError(
+                        f"No migration is available from schema version {version}"
+                    )
+                with self._transaction():
+                    migration(self._connection)
+                    self._connection.execute(f"PRAGMA user_version = {version + 1}")
+                version += 1
 
     def close(self) -> None:
         with self._lock:
@@ -348,6 +554,294 @@ class SQLiteStateStore:
         with self._lock, self._transaction():
             self._save_job_in_transaction(job, transition, expected_job)
             self._save_run_in_transaction(run, expected_run)
+
+    def save_job_and_run_with_artifacts(
+        self,
+        job: Job,
+        transition: StateTransition,
+        run: RunRecord,
+        artifacts: Iterable[ArtifactRecord],
+        *,
+        expected_job: Job,
+        expected_run: RunRecord | None,
+    ) -> None:
+        """Atomically save a job/run transition and publish its artifacts.
+
+        Artifact rows are inserted only after both snapshots have passed their
+        normal optimistic checks. Any conflict, invalid producer link, or
+        duplicate with different immutable content rolls the whole transaction
+        back, leaving no partially published output.
+        """
+
+        if run.job_id != job.id:
+            raise ValueError("The run must belong to the transitioned job")
+        artifact_batch = tuple(artifacts)
+        with self._lock, self._transaction():
+            self._save_job_in_transaction(job, transition, expected_job)
+            self._save_run_in_transaction(run, expected_run)
+            self._publish_artifacts_in_transaction(artifact_batch)
+
+    def publish_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+        """Publish one immutable artifact, accepting an exact retry."""
+
+        return self.publish_artifacts((artifact,))[0]
+
+    def register_external_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+        """Register a verified immutable input without inventing a producer run."""
+
+        if not artifact.external:
+            raise ValueError(
+                "Only external artifacts use the external registration path"
+            )
+        with self._lock, self._transaction():
+            return self._publish_artifacts_in_transaction(
+                (artifact,), allow_external=True
+            )[0]
+
+    def publish_artifacts(
+        self, artifacts: Iterable[ArtifactRecord]
+    ) -> tuple[ArtifactRecord, ...]:
+        """Publish an append-only artifact batch in one transaction."""
+
+        artifact_batch = tuple(artifacts)
+        with self._lock, self._transaction():
+            return self._publish_artifacts_in_transaction(artifact_batch)
+
+    def _publish_artifacts_in_transaction(
+        self,
+        artifacts: tuple[ArtifactRecord, ...],
+        *,
+        allow_external: bool = False,
+    ) -> tuple[ArtifactRecord, ...]:
+        published: list[ArtifactRecord] = []
+        seen_ids: dict[str, ArtifactRecord] = {}
+        seen_slots: dict[tuple[str, str], ArtifactRecord] = {}
+        for artifact in artifacts:
+            if not isinstance(artifact, ArtifactRecord):
+                raise TypeError("Artifacts must be ArtifactRecord values")
+            if artifact.external and not allow_external:
+                raise ValueError(
+                    "external artifacts must use register_external_artifact"
+                )
+            self._validate_artifact_links(artifact)
+            batch_existing = seen_ids.get(artifact.id)
+            if batch_existing is not None:
+                if batch_existing != artifact:
+                    raise ConcurrentStateError(
+                        f"Artifact {artifact.id} already differs"
+                    )
+                published.append(batch_existing)
+                continue
+            existing = self._connection.execute(
+                "SELECT payload FROM artifacts WHERE id = ?", (artifact.id,)
+            ).fetchone()
+            if existing is not None:
+                stored = _load(existing["payload"], ArtifactRecord.from_dict)
+                if stored != artifact:
+                    raise ConcurrentStateError(
+                        f"Artifact {artifact.id} already differs"
+                    )
+                seen_ids[artifact.id] = stored
+                if stored.producer_job_id is not None:
+                    seen_slots[(stored.producer_job_id, stored.spec_name)] = stored
+                published.append(stored)
+                continue
+
+            slot = (
+                (artifact.producer_job_id, artifact.spec_name)
+                if artifact.producer_job_id is not None
+                else None
+            )
+            batch_slot = seen_slots.get(slot) if slot is not None else None
+            if batch_slot is not None:
+                raise ConcurrentStateError(
+                    f"Artifact producer slot is already published as {batch_slot.id}"
+                )
+            if slot is not None:
+                stored_row = self._connection.execute(
+                    "SELECT payload FROM artifacts "
+                    "WHERE producer_job_id = ? AND spec_name = ?",
+                    slot,
+                ).fetchone()
+                if stored_row is not None:
+                    stored = _load(stored_row["payload"], ArtifactRecord.from_dict)
+                    raise ConcurrentStateError(
+                        f"Artifact producer slot is already published as {stored.id}"
+                    )
+            try:
+                self._connection.execute(
+                    "INSERT INTO artifacts("
+                    "id, kind, value, producer_job_id, producer_run_id, "
+                    "spec_name, verified, verified_at, created_at, payload, external"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artifact.id,
+                        artifact.ref.kind.value,
+                        artifact.ref.value,
+                        artifact.producer_job_id,
+                        artifact.producer_run_id,
+                        artifact.spec_name,
+                        int(artifact.verified),
+                        (
+                            artifact.verified_at.isoformat()
+                            if artifact.verified_at is not None
+                            else None
+                        ),
+                        artifact.created_at.isoformat(),
+                        _dump(artifact),
+                        int(artifact.external),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ConcurrentStateError(
+                    f"Could not publish immutable artifact {artifact.id}"
+                ) from error
+            seen_ids[artifact.id] = artifact
+            if slot is not None:
+                seen_slots[slot] = artifact
+            published.append(artifact)
+        return tuple(published)
+
+    def _validate_artifact_links(self, artifact: ArtifactRecord) -> None:
+        if artifact.external:
+            if (
+                artifact.producer_job_id is not None
+                or artifact.producer_run_id is not None
+            ):
+                raise ValueError("External artifacts cannot have producer identifiers")
+            return
+        if artifact.producer_job_id is None or artifact.producer_run_id is None:
+            raise ValueError("Produced artifacts require producer identifiers")
+        job = self._connection.execute(
+            "SELECT 1 FROM jobs WHERE id = ?", (artifact.producer_job_id,)
+        ).fetchone()
+        if job is None:
+            raise EntityNotFoundError(
+                f"Producer job {artifact.producer_job_id} does not exist"
+            )
+        run = self._connection.execute(
+            "SELECT job_id FROM runs WHERE id = ?", (artifact.producer_run_id,)
+        ).fetchone()
+        if run is None:
+            raise EntityNotFoundError(
+                f"Producer run {artifact.producer_run_id} does not exist"
+            )
+        if run["job_id"] != artifact.producer_job_id:
+            raise ValueError("Artifact producer run and job do not agree")
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        row = self._one(
+            "SELECT payload FROM artifacts WHERE id = ?", (artifact_id,), "Artifact"
+        )
+        return _load(row["payload"], ArtifactRecord.from_dict)
+
+    def list_artifacts(
+        self,
+        *,
+        job_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[ArtifactRecord]:
+        query = "SELECT payload FROM artifacts"
+        clauses: list[str] = []
+        args: list[str] = []
+        if job_id is not None:
+            clauses.append("producer_job_id = ?")
+            args.append(job_id)
+        if run_id is not None:
+            clauses.append("producer_run_id = ?")
+            args.append(run_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, id"
+        return [
+            _load(row["payload"], ArtifactRecord.from_dict)
+            for row in self._all(query, tuple(args))
+        ]
+
+    def append_agent_request(self, request: AgentRequestRecord) -> AgentRequestRecord:
+        """Append a worker message and return its database-assigned sequence."""
+
+        if not isinstance(request, AgentRequestRecord):
+            raise TypeError("Request must be an AgentRequestRecord")
+        with self._lock, self._transaction():
+            return self._append_agent_request_in_transaction(request)
+
+    def _append_agent_request_in_transaction(
+        self, request: AgentRequestRecord
+    ) -> AgentRequestRecord:
+        run = self._connection.execute(
+            "SELECT job_id FROM runs WHERE id = ?", (request.run_id,)
+        ).fetchone()
+        if run is None:
+            raise EntityNotFoundError(f"Run {request.run_id} does not exist")
+        job_id = str(run["job_id"])
+        if request.job_id and request.job_id != job_id:
+            raise ValueError("Agent request job does not own its run")
+        owned = replace(request, job_id=job_id)
+        existing = self._connection.execute(
+            "SELECT payload FROM agent_messages WHERE id = ?", (request.request_id,)
+        ).fetchone()
+        if existing is not None:
+            stored = _load(existing["payload"], AgentRequestRecord.from_dict)
+            if not self._same_agent_request(stored, owned):
+                raise ConcurrentStateError(
+                    f"Agent request {request.request_id} already differs"
+                )
+            return stored
+        try:
+            cursor = self._connection.execute(
+                "INSERT INTO agent_messages("
+                "id, run_id, job_id, kind, created_at, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    owned.request_id,
+                    owned.run_id,
+                    owned.job_id,
+                    owned.kind.value,
+                    owned.created_at.isoformat(),
+                    _dump(replace(owned, sequence=0)),
+                ),
+            )
+            sequence = int(cursor.lastrowid)
+            persisted = replace(owned, sequence=sequence)
+            self._connection.execute(
+                "UPDATE agent_messages SET payload = ? WHERE sequence = ?",
+                (_dump(persisted), sequence),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ConcurrentStateError(
+                f"Could not append agent request {request.request_id}"
+            ) from error
+        return persisted
+
+    def list_agent_requests(
+        self, run_id: str, *, limit: int | None = None
+    ) -> list[AgentRequestRecord]:
+        if limit is not None and limit < 0:
+            raise ValueError("Agent request limit cannot be negative")
+        query = (
+            "SELECT payload FROM agent_messages WHERE run_id = ? ORDER BY sequence DESC"
+        )
+        args: tuple[object, ...] = (run_id,)
+        if limit is not None:
+            query += " LIMIT ?"
+            args += (limit,)
+        rows = list(reversed(self._all(query, args)))
+        return [_load(row["payload"], AgentRequestRecord.from_dict) for row in rows]
+
+    @staticmethod
+    def _same_agent_request(
+        stored: AgentRequestRecord, incoming: AgentRequestRecord
+    ) -> bool:
+        return (
+            stored.request_id == incoming.request_id
+            and stored.run_id == incoming.run_id
+            and stored.job_id == incoming.job_id
+            and stored.kind is incoming.kind
+            and stored.message == incoming.message
+            and stored.created_at == incoming.created_at
+            and stored.retryable == incoming.retryable
+        )
 
     def _save_job_in_transaction(
         self,
@@ -466,14 +960,15 @@ class SQLiteStateStore:
             row = self._connection.execute(
                 "SELECT payload FROM nodes WHERE id = ?", (node.id,)
             ).fetchone()
-            registered = (
-                replace(
+            if row is None:
+                registered = node
+            else:
+                existing = _load(row["payload"], WorkerNode.from_dict)
+                registered = replace(
                     node,
-                    allocated=_load(row["payload"], WorkerNode.from_dict).allocated,
+                    allocated=existing.allocated,
+                    heartbeat=node.heartbeat or existing.heartbeat,
                 )
-                if row is not None
-                else node
-            )
             self._execute_upsert(
                 "nodes",
                 registered.id,
@@ -700,6 +1195,114 @@ class SQLiteStateStore:
                 "UPDATE quota_pools SET payload = ? WHERE id = ?",
                 (_dump(updated_pool), expected_pool.id),
             )
+
+    def apply_reset_event(self, event: QuotaResetEvent) -> QuotaPool:
+        """Apply and record one reset event exactly once in one transaction."""
+
+        self._validate_reset_event(event)
+        with self._lock, self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM quota_reset_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            if existing is not None:
+                stored = _load(existing["payload"], QuotaResetEvent.from_dict)
+                if stored != event:
+                    raise ConcurrentStateError(
+                        f"Quota reset event {event.id} already differs"
+                    )
+                pool_row = self._connection.execute(
+                    "SELECT payload FROM quota_pools WHERE id = ?", (event.pool_id,)
+                ).fetchone()
+                if pool_row is None:
+                    raise EntityNotFoundError(
+                        f"Quota pool {event.pool_id} does not exist"
+                    )
+                return _load(pool_row["payload"], QuotaPool.from_dict)
+
+            pool_row = self._connection.execute(
+                "SELECT payload FROM quota_pools WHERE id = ?", (event.pool_id,)
+            ).fetchone()
+            if pool_row is None:
+                raise EntityNotFoundError(f"Quota pool {event.pool_id} does not exist")
+            pool = _load(pool_row["payload"], QuotaPool.from_dict)
+            remaining = pool.remaining
+            reset_at = event.expected_reset_at
+            confidence = event.confidence
+            if event.mode is QuotaMode.RESET_CONFIRMED:
+                remaining = event.new_remaining
+                reset_at = None
+                confidence = 1
+            updated = replace(
+                pool,
+                mode=event.mode,
+                remaining=remaining,
+                reset_at=reset_at,
+                reset_confidence=confidence,
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "INSERT INTO quota_reset_events("
+                "id, pool_id, mode, expected_reset_at, confidence, "
+                "new_remaining, source, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    event.pool_id,
+                    event.mode.value,
+                    (
+                        event.expected_reset_at.isoformat()
+                        if event.expected_reset_at is not None
+                        else None
+                    ),
+                    event.confidence,
+                    event.new_remaining,
+                    event.source,
+                    _dump(event),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated), pool.id),
+            )
+            return updated
+
+    @staticmethod
+    def _validate_reset_event(event: QuotaResetEvent) -> None:
+        if not isinstance(event, QuotaResetEvent):
+            raise TypeError("Reset event must be a QuotaResetEvent")
+        if not event.pool_id.strip() or not event.id.strip():
+            raise ValueError("Reset event requires pool and event identifiers")
+        if not isinstance(event.mode, QuotaMode):
+            raise TypeError("Reset event mode must be a QuotaMode")
+        if not isfinite(event.confidence) or not 0 <= event.confidence <= 1:
+            raise ValueError("Reset confidence must be between zero and one")
+        if event.mode is QuotaMode.RESET_CONFIRMED:
+            if event.new_remaining is None:
+                raise ValueError("A confirmed reset must include the new quota amount")
+            if not isfinite(event.new_remaining) or event.new_remaining < 0:
+                raise ValueError("Reset quota must be finite and non-negative")
+        if not event.source.strip():
+            raise ValueError("Reset event source cannot be empty")
+
+    def get_reset_event(self, event_id: str) -> QuotaResetEvent:
+        row = self._one(
+            "SELECT payload FROM quota_reset_events WHERE id = ?",
+            (event_id,),
+            "Quota reset event",
+        )
+        return _load(row["payload"], QuotaResetEvent.from_dict)
+
+    def list_reset_events(self, pool_id: str | None = None) -> list[QuotaResetEvent]:
+        query = "SELECT payload FROM quota_reset_events"
+        args: tuple[object, ...] = ()
+        if pool_id is not None:
+            query += " WHERE pool_id = ?"
+            args = (pool_id,)
+        query += " ORDER BY rowid"
+        return [
+            _load(row["payload"], QuotaResetEvent.from_dict)
+            for row in self._all(query, args)
+        ]
 
     def get_quota_pool(self, pool_id: str) -> QuotaPool:
         row = self._one(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -15,14 +16,17 @@ from agentd.harness.app_server import OpenAICodexClient
 from agentd.harness.codex import CodexCliDriver
 from agentd.harness.codex_sdk import CodexSdkDriver
 from agentd.harness.fake import FakeHarnessDriver
+from agentd.harness.protocol import HarnessDriver
 from agentd.harness.registry import DriverRegistry
 from agentd.harness.supervisor import RunSupervisor
 from agentd.provisioning import TrustedUvProvisioner
 from agentd.runtime.accounts import AccountPolicyThresholds, JobUsagePolicy
 from agentd.runtime.codex_oracle import CodexAccountOracle
+from agentd.runtime.governor import ProviderStopPolicy
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.local import LocalWorkerBackend
+from agentd.workers.protocol import WorkerBackend
 from agentd.workers.registry import BackendRegistry
 from agentd.workspaces.git import GitWorkspaceManager
 
@@ -38,26 +42,35 @@ class LocalRuntime:
     coordinator: SchedulerCoordinator
     control_plane: ControlPlane
     drivers: DriverRegistry
+    backends: BackendRegistry
     supervisor: RunSupervisor | None = None
     account_oracle: CodexAccountOracle | None = None
 
     async def aclose(self) -> None:
         """Quiesce driver transports before closing durable state."""
 
+        await self._close_transports()
+        self.store.close()
+
+    async def _close_transports(self) -> None:
         if self.supervisor is not None:
             await self.supervisor.close()
-        self.store.close()
+        for name in self.backends.names():
+            close = getattr(self.backends.get(name), "close", None)
+            if close is not None:
+                result = close()
+                if result is not None:
+                    await result
 
     def close(self) -> None:
         """Close a runtime from synchronous embedding code."""
 
-        if self.supervisor is not None:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.run(self.supervisor.close())
-            else:
-                raise RuntimeError("Use await runtime.aclose() inside an event loop")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._close_transports())
+        else:
+            raise RuntimeError("Use await runtime.aclose() inside an event loop")
         self.store.close()
 
     def __enter__(self) -> LocalRuntime:
@@ -76,6 +89,8 @@ def create_local_runtime(
     include_codex_cli_driver: bool = True,
     trusted_provisioning: bool = False,
     enforce_codex_account_policy: bool = False,
+    additional_drivers: Iterable[HarnessDriver] = (),
+    worker_backends: Iterable[WorkerBackend] = (),
     config: ServiceConfig | None = None,
 ) -> LocalRuntime:
     """Compose the local SQLite/Git/process implementation behind domain ports."""
@@ -135,6 +150,8 @@ def create_local_runtime(
         )
     if include_codex_cli_driver:
         drivers.register(CodexCliDriver())
+    for driver in additional_drivers:
+        drivers.register(driver)
     provisioner = (
         TrustedUvProvisioner(
             codex_home=effective_config.codex_home,
@@ -148,11 +165,12 @@ def create_local_runtime(
         if trusted_provisioning
         else None
     )
+    backends = BackendRegistry((LocalWorkerBackend(), *tuple(worker_backends)))
     coordinator = SchedulerCoordinator(
         store,
         GitWorkspaceManager(workspace_root),
         drivers,
-        backends=BackendRegistry((LocalWorkerBackend(),)),
+        backends=backends,
         provisioner=provisioner,
         enforce_codex_account_policy=enforce_codex_account_policy,
         account_policy=AccountPolicyThresholds(
@@ -161,6 +179,9 @@ def create_local_runtime(
             )
         ),
         usage_policy=JobUsagePolicy(top_up_chunk=effective_config.quota_top_up_tokens),
+        provider_stop_policy=ProviderStopPolicy(
+            remaining_fraction=effective_config.provider_stop_remaining_fraction
+        ),
         hard_cap_grace=timedelta(seconds=effective_config.hard_cap_grace_seconds),
     )
     control_plane = ControlPlane(store, coordinator=coordinator)
@@ -169,6 +190,7 @@ def create_local_runtime(
         coordinator,
         control_plane,
         drivers,
+        backends,
         supervisor,
         account_oracle,
     )

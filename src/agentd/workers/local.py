@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import platform
+from inspect import isawaitable
 
 from agentd.domain.enums import NodeState
-from agentd.domain.models import ExecutionContract, RunHandle, WorkerNode
-from agentd.harness.protocol import HarnessDriver
-from agentd.workers.protocol import WorkerBackendCapabilities
+from agentd.domain.models import (
+    ExecutionContract,
+    RunHandle,
+    RunObservation,
+    RunResult,
+    WorkerNode,
+)
+from agentd.harness.protocol import HarnessDriver, ManagedHarnessDriver
+from agentd.workers.protocol import (
+    WorkerBackendCapabilities,
+    validate_status_payload,
+)
 
 _OS_ALIASES = {
     "darwin": "macos",
@@ -55,6 +65,7 @@ class LocalWorkerBackend:
             architecture or platform.machine()
         )
         self._node_id = node_id
+        self._drivers: dict[str, HarnessDriver] = {}
         self._capabilities = WorkerBackendCapabilities(
             name=name,
             supported_operating_systems=frozenset({current_os}),
@@ -93,7 +104,74 @@ class LocalWorkerBackend:
         self,
         driver: HarnessDriver,
         contract: ExecutionContract,
+        *,
+        run_id: str | None = None,
+        managed: bool = False,
     ) -> RunHandle:
         """Start locally without adding harness-selection policy."""
 
-        return await driver.start(contract)
+        if managed:
+            if not isinstance(driver, ManagedHarnessDriver):
+                raise TypeError(
+                    f"Driver {driver.capabilities().name!r} does not support "
+                    "managed starts"
+                )
+            handle = await driver.start_managed(run_id or contract.job_id, contract)
+        else:
+            handle = await driver.start(contract)
+        self._drivers[handle.id] = driver
+        if run_id is not None:
+            self._drivers[run_id] = driver
+        return handle
+
+    async def observe(self, run_id: str) -> RunObservation | None:
+        driver = self._drivers.get(run_id)
+        if not isinstance(driver, ManagedHarnessDriver):
+            return None
+        return driver.observe(run_id)
+
+    async def status(self, run: RunHandle | str) -> dict[str, object]:
+        run_id = run if isinstance(run, str) else run.id
+        driver = self._drivers.get(run_id)
+        if driver is None:
+            return {"known": False, "terminal": False, "result": None}
+        status_method = getattr(driver, "status", None)
+        if status_method is None:
+            return {"known": True, "terminal": False, "result": None}
+        handle = run
+        if isinstance(run, str):
+            handle = RunHandle(id=run, driver=driver.capabilities().name)
+        raw_status = status_method(handle)
+        if isawaitable(raw_status):
+            raw_status = await raw_status
+        return validate_status_payload(raw_status)
+
+    async def steer(self, run: RunHandle, instruction: str) -> None:
+        await self._driver_for(run).steer(run, instruction)
+
+    async def interrupt(self, run: RunHandle) -> None:
+        await self._driver_for(run).interrupt(run)
+
+    async def cancel(self, run: RunHandle) -> None:
+        await self._driver_for(run).cancel(run)
+
+    async def collect(self, run: RunHandle) -> RunResult:
+        return await self._driver_for(run).collect(run)
+
+    async def heartbeat(self) -> dict[str, object]:
+        return {
+            "node_id": self._node_id,
+            "backend": self._capabilities.name,
+            "remote": False,
+        }
+
+    async def close(self) -> None:
+        # Harness drivers are owned by the enclosing local runtime.  There is
+        # no transport to close here, so this is intentionally a no-op.
+        return None
+
+    def _driver_for(self, run: RunHandle) -> HarnessDriver:
+        try:
+            return self._drivers[run.id]
+        except KeyError as error:
+            raise KeyError(f"Unknown local worker run {run.id!r}") from error

@@ -8,14 +8,18 @@ assignment but does not choose priority, quota, workspace, or lifecycle.
 
 ```text
 Caller -> ControlPlane / AgentDaemon
-       -> readiness -> quota -> logical placement -> Git lease
-       -> LocalWorkerBackend -> HarnessDriver
+       -> readiness -> quota -> logical placement
+       -> LocalWorkerBackend -> HarnessDriver (local coding run)
+       -> RemoteWorkerBackend -> typed Build/Deploy operation (remote artifact run)
        -> checkpoint / metering / review / repair / acceptance
 ```
 
-Placement selects a `WorkerNode` for compatibility and accounting. The current
-`LocalWorkerBackend` starts every selected harness on the controller host, so a
-node record does not represent a remote worker.
+Placement selects a `WorkerNode` for compatibility and accounting. A
+`LocalWorkerBackend` starts ordinary harnesses on the controller host. A
+`RemoteWorkerBackend` addresses a node-bound authenticated worker, but the
+coordinator admits remote execution only for typed Build/Deploy operations. A
+remote operation receives immutable artifact inputs and a logical `worker://`
+workspace; it does not receive a controller-local Git worktree.
 
 ## Responsibilities
 

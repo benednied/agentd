@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
+from inspect import isawaitable
 
 from agentd.domain.enums import (
+    ArtifactKind,
     JobState,
     PreemptionPolicy,
     QoSClass,
@@ -17,7 +20,13 @@ from agentd.domain.enums import (
     WorkspaceState,
 )
 from agentd.domain.models import (
+    ArtifactInput,
+    ArtifactRecord,
+    ArtifactRef,
+    BuildImageOperation,
     Checkpoint,
+    DeployImageOperation,
+    DriverSession,
     ExecutionContract,
     Job,
     ProviderQuotaSnapshot,
@@ -29,6 +38,7 @@ from agentd.domain.models import (
     RunObservation,
     RunRecord,
     RunResult,
+    WorkerHeartbeat,
     WorkspaceLease,
     new_id,
     utc_now,
@@ -58,18 +68,31 @@ from agentd.runtime.accounts import (
     should_top_up,
     snapshot_is_stale,
 )
+from agentd.runtime.governor import (
+    DEFAULT_PROVIDER_STOP_POLICY,
+    ProviderStopPolicy,
+    provider_stop_command,
+    tail_governor_command,
+)
 from agentd.runtime.quota import QuotaAdmissionError, QuotaManager
 from agentd.runtime.resources import ResourceManager
 from agentd.scheduling.burn import burn_order_key
 from agentd.scheduling.placement import Placement, compatible_placements
 from agentd.scheduling.readiness import gang_readiness
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError, StateStore
-from agentd.workers.protocol import WorkerBackend
+from agentd.workers.errors import WorkerStartUncertainError, WorkerTransportError
+from agentd.workers.protocol import ARTIFACT_VERIFICATION_FEATURE, WorkerBackend
 from agentd.workers.registry import BackendRegistry
 from agentd.workspaces.base import WorkspaceManager, WorkspaceReleaseError
 
 
 class LifecycleError(RuntimeError):
+    pass
+
+
+class _ArtifactUnavailable(LifecycleError):
+    """A valid job is waiting for an immutable input to be verified."""
+
     pass
 
 
@@ -94,6 +117,7 @@ class SchedulerCoordinator:
         enforce_codex_account_policy: bool = False,
         account_policy: AccountPolicyThresholds = DEFAULT_ACCOUNT_POLICY,
         usage_policy: JobUsagePolicy = DEFAULT_JOB_USAGE_POLICY,
+        provider_stop_policy: ProviderStopPolicy = DEFAULT_PROVIDER_STOP_POLICY,
         hard_cap_grace: timedelta = timedelta(seconds=120),
     ) -> None:
         if hard_cap_grace <= timedelta(0):
@@ -108,6 +132,7 @@ class SchedulerCoordinator:
         self._enforce_codex_account_policy = enforce_codex_account_policy
         self._account_policy = account_policy
         self._usage_policy = usage_policy
+        self._provider_stop_policy = provider_stop_policy
         self._hard_cap_grace = hard_cap_grace
 
     async def dispatch_next(self) -> RunRecord | None:
@@ -130,6 +155,13 @@ class SchedulerCoordinator:
             if not gang_readiness(job, all_jobs, states).ready:
                 continue
             try:
+                resolved_inputs, resolved_operation = self._resolve_artifacts(job)
+            except _ArtifactUnavailable:
+                # Artifact readiness is an admission prerequisite.  Waiting for
+                # a producer or operator-verified external input must not reserve
+                # quota, allocate capacity, or create a workspace.
+                continue
+            try:
                 self._store.get_quota_pool(job.quota_budget.pool_id)
             except LookupError:
                 continue
@@ -140,11 +172,17 @@ class SchedulerCoordinator:
             ):
                 if not self._provider_allows_placement(job, placement):
                     continue
-                backend = self._select_backend(placement.node_id)
+                backend = self._select_backend(placement.node_id, job)
                 if self._backends is not None and backend is None:
                     continue
                 try:
-                    return await self._dispatch(job, placement, backend)
+                    return await self._dispatch(
+                        job,
+                        placement,
+                        backend,
+                        resolved_inputs=resolved_inputs,
+                        resolved_operation=resolved_operation,
+                    )
                 except QuotaAdmissionError:
                     break
                 except Exception as error:
@@ -163,6 +201,9 @@ class SchedulerCoordinator:
         job: Job,
         placement: Placement,
         backend: WorkerBackend | None,
+        *,
+        resolved_inputs: tuple[ArtifactRef, ...],
+        resolved_operation: BuildImageOperation | DeployImageOperation | None,
     ) -> RunRecord:
         reservation: QuotaReservation | None = None
         allocation_id: str | None = None
@@ -187,27 +228,38 @@ class SchedulerCoordinator:
             allocation = self._resources.allocate(job, node)
             allocation_id = allocation.id
 
+            typed_operation = resolved_operation is not None
             workspace = self._store.find_workspace(job.id)
-            if (
-                workspace is not None
-                and workspace.state is WorkspaceState.LEASED
-                and not self._workspaces.is_available(workspace)
-            ):
-                self._store.save_workspace(
-                    replace(workspace, state=WorkspaceState.FAILED),
-                    expected=workspace,
-                )
-                workspace = None
-            if workspace is None or workspace.state is not WorkspaceState.LEASED:
-                workspace = self._workspaces.allocate(
-                    job,
-                    base_ref=self._base_ref(job),
-                )
-                self._store.save_workspace(workspace, expected=None)
-                workspace_created = True
+            if typed_operation:
+                if workspace is None or workspace.state is not WorkspaceState.LEASED:
+                    workspace = self._operation_workspace(
+                        job,
+                        placement,
+                        backend,
+                    )
+                    self._store.save_workspace(workspace, expected=None)
+                    workspace_created = True
+            else:
+                if (
+                    workspace is not None
+                    and workspace.state is WorkspaceState.LEASED
+                    and not self._workspaces.is_available(workspace)
+                ):
+                    self._store.save_workspace(
+                        replace(workspace, state=WorkspaceState.FAILED),
+                        expected=workspace,
+                    )
+                    workspace = None
+                if workspace is None or workspace.state is not WorkspaceState.LEASED:
+                    workspace = self._workspaces.allocate(
+                        job,
+                        base_ref=self._base_ref(job),
+                    )
+                    self._store.save_workspace(workspace, expected=None)
+                    workspace_created = True
 
-            if self._provisioner is not None:
-                await self._provisioner.prepare(workspace)
+                if self._provisioner is not None:
+                    await self._provisioner.prepare(workspace)
 
             selected = replace(
                 job,
@@ -222,7 +274,12 @@ class SchedulerCoordinator:
             self._store.save_job(candidate, event, expected=job)
             admitted = candidate
 
-            contract = self._build_contract(admitted, workspace)
+            contract = self._build_contract(
+                admitted,
+                workspace,
+                artifact_inputs=resolved_inputs,
+                operation=resolved_operation,
+            )
             run = RunRecord(
                 job_id=admitted.id,
                 node_id=placement.node_id,
@@ -241,12 +298,20 @@ class SchedulerCoordinator:
                 state=RunState.STARTING,
             )
             self._store.save_run(run, expected=None)
-            if isinstance(driver, ManagedHarnessDriver):
+            managed = isinstance(driver, ManagedHarnessDriver)
+            if backend is not None:
+                handle = await backend.dispatch(
+                    driver,
+                    contract,
+                    run_id=run.id,
+                    managed=managed,
+                )
+            elif managed:
                 handle = await driver.start_managed(run.id, contract)
-            elif backend is not None:
-                handle = await backend.dispatch(driver, contract)
             else:
                 handle = await driver.start(contract)
+            if managed and backend is not None and backend.capabilities().remote:
+                self._create_remote_driver_session(run, handle)
             # Persist the externally meaningful handle before publishing RUNNING.
             # A reconciler can now identify and stop a process even if the job/run
             # transition below is interrupted.
@@ -272,18 +337,50 @@ class SchedulerCoordinator:
         except BaseException as error:
             log.bind(error_type=type(error).__name__).error("dispatch_failed")
             cleanup_errors: list[BaseException] = []
-            quiesced = handle is None
+            uncertain_remote_start = (
+                handle is None
+                and run is not None
+                and backend is not None
+                and backend.capabilities().remote
+                and (
+                    isinstance(
+                        error,
+                        (WorkerStartUncertainError, asyncio.CancelledError),
+                    )
+                )
+            )
+            # A remote START can have created a process before its response
+            # was lost.  The durable STARTING/ADMITTED intent, reservation,
+            # and allocation are then the only safe ownership record.  Do not
+            # cancel, release, or return the job to READY: recovery must query
+            # this same run id before deciding anything.
+            quiesced = handle is None and not uncertain_remote_start
             if handle is not None:
                 try:
-                    await driver.cancel(handle)
-                    await driver.collect(handle)
+                    if backend is not None:
+                        cleanup_target = (
+                            run.id
+                            if backend.capabilities().remote and run is not None
+                            else handle
+                        )
+                        await backend.cancel(cleanup_target)
+                        await backend.collect(cleanup_target)
+                    else:
+                        await driver.cancel(handle)
+                        await driver.collect(handle)
                     quiesced = True
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
             if quiesced:
                 if workspace_created and workspace is not None:
                     try:
-                        self._release_workspace(workspace, retain_on_failure=True)
+                        if self._is_operation_workspace(workspace):
+                            self._release_operation_workspace(workspace)
+                        else:
+                            self._release_workspace(
+                                workspace,
+                                retain_on_failure=True,
+                            )
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
                 if allocation_id is not None:
@@ -330,6 +427,11 @@ class SchedulerCoordinator:
                 )
             elif quiesced:
                 log.info("dispatch_compensated")
+            elif uncertain_remote_start:
+                log.warning(
+                    "remote_start_outcome_uncertain_intent_retained",
+                    run_id=run.id if run is not None else None,
+                )
             raise
 
     def apply_provider_snapshot(self, snapshot: ProviderQuotaSnapshot) -> None:
@@ -360,8 +462,79 @@ class SchedulerCoordinator:
             f"Could not apply provider snapshot for pool {snapshot.pool_id}"
         )
 
+    async def refresh_worker_heartbeats(self) -> tuple[dict[str, object], ...]:
+        """Refresh authenticated remote backends and persist node liveness.
+
+        Capacity remains an operator-owned scheduling declaration on
+        :class:`WorkerNode`; a heartbeat never fabricates or silently expands
+        it.  The authenticated worker identity is instead used to bind the
+        configured backend to that existing node and advance ``updated_at``.
+        """
+
+        if self._backends is None:
+            return ()
+        snapshots: list[dict[str, object]] = []
+        errors: list[Exception] = []
+        for backend_name in self._backends.names():
+            backend = self._backends.get(backend_name)
+            if not backend.capabilities().remote:
+                continue
+            try:
+                raw_snapshot = await backend.heartbeat()
+                snapshot = dict(raw_snapshot)
+                node_id = snapshot.get("node_id")
+                if not isinstance(node_id, str) or not node_id.strip():
+                    raise LifecycleError(
+                        f"Remote backend {backend_name!r} returned no node identity"
+                    )
+                node = self._store.get_node(node_id)
+                session_epoch = snapshot.get("session_epoch")
+                drivers = snapshot.get("drivers")
+                active_runs = snapshot.get("active_runs")
+                if (
+                    not isinstance(session_epoch, str)
+                    or not session_epoch.strip()
+                    or not isinstance(drivers, list)
+                    or any(not isinstance(driver, str) for driver in drivers)
+                    or isinstance(active_runs, bool)
+                    or not isinstance(active_runs, int)
+                    or active_runs < 0
+                ):
+                    raise LifecycleError(
+                        f"Remote backend {backend_name!r} returned invalid status"
+                    )
+                declared_backend = node.labels.get("backend")
+                if declared_backend not in {None, backend_name}:
+                    raise LifecycleError(
+                        f"Node {node_id!r} is bound to backend "
+                        f"{declared_backend!r}, not {backend_name!r}"
+                    )
+                refreshed = replace(
+                    node,
+                    labels={**node.labels, "backend": backend_name},
+                    updated_at=utc_now(),
+                    heartbeat=WorkerHeartbeat(
+                        session_epoch=session_epoch,
+                        drivers=frozenset(drivers),
+                        active_runs=active_runs,
+                    ),
+                )
+                self._store.register_node(refreshed)
+                snapshots.append(snapshot)
+            except Exception as error:
+                errors.append(error)
+                event_logger(
+                    component="coordinator",
+                    operation="worker_heartbeat",
+                    backend=backend_name,
+                    error_type=type(error).__name__,
+                ).error("worker_heartbeat_failed")
+        if errors:
+            raise ExceptionGroup("one or more remote worker heartbeats failed", errors)
+        return tuple(snapshots)
+
     async def recover_managed_runs(self) -> None:
-        """Resume durable SDK threads after the service transport restarts."""
+        """Recover durable SDK threads and typed-operation startup intents."""
 
         first_error: BaseException | None = None
         for run in self._store.list_runs():
@@ -381,6 +554,75 @@ class SchedulerCoordinator:
             }:
                 continue
             driver = self._drivers.get(run.driver)
+            # A START response can be lost after the remote worker has
+            # claimed the durable run.  Reconcile that persisted intent before
+            # entering any driver recovery path; it must never dispatch a new
+            # request or use a controller-local fallback.
+            try:
+                backend = self._backend_for_run(run)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            if job.state is JobState.ADMITTED and (
+                backend is not None and backend.capabilities().remote
+            ):
+                try:
+                    await self._recover_remote_starting_intent(job, run, backend)
+                except BaseException as error:
+                    event_logger(
+                        component="coordinator",
+                        operation="remote_start_recovery",
+                        job_id=job.id,
+                        run_id=run.id,
+                        error_type=type(error).__name__,
+                    ).error("remote_start_recovery_failed")
+                    if first_error is None:
+                        first_error = error
+                continue
+            if self._is_typed_operation_run(run, driver):
+                if job.state is JobState.ADMITTED:
+                    log = event_logger(
+                        component="coordinator",
+                        operation="typed_operation_recovery",
+                        job_id=job.id,
+                        run_id=run.id,
+                        driver=run.driver,
+                    )
+                    try:
+                        # START was already durably addressed by ``run.id``.
+                        # Query that identity without dispatching again, then
+                        # publish RUNNING so the normal idempotent terminal
+                        # path can either continue or fail an unknown run.
+                        status = await self._operation_status(run)
+                        recovered = replace(run, state=RunState.RUNNING)
+                        running, event = transition_job(
+                            job,
+                            JobState.RUNNING,
+                            f"recovered typed operation intent {run.id}",
+                        )
+                        self._store.save_job_and_run(
+                            running,
+                            event,
+                            recovered,
+                            expected_job=job,
+                            expected_run=run,
+                        )
+                        await self._reconcile_operation_run(
+                            recovered,
+                            status=status,
+                        )
+                        log.info("typed_operation_recovered")
+                    except BaseException as error:
+                        log.bind(error_type=type(error).__name__).error(
+                            "typed_operation_recovery_failed"
+                        )
+                        if first_error is None:
+                            first_error = error
+                # Already-published typed runs are reconciled at the start of
+                # the daemon's first normal tick. They must never enter the SDK
+                # recovery path or re-run START.
+                continue
             if not isinstance(driver, ManagedHarnessDriver):
                 continue
             log = event_logger(
@@ -433,6 +675,23 @@ class SchedulerCoordinator:
                 except BaseException as error:
                     log.bind(error_type=type(error).__name__).error(
                         "repair_recovery_failed"
+                    )
+                    if first_error is None:
+                        first_error = error
+                    continue
+            backend = self._backend_for_run(run)
+            if backend is not None and backend.capabilities().remote:
+                try:
+                    observation = await backend.observe(run.id)
+                    if observation is not None:
+                        self._record_remote_observation(run, observation)
+                        continue
+                    raise LifecycleError(
+                        f"Remote managed run {run.id} has no recoverable observation"
+                    )
+                except BaseException as error:
+                    log.bind(error_type=type(error).__name__).error(
+                        "remote_managed_run_recovery_failed"
                     )
                     if first_error is None:
                         first_error = error
@@ -491,6 +750,117 @@ class SchedulerCoordinator:
         if first_error is not None:
             raise first_error
 
+    async def _recover_remote_starting_intents(self) -> None:
+        """Reconcile remote ADMITTED/STARTING intents during normal ticks."""
+
+        first_error: BaseException | None = None
+        for run in self._store.list_runs():
+            if run.state is not RunState.STARTING:
+                continue
+            job = self._store.get_job(run.job_id)
+            if job.state is not JobState.ADMITTED:
+                continue
+            try:
+                backend = self._backend_for_run(run)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            if backend is None or not backend.capabilities().remote:
+                continue
+            try:
+                await self._recover_remote_starting_intent(job, run, backend)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    async def _recover_remote_starting_intent(
+        self,
+        job: Job,
+        run: RunRecord,
+        backend: WorkerBackend,
+    ) -> None:
+        """Resolve one remote START uncertainty by durable run id only."""
+
+        status = await backend.status(run.id)
+        if not isinstance(status, dict):
+            raise LifecycleError(f"Remote run {run.id} returned malformed status")
+        known = status.get("known")
+        terminal = status.get("terminal")
+        raw_result = status.get("result")
+        if (
+            not isinstance(known, bool)
+            or not isinstance(terminal, bool)
+            or (not known and (terminal or raw_result is not None))
+            or (not terminal and raw_result is not None)
+        ):
+            raise LifecycleError(f"Remote run {run.id} returned invalid status")
+        if not known:
+            # This worker-authenticated answer is the only point at which a
+            # lost START may be failed and its admission effects released.
+            result = RunResult(
+                RunOutcome.FAILED,
+                "worker lost the remote run state after START uncertainty",
+                metadata={"worker_status": "unknown"},
+            )
+            final_run = replace(
+                run,
+                state=RunState.FAILED,
+                ended_at=utc_now(),
+                result=result,
+            )
+            failed, event = transition_job(
+                job,
+                JobState.FAILED,
+                f"remote run {run.id} is no longer known by the worker",
+            )
+            self._store.save_job_and_run(
+                failed,
+                event,
+                final_run,
+                expected_job=job,
+                expected_run=run,
+            )
+            self._raise_cleanup_errors(
+                self._cleanup_job_resources(job.id, final_run, completed=False)
+            )
+            return
+
+        recovered = replace(run, state=RunState.RUNNING)
+        running, event = transition_job(
+            job,
+            JobState.RUNNING,
+            f"recovered remote START intent {run.id}",
+        )
+        self._store.save_job_and_run(
+            running,
+            event,
+            recovered,
+            expected_job=job,
+            expected_run=run,
+        )
+        if self._is_typed_operation_run(run, self._drivers.get(run.driver)):
+            await self._reconcile_operation_run(recovered, status=status)
+            return
+        if not terminal:
+            return
+        if raw_result is None:
+            result = await backend.collect(run.id)
+        else:
+            try:
+                result = RunResult.from_dict(raw_result)
+            except (KeyError, TypeError, ValueError) as error:
+                raise LifecycleError(
+                    f"Remote run {run.id} returned malformed terminal result"
+                ) from error
+        self._store.save_run(
+            replace(recovered, result=result),
+            expected=recovered,
+        )
+        await self.complete(job.id)
+
     async def reconcile_managed_runs(
         self,
         snapshot: ProviderQuotaSnapshot | None = None,
@@ -502,6 +872,30 @@ class SchedulerCoordinator:
         now = at or utc_now()
         finalized: list[Job] = []
         first_error: BaseException | None = None
+        # Do not retry cleanup for a job that this same pass just made
+        # terminal.  Keeping the retry on the next tick makes a one-shot
+        # release failure observable while preserving the durable terminal
+        # result and the admission for retry.
+        terminal_cleanup_candidates = frozenset(
+            job.id
+            for job in self._store.list_jobs(
+                frozenset({JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED})
+            )
+        )
+        try:
+            # This also runs after an in-process dispatch returned an
+            # uncertain START, not only during daemon bootstrap.
+            await self._recover_remote_starting_intents()
+        except BaseException as error:
+            first_error = error
+        try:
+            # Terminal persistence and resource cleanup are separate durable
+            # effects. A transient release failure must remain retryable on a
+            # later normal tick instead of stranding a terminal job forever.
+            self._retry_terminal_resource_cleanups(terminal_cleanup_candidates)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         for job in self._store.list_jobs(frozenset({JobState.METERING_PENDING})):
             run = self._store.latest_run(job.id)
             if run is None or run.result is None:
@@ -535,12 +929,23 @@ class SchedulerCoordinator:
             if active_run is None or active_run.id != run.id:
                 continue
             driver = self._drivers.get(run.driver)
+            if self._is_typed_operation_run(run, driver):
+                try:
+                    finalized_job = await self._reconcile_operation_run(run)
+                    if finalized_job is not None:
+                        finalized.append(finalized_job)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                continue
             if not isinstance(driver, ManagedHarnessDriver):
                 continue
-            observation = driver.observe(run.id)
+            observation = await self._observe_run(run)
             if observation is None:
                 continue
             try:
+                if self._is_remote_run(run):
+                    self._record_remote_observation(run, observation)
                 if observation.terminal:
                     finalized_job = self._finalize_managed_observation(run, observation)
                     finalized.append(finalized_job)
@@ -574,8 +979,11 @@ class SchedulerCoordinator:
                     run,
                     active_snapshot,
                     at=now,
+                    observation=observation,
                 )
-                if isinstance(driver, PendingCommandHarnessDriver):
+                if self._is_remote_run(run):
+                    await self._deliver_remote_commands(run, observation)
+                elif isinstance(driver, PendingCommandHarnessDriver):
                     await driver.process_pending(run.id)
             except BaseException as error:
                 if first_error is None:
@@ -583,6 +991,165 @@ class SchedulerCoordinator:
         if first_error is not None:
             raise first_error
         return tuple(finalized)
+
+    def _retry_terminal_resource_cleanups(
+        self,
+        job_ids: frozenset[str],
+    ) -> None:
+        """Retry idempotent workspace/capacity cleanup for terminal jobs."""
+
+        first_error: BaseException | None = None
+        terminal_states = frozenset(
+            {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
+        )
+        for job in self._store.list_jobs(terminal_states):
+            if job.id not in job_ids:
+                continue
+            run = self._store.latest_run(job.id)
+            try:
+                self._raise_cleanup_errors(
+                    self._cleanup_job_resources(
+                        job.id,
+                        run,
+                        completed=job.state is JobState.COMPLETED,
+                        cancelled=job.state is JobState.CANCELLED,
+                    )
+                )
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _is_typed_operation_run(
+        run: RunRecord,
+        driver: object,
+    ) -> bool:
+        """Identify runs owned by the typed build/deploy harness.
+
+        A contract may carry an operation while a legacy managed harness is
+        still being used for its normal observation/command lifecycle.  Only a
+        driver advertising the matching typed-operation feature is eligible
+        for status-based finalization; this keeps that compatibility path from
+        being mistaken for a worker operation run.
+        """
+
+        operation = run.contract.operation
+        if operation is None:
+            return False
+        capabilities = getattr(driver, "capabilities", None)
+        if not callable(capabilities):
+            return False
+        features = getattr(capabilities(), "features", frozenset())
+        if isinstance(operation, BuildImageOperation):
+            return "build-image" in features
+        if isinstance(operation, DeployImageOperation):
+            return "deploy-image" in features
+        return False
+
+    async def _operation_status(self, run: RunRecord) -> dict[str, object]:
+        """Read status for a typed operation using its durable run identity."""
+
+        backend = self._backend_for_run(run)
+        if backend is None:
+            if run.backend != "direct":
+                raise LifecycleError(
+                    f"Run {run.id} references unavailable remote backend"
+                )
+            driver = self._drivers.get(run.driver)
+            status_method = getattr(driver, "status", None)
+            if status_method is None:
+                raise LifecycleError(f"Typed run {run.id} has no local status provider")
+            status = status_method(run.handle)
+            if isawaitable(status):
+                status = await status
+        else:
+            # The durable control-plane run id is the worker's primary key. A
+            # freshly restarted controller has no in-memory handle mapping.
+            status_target = run.id if backend.capabilities().remote else run.handle
+            status = await backend.status(status_target)
+        if not isinstance(status, dict):
+            raise LifecycleError(f"Typed run {run.id} returned malformed status")
+        return status
+
+    async def _reconcile_operation_run(
+        self,
+        run: RunRecord,
+        *,
+        status: dict[str, object] | None = None,
+    ) -> Job | None:
+        """Collect one typed operation only after a terminal worker status.
+
+        Status is a read-only, authenticated worker query.  A worker that no
+        longer knows the run is treated as a failed attempt, which releases
+        admission resources through the same atomic completion path as a
+        normal failed operation.  Transport/backend failures remain retryable
+        and never fall back to a controller-local driver.
+        """
+
+        # Persisting the worker result is deliberately a separate step from
+        # publishing the terminal run/job transition.  If the controller dies
+        # in that window, the durable result is authoritative and no second
+        # worker status query (which could now report ``known=False``) is
+        # needed to finish the same idempotent completion path.
+        if run.result is not None:
+            return await self.complete(run.job_id)
+
+        backend = self._backend_for_run(run)
+        if status is None:
+            status = await self._operation_status(run)
+        known = status.get("known")
+        terminal = status.get("terminal")
+        raw_result = status.get("result")
+        if not isinstance(known, bool) or not isinstance(terminal, bool):
+            raise LifecycleError(f"Typed run {run.id} returned malformed status flags")
+        if not known:
+            if terminal or raw_result is not None:
+                raise LifecycleError(
+                    f"Typed run {run.id} returned an invalid unknown status"
+                )
+            result = RunResult(
+                RunOutcome.FAILED,
+                "worker lost the typed run state after restart",
+                metadata={"worker_status": "unknown"},
+            )
+        elif not terminal:
+            if raw_result is not None:
+                raise LifecycleError(
+                    f"Typed run {run.id} returned a non-terminal result"
+                )
+            return None
+        elif raw_result is not None:
+            if not isinstance(raw_result, dict):
+                raise LifecycleError(f"Typed run {run.id} returned malformed result")
+            try:
+                result = RunResult.from_dict(raw_result)
+            except (KeyError, TypeError, ValueError) as error:
+                raise LifecycleError(
+                    f"Typed run {run.id} returned malformed terminal result"
+                ) from error
+        else:
+            try:
+                if backend is not None and backend.capabilities().remote:
+                    result = await backend.collect(run.id)
+                else:
+                    result = await self._collect_run(run)
+            except WorkerTransportError:
+                # A terminal status is not proof that the result was
+                # collected. Preserve the active run and retry collection
+                # after a transient connection failure.
+                raise
+            except Exception as error:
+                result = RunResult(
+                    RunOutcome.FAILED,
+                    "typed operation collection failed",
+                    metadata={"error_type": type(error).__name__},
+                )
+
+        collected = replace(run, result=result)
+        self._store.save_run(collected, expected=run)
+        return await self.complete(run.job_id)
 
     async def checkpoint(
         self,
@@ -636,8 +1203,8 @@ class SchedulerCoordinator:
             job = draining
 
         if job.state is JobState.DRAINING:
-            await driver.steer(
-                run.handle,
+            await self._steer_run(
+                run,
                 "Stop at the next safe boundary and preserve the supplied "
                 "resume state.",
             )
@@ -646,7 +1213,7 @@ class SchedulerCoordinator:
                 # during collection. Let that bounded turn finish before
                 # claiming a durable safe checkpoint; interrupting here would
                 # discard the queued instruction.
-                result = run.result or await driver.collect(run.handle)
+                result = run.result or await self._collect_run(run)
                 result = self._result_with_workspace_commit(run, result)
                 collected_run = replace(run, result=result)
                 self._store.save_run(collected_run, expected=run)
@@ -682,8 +1249,8 @@ class SchedulerCoordinator:
 
         result = run.result
         if result is None:
-            await driver.interrupt(run.handle)
-            result = await driver.collect(run.handle)
+            await self._interrupt_run(run)
+            result = await self._collect_run(run)
         result = self._result_with_workspace_commit(run, result)
         suspended, event = transition_job(
             job,
@@ -732,9 +1299,8 @@ class SchedulerCoordinator:
         if job.state is not JobState.RUNNING:
             raise LifecycleError(f"Job {job_id} is not running")
         run = self._require_active_run(job_id)
-        driver = self._drivers.get(run.driver)
-        await driver.interrupt(run.handle)
-        result = run.result or await driver.collect(run.handle)
+        await self._interrupt_run(run)
+        result = run.result or await self._collect_run(run)
         result = self._review_handoff_result(result)
         result = self._result_with_workspace_commit(run, result)
         review, event = transition_job(
@@ -814,13 +1380,18 @@ class SchedulerCoordinator:
         )
         result = run.result
         if result is None:
-            result = await self._drivers.get(run.driver).collect(run.handle)
+            result = await self._collect_run(run)
             result = self._result_with_workspace_commit(run, result)
             collected_run = replace(run, result=result)
             # Collect is an external effect. Persist it while the run remains
             # retryable, before attempting the atomic terminal transition.
             self._store.save_run(collected_run, expected=run)
             run = collected_run
+        else:
+            # A worker-reported Git commit is not an attestation. Re-read the
+            # controller-owned worktree even when an earlier review/checkpoint
+            # already persisted the result.
+            result = self._result_with_workspace_commit(run, result)
 
         target = {
             RunOutcome.COMPLETED: JobState.COMPLETED,
@@ -846,13 +1417,24 @@ class SchedulerCoordinator:
         )
         # The run and its audit transition are one SQLite transaction. No
         # external cleanup happens if this persistence step fails.
-        self._store.save_job_and_run(
-            completed,
-            event,
-            final_run,
-            expected_job=job,
-            expected_run=run,
-        )
+        artifacts = self._completion_artifacts(completed, final_run)
+        if artifacts:
+            self._store.save_job_and_run_with_artifacts(
+                completed,
+                event,
+                final_run,
+                artifacts,
+                expected_job=job,
+                expected_run=run,
+            )
+        else:
+            self._store.save_job_and_run(
+                completed,
+                event,
+                final_run,
+                expected_job=job,
+                expected_run=run,
+            )
         self._raise_cleanup_errors(
             self._cleanup_job_resources(
                 job_id,
@@ -887,10 +1469,9 @@ class SchedulerCoordinator:
             RunState.DRAINING,
             RunState.CHECKPOINTED,
         }:
-            driver = self._drivers.get(run.driver)
             try:
-                await driver.cancel(run.handle)
-                collected = await driver.collect(run.handle)
+                await self._cancel_run(run)
+                collected = await self._collect_run(run)
             except BaseException as error:
                 raise LifecycleError(
                     f"Could not quiesce run {run.id}; resources remain allocated"
@@ -961,10 +1542,158 @@ class SchedulerCoordinator:
             raise LifecycleError(f"Job {job_id} has no run attempt")
         return run
 
+    def _backend_for_run(self, run: RunRecord) -> WorkerBackend | None:
+        if run.backend == "direct":
+            return None
+        if self._backends is None:
+            raise LifecycleError(
+                f"Run {run.id} references unavailable backend {run.backend!r}"
+            )
+        try:
+            return self._backends.get(run.backend)
+        except LookupError as error:
+            raise LifecycleError(
+                f"Run {run.id} references unavailable backend {run.backend!r}"
+            ) from error
+
+    def _is_remote_run(self, run: RunRecord) -> bool:
+        backend = self._backend_for_run(run)
+        return backend is not None and backend.capabilities().remote
+
+    async def _observe_run(self, run: RunRecord) -> RunObservation | None:
+        backend = self._backend_for_run(run)
+        if backend is not None and backend.capabilities().remote:
+            return await backend.observe(run.id)
+        driver = self._drivers.get(run.driver)
+        if not isinstance(driver, ManagedHarnessDriver):
+            return None
+        return driver.observe(run.id)
+
+    async def _steer_run(self, run: RunRecord, instruction: str) -> None:
+        backend = self._backend_for_run(run)
+        if backend is not None and backend.capabilities().remote:
+            await backend.steer(run.id, instruction)
+            return
+        await self._drivers.get(run.driver).steer(run.handle, instruction)
+
+    async def _interrupt_run(self, run: RunRecord) -> None:
+        backend = self._backend_for_run(run)
+        if backend is not None and backend.capabilities().remote:
+            await backend.interrupt(run.id)
+            return
+        await self._drivers.get(run.driver).interrupt(run.handle)
+
+    async def _cancel_run(self, run: RunRecord) -> None:
+        backend = self._backend_for_run(run)
+        if backend is not None and backend.capabilities().remote:
+            await backend.cancel(run.id)
+            return
+        await self._drivers.get(run.driver).cancel(run.handle)
+
+    async def _collect_run(self, run: RunRecord) -> RunResult:
+        backend = self._backend_for_run(run)
+        if backend is not None and backend.capabilities().remote:
+            return await backend.collect(run.id)
+        return await self._drivers.get(run.driver).collect(run.handle)
+
+    def _create_remote_driver_session(
+        self,
+        run: RunRecord,
+        handle: RunHandle,
+    ) -> None:
+        self._store.save_driver_session(
+            DriverSession(
+                run_id=run.id,
+                driver=run.driver,
+                external_id=handle.external_id or handle.id,
+                metadata={"backend": run.backend, "remote": True},
+            ),
+            expected=None,
+        )
+
+    def _record_remote_observation(
+        self,
+        run: RunRecord,
+        observation: RunObservation,
+    ) -> None:
+        """Mirror worker telemetry into the controller's durable quota ledger."""
+
+        if observation.run_id != run.id:
+            raise LifecycleError("Remote observation belongs to another run")
+        session = self._store.get_driver_session(run.id)
+        if session.observation_cursor == observation.cursor:
+            return
+        if observation.telemetry_valid:
+            cumulative = observation.normalized_cumulative_quota
+            if cumulative is not None and cumulative > 0:
+                prior = self._store.list_usage_samples(run.id)
+                sequence = max((sample.sequence for sample in prior), default=-1) + 1
+                self._store.apply_usage_sample(
+                    observation.to_usage_sample(sequence),
+                    maximum=self._store.get_job(run.job_id).quota_budget.maximum,
+                )
+        self._store.update_observation_cursor(
+            run.id,
+            session.observation_cursor,
+            observation.cursor,
+            observation,
+        )
+
+    async def _deliver_remote_commands(
+        self,
+        run: RunRecord,
+        observation: RunObservation,
+    ) -> None:
+        for command in self._store.list_pending_run_commands(run.id):
+            if command.action == "repair":
+                continue
+            if command.action in {"steer", "checkpoint", "suspend"}:
+                supplied = command.payload.get("instruction")
+                if isinstance(supplied, str) and supplied.strip():
+                    instruction = supplied.strip()
+                elif command.action == "checkpoint":
+                    instruction = (
+                        "Stop at the next safe boundary and return a durable "
+                        "checkpoint with completed work, current state, next "
+                        "steps, known failures, and decisions."
+                    )
+                elif command.action == "suspend":
+                    instruction = (
+                        "Stop at the next safe boundary and return the durable "
+                        "state needed to resume later."
+                    )
+                else:
+                    raise LifecycleError(
+                        f"Remote steer command {command.id} has no instruction"
+                    )
+                await self._steer_run(
+                    run,
+                    f"{instruction}\n\nControl-plane command id: {command.id}",
+                )
+            elif command.action == "interrupt":
+                await self._interrupt_run(run)
+            elif command.action == "cancel":
+                await self._cancel_run(run)
+            else:
+                raise LifecycleError(
+                    f"Unsupported remote run command {command.action!r}"
+                )
+            self._store.acknowledge_run_command(
+                RunCommandAck(
+                    command_id=command.id,
+                    run_id=run.id,
+                    observation_cursor=observation.cursor,
+                    metadata={"backend": run.backend, "remote": True},
+                )
+            )
+
     def _build_contract(
         self,
         job: Job,
         workspace: WorkspaceLease,
+        *,
+        artifact_inputs: tuple[ArtifactRef, ...] | None = None,
+        operation: BuildImageOperation | DeployImageOperation | None = None,
     ) -> ExecutionContract:
         dependency_results: dict[str, str] = {}
         for dependency_id in job.dependencies:
@@ -994,6 +1723,15 @@ class SchedulerCoordinator:
                 "and report completion to the control plane. Do not merge."
             )
         )
+        resolved_inputs = (
+            artifact_inputs
+            if artifact_inputs is not None
+            else self._resolve_artifacts(job)[0]
+        )
+        resolved_operation = (
+            operation if operation is not None else self._resolve_artifacts(job)[1]
+        )
+        typed_operation = self._is_operation_workspace(workspace)
         return ExecutionContract(
             job_id=job.id,
             objective=job.objective,
@@ -1001,7 +1739,9 @@ class SchedulerCoordinator:
             acceptance_criteria=job.acceptance_criteria,
             dependency_results=dependency_results,
             role="implementation worker",
-            allowed_filesystem_scope=(workspace.working_directory,),
+            allowed_filesystem_scope=(
+                () if typed_operation else (workspace.working_directory,)
+            ),
             checkpoint_expectations=checkpoint_expectations,
             coordination_mechanisms=(
                 "get_assignment",
@@ -1020,7 +1760,99 @@ class SchedulerCoordinator:
                 if (latest := self._store.latest_checkpoint(job.id)) is not None
                 else None
             ),
+            artifact_inputs=resolved_inputs,
+            artifact_outputs=job.artifact_outputs,
+            operation=resolved_operation,
         )
+
+    def _resolve_artifacts(
+        self,
+        job: Job,
+    ) -> tuple[
+        tuple[ArtifactRef, ...],
+        BuildImageOperation | DeployImageOperation | None,
+    ]:
+        """Bind every selector/ref to verified append-only ledger provenance."""
+
+        ledger = tuple(self._store.list_artifacts())
+
+        def resolve(value: ArtifactInput) -> ArtifactRef:
+            if isinstance(value, ArtifactRef):
+                matches = [
+                    item for item in ledger if item.ref == value and item.verified
+                ]
+                if not matches:
+                    raise _ArtifactUnavailable(
+                        f"Job {job.id} is waiting for a verified immutable artifact"
+                    )
+                # Several producer jobs may legitimately converge on the same
+                # content-addressed Git/OCI value. Direct refs resolve to the
+                # value, not to one arbitrary provenance row.
+                return value
+            else:
+                matches = [
+                    item
+                    for item in ledger
+                    if item.producer_job_id == value.producer_job_id
+                    and item.spec_name == value.spec_name
+                    and item.ref.kind is value.kind
+                    and item.verified
+                ]
+            if len(matches) != 1:
+                raise _ArtifactUnavailable(
+                    f"Job {job.id} is waiting for one verified immutable artifact"
+                )
+            return matches[0].ref
+
+        resolved_inputs = tuple(resolve(value) for value in job.artifact_inputs)
+        operation = job.operation
+        if isinstance(operation, BuildImageOperation):
+            operation = replace(operation, source_input=resolve(operation.source_input))
+        elif isinstance(operation, DeployImageOperation):
+            operation = replace(operation, image_input=resolve(operation.image_input))
+            # Configuration revisions are direct immutable inputs too, even
+            # though the operation keeps the field separate for type clarity.
+            resolve(operation.config_revision)
+        return resolved_inputs, operation
+
+    @staticmethod
+    def _operation_workspace(
+        job: Job,
+        placement: Placement,
+        backend: WorkerBackend | None,
+    ) -> WorkspaceLease:
+        backend_name = backend.capabilities().name if backend is not None else "direct"
+        return WorkspaceLease(
+            id=f"operation-workspace:{new_id()}",
+            job_id=job.id,
+            repository=job.repository,
+            branch=f"agentd/remote/{job.id}",
+            working_directory=f"worker://{placement.node_id}/{job.id}",
+            base_ref=job.base_ref,
+            environment={},
+            runtime_namespace=f"operation:{backend_name}",
+        )
+
+    @staticmethod
+    def _is_operation_workspace(workspace: WorkspaceLease) -> bool:
+        return bool(
+            workspace.runtime_namespace
+            and workspace.runtime_namespace.startswith("operation:")
+        )
+
+    def _release_operation_workspace(
+        self,
+        workspace: WorkspaceLease,
+    ) -> WorkspaceLease:
+        if workspace.state is WorkspaceState.RELEASED:
+            return workspace
+        released = replace(
+            workspace,
+            state=WorkspaceState.RELEASED,
+            released_at=utc_now(),
+        )
+        self._store.save_workspace(released, expected=workspace)
+        return released
 
     async def _prepare_recovery_workspace(
         self,
@@ -1100,7 +1932,7 @@ class SchedulerCoordinator:
         run: RunRecord,
         capsule: ResumeCapsule,
     ) -> ResumeCapsule:
-        if capsule.commit is not None:
+        if capsule.commit is not None or run.contract.operation is not None:
             return capsule
         workspace = self._store.get_workspace(run.workspace_id)
         return replace(capsule, commit=self._workspaces.current_commit(workspace))
@@ -1110,10 +1942,94 @@ class SchedulerCoordinator:
         run: RunRecord,
         result: RunResult,
     ) -> RunResult:
-        if result.commit is not None:
+        if run.contract.operation is not None:
             return result
-        workspace = self._store.get_workspace(run.workspace_id)
-        return replace(result, commit=self._workspaces.current_commit(workspace))
+        return self._trusted_workspace_result(run, result)
+
+    def _completion_artifacts(
+        self,
+        job: Job,
+        run: RunRecord,
+    ) -> tuple[ArtifactRecord, ...]:
+        """Validate declared outputs and construct one atomic ledger batch."""
+
+        if run.result is None:
+            raise LifecycleError(f"Run {run.id} has no result to publish")
+        produced = run.result.produced_artifacts
+        if job.state is not JobState.COMPLETED:
+            return ()
+        expected = {spec.name: spec for spec in job.artifact_outputs}
+        actual = {item.spec_name: item for item in produced}
+        if set(actual) != set(expected):
+            missing = sorted(set(expected) - set(actual))
+            unexpected = sorted(set(actual) - set(expected))
+            raise LifecycleError(
+                "Completed run outputs do not match the declared artifact slots "
+                f"(missing={missing}, unexpected={unexpected})"
+            )
+        for name, item in actual.items():
+            if item.ref.kind is not expected[name].kind:
+                raise LifecycleError(
+                    f"Artifact output {name!r} has kind {item.ref.kind.value!r}; "
+                    f"expected {expected[name].kind.value!r}"
+                )
+            if item.ref.kind is ArtifactKind.GIT_COMMIT:
+                if run.result.commit is None:
+                    raise LifecycleError(
+                        f"Artifact output {name!r} has no trusted workspace commit"
+                    )
+                trusted_ref = ArtifactRef(
+                    ArtifactKind.GIT_COMMIT,
+                    run.result.commit.lower(),
+                )
+                if item.ref != trusted_ref:
+                    raise LifecycleError(
+                        f"Artifact output {name!r} does not match the trusted "
+                        "workspace commit"
+                    )
+
+        image_outputs = [
+            item for item in actual.values() if item.ref.kind is ArtifactKind.OCI_IMAGE
+        ]
+        if image_outputs:
+            operation = run.contract.operation
+            if not isinstance(operation, BuildImageOperation):
+                raise LifecycleError(
+                    "OCI artifact outputs require a typed Build operation"
+                )
+            backend = self._backend_for_run(run)
+            features = (
+                backend.capabilities().features
+                if backend is not None and backend.capabilities().remote
+                else self._drivers.get(run.driver).capabilities().features
+            )
+            if ARTIFACT_VERIFICATION_FEATURE not in features:
+                raise LifecycleError(
+                    "Build output cannot be published without trusted artifact "
+                    "verification"
+                )
+            for item in image_outputs:
+                repository, _, _digest = item.ref.value.partition("@")
+                if repository != operation.registry_repository:
+                    raise LifecycleError(
+                        f"Artifact output {item.spec_name!r} targets repository "
+                        f"{repository!r}; expected {operation.registry_repository!r}"
+                    )
+        published_at = run.ended_at or utc_now()
+        return tuple(
+            ArtifactRecord(
+                id=f"artifact:{run.id}:{name}",
+                ref=actual[name].ref,
+                producer_job_id=job.id,
+                producer_run_id=run.id,
+                spec_name=name,
+                verified=True,
+                verified_at=published_at,
+                created_at=published_at,
+                metadata=actual[name].metadata,
+            )
+            for name in sorted(expected)
+        )
 
     @staticmethod
     def _review_handoff_result(result: RunResult) -> RunResult:
@@ -1143,7 +2059,10 @@ class SchedulerCoordinator:
             WorkspaceState.RETAINED,
         }:
             try:
-                self._release_workspace(workspace, retain_on_failure=True)
+                if self._is_operation_workspace(workspace):
+                    self._release_operation_workspace(workspace)
+                else:
+                    self._release_workspace(workspace, retain_on_failure=True)
             except BaseException as error:
                 errors.append(error)
 
@@ -1268,7 +2187,7 @@ class SchedulerCoordinator:
                 job, placement
             ):
                 continue
-            backend = self._select_backend(placement.node_id)
+            backend = self._select_backend(placement.node_id, job)
             if self._backends is not None and backend is None:
                 continue
             placements.append((placement, backend))
@@ -1423,6 +2342,7 @@ class SchedulerCoordinator:
         snapshot: ProviderQuotaSnapshot | None,
         *,
         at: datetime,
+        observation: RunObservation | None = None,
     ) -> None:
         reservation = self._store.get_reservation(run.reservation_id)
         consumed = sum(item.consumed for item in self._store.list_reservations(job.id))
@@ -1492,6 +2412,32 @@ class SchedulerCoordinator:
             )
             if provider_command is not None:
                 self._store.enqueue_run_command(provider_command)
+            stop_command = provider_stop_command(
+                snapshot,
+                run_id=run.id,
+                at=at,
+                policy=self._provider_stop_policy,
+                account_policy=self._account_policy,
+            )
+            if stop_command is not None and not self._job_has_command(
+                job.id,
+                stop_command.id,
+            ):
+                self._store.enqueue_run_command(stop_command)
+
+        tail = tail_governor_command(
+            job,
+            run,
+            at=at,
+            observation=observation,
+        )
+        if tail is not None:
+            _decision, tail_command = tail
+            if tail_command is not None and not self._job_has_command(
+                job.id,
+                tail_command.id,
+            ):
+                self._store.enqueue_run_command(tail_command)
 
         reached_at = self._first_hard_cap_at(job)
         if reached_at is not None and at >= reached_at + self._hard_cap_grace:
@@ -1758,7 +2704,10 @@ class SchedulerCoordinator:
         result: RunResult,
     ) -> RunResult:
         workspace = self._store.get_workspace(run.workspace_id)
-        current = self._workspaces.current_commit(workspace)
+        current = ArtifactRef(
+            ArtifactKind.GIT_COMMIT,
+            self._workspaces.current_commit(workspace).lower(),
+        ).value
         if result.commit is None or result.commit == current:
             return replace(result, commit=current)
         return replace(
@@ -1776,7 +2725,10 @@ class SchedulerCoordinator:
         result: RunResult,
     ) -> RunResult:
         workspace = self._store.get_workspace(run.workspace_id)
-        commit = self._workspaces.commit_changes(workspace)
+        commit = ArtifactRef(
+            ArtifactKind.GIT_COMMIT,
+            self._workspaces.commit_changes(workspace).lower(),
+        ).value
         if workspace.commit != commit:
             self._store.save_workspace(
                 replace(workspace, commit=commit),
@@ -1837,11 +2789,35 @@ class SchedulerCoordinator:
             for command in self._store.list_run_commands(run.id)
         )
 
-    def _select_backend(self, node_id: str) -> WorkerBackend | None:
+    def _select_backend(self, node_id: str, job: Job) -> WorkerBackend | None:
         if self._backends is None:
             return None
         compatible = self._backends.compatible(self._store.get_node(node_id))
-        return compatible[0] if compatible else None
+        for backend in compatible:
+            capabilities = backend.capabilities()
+            if capabilities.remote and job.operation is None:
+                # A remote code harness also needs an authenticated remote
+                # source/workspace lifecycle.  This MVP's distributed path is
+                # deliberately artifact-centric; never hand a controller-local
+                # worktree path to a remote process.
+                continue
+            if (
+                capabilities.remote
+                and isinstance(job.operation, BuildImageOperation)
+                and (
+                    "build-image" not in capabilities.features
+                    or ARTIFACT_VERIFICATION_FEATURE not in capabilities.features
+                )
+            ):
+                continue
+            if (
+                capabilities.remote
+                and isinstance(job.operation, DeployImageOperation)
+                and "deploy-image" not in capabilities.features
+            ):
+                continue
+            return backend
+        return None
 
     def _release_workspace(
         self,

@@ -7,15 +7,15 @@ newer attempt for the same job.
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from threading import RLock
 
-from agentd.domain.enums import JobState, RunState
+from agentd.domain.enums import AgentRequestKind, JobState, RunState
 from agentd.domain.models import (
+    AgentRequestRecord,
     Checkpoint,
     ExecutionContract,
     Job,
@@ -39,27 +39,9 @@ class AgentAPIInvariantError(RuntimeError):
     """Raised when the control plane returns data for a different run or job."""
 
 
-class AgentRequestKind(StrEnum):
-    REFINEMENT = "refinement"
-    BLOCKER = "blocker"
-
-
 class AgentAction(StrEnum):
     REVIEW_REQUESTED = "review-requested"
     COMPLETE = "complete"
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRequestRecord:
-    """A bounded in-process audit record for requests without a durable port."""
-
-    request_id: str
-    sequence: int
-    run_id: str
-    kind: AgentRequestKind
-    message: str
-    created_at: datetime
-    retryable: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +65,9 @@ class CheckpointResult:
 class AgentAPI:
     """Worker-scoped protocol facade over the authoritative ``ControlPlane``.
 
-    Refinement and blocker requests have no generic durable event repository in
-    the MVP. They are therefore returned to the caller and retained in a bounded,
-    timestamped in-memory log. Checkpoints and lifecycle actions continue through
-    the control plane and use its durable audit mechanisms.
+    Refinement and blocker requests are append-only records in the control-plane
+    store. The history limit only bounds returned records; it never drops durable
+    messages. Checkpoints and lifecycle actions continue through the control plane.
     """
 
     def __init__(
@@ -103,13 +84,10 @@ class AgentAPI:
         if max_message_length <= 0:
             raise ValueError("Maximum message length must be positive")
         self._control_plane = control_plane
+        self._max_request_records = max_request_records
         self._max_message_length = max_message_length
         self._clock = clock
         self._id_factory = id_factory
-        self._request_records: deque[AgentRequestRecord] = deque(
-            maxlen=max_request_records
-        )
-        self._next_sequence = 1
         self._records_lock = RLock()
 
     def get_assignment(self, run_id: str) -> ExecutionContract:
@@ -211,13 +189,14 @@ class AgentAPI:
         )
 
     def request_history(self, run_id: str) -> tuple[AgentRequestRecord, ...]:
-        """Return only this authenticated run's retained in-memory requests."""
+        """Return the newest durable requests in chronological order."""
 
         self._known_run(run_id)
-        with self._records_lock:
-            return tuple(
-                record for record in self._request_records if record.run_id == run_id
+        return tuple(
+            self._control_plane.store.list_agent_requests(
+                run_id, limit=self._max_request_records
             )
+        )
 
     def _known_run(self, run_id: str) -> RunRecord:
         if not run_id.strip():
@@ -273,19 +252,19 @@ class AgentAPI:
             raise ValueError("Agent request message cannot be empty")
         if len(normalized) > self._max_message_length:
             raise ValueError("Agent request message exceeds the configured limit")
+        run = self._known_run(run_id)
         with self._records_lock:
             record = AgentRequestRecord(
                 request_id=self._id_factory(),
-                sequence=self._next_sequence,
-                run_id=run_id,
+                sequence=0,
+                run_id=run.id,
                 kind=kind,
                 message=normalized,
                 created_at=self._clock(),
                 retryable=retryable,
+                job_id=run.job_id,
             )
-            self._next_sequence += 1
-            self._request_records.append(record)
-        return record
+            return self._control_plane.store.append_agent_request(record)
 
     @staticmethod
     def _verify_checkpoint(checkpoint: Checkpoint, run: RunRecord) -> None:
