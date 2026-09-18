@@ -112,3 +112,14 @@ and immediately before branch push or PR creation, so an observed revocation
 during a long validation or after a push blocks subsequent effects. Authorization
 uses the latest controller snapshot: GitHub edits not yet polled, or an external
 edit racing an in-flight request, cannot be atomically fenced by GitHub's API.
+
+Validation cannot write `.git`: both supplied OS runners protect that metadata
+separately from writable source files. The finalizer additionally copies trusted
+Git metadata outside the validation filesystem grants before execution and uses
+that copy for its post-validation content check. It never consults a
+validation-controlled config or index afterward; otherwise a forged fsmonitor
+hook could execute with publisher privileges, or an assume-unchanged index bit
+could hide source edits. Trusted Git invocations disable fsmonitor, and the
+post-check disables external diff/text conversion and submodule traversal.
+Regression tests exercise both attacks and the real sandbox probe now verifies
+Git metadata writes are denied.
