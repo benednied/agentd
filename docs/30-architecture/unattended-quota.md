@@ -31,8 +31,11 @@ admission is blocked; unknown or stale provider capacity cannot authorize a top-
 Managed executions reuse the existing durable governor: nonurgent work checkpoints
 at 90% provider usage, provider remaining capacity at or below 2% interrupts,
 and cumulative job usage checkpoints at 90% of maximum and interrupts after the
-configured hard-cap grace. These commands retain run identity and stable command
-IDs across controller restarts. Typed coding integrations must route their trusted
+configured hard-cap grace. These are observed-usage stop thresholds; provider
+batches and in-flight work may overshoot the maximum. The controller accounts the
+entire trusted usage and coding evidence flags a terminal overshoot. See
+[quota behavior](../20-using-agentd/quotas.md). These commands retain run identity
+and stable command IDs across controller restarts. Typed coding integrations must route their trusted
 observations through the same governor and deliver its checkpoint/interrupt
 commands; a successful dispatch gate alone does not implement active-run policing.
 Interactive/blocker jobs retain the separately configured account policy and

@@ -71,7 +71,7 @@ only digest-pinned OCI refs and has no output slots.
 | `review` | `float`, `0` | Expected review-path quota. |
 | `repair` | `float`, `0` | Expected repair-path quota. |
 | `validation` | `float`, `0` | Expected validation-path quota. |
-| `maximum` | `float \| None`, `None` | Cumulative hard ceiling. If present it must be at least `expected_path`. |
+| `maximum` | `float \| None`, `None` | Cumulative observed-usage stop threshold; provider batches can overshoot. If present it must be at least `expected_path`. |
 | `pool_id` | `str`, `"default"` | Quota pool from which the reservation is drawn. |
 | `unit` | `QuotaUnit`, `QuotaUnit.ABSTRACT` | Dimension of all budget amounts. |
 
