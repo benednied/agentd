@@ -1176,6 +1176,9 @@ class SchedulerCoordinator:
         # worker status query (which could now report ``known=False``) is
         # needed to finish the same idempotent completion path.
         if run.result is not None:
+            normalized = self._normalize_coding_usage(run, run.result)
+            if normalized != run.result:
+                self._store.save_run(replace(run, result=normalized), expected=run)
             return await self.complete(run.job_id)
 
         backend = self._backend_for_run(run)
@@ -1231,9 +1234,23 @@ class SchedulerCoordinator:
                     metadata={"error_type": type(error).__name__},
                 )
 
+        result = self._normalize_coding_usage(run, result)
         collected = replace(run, result=result)
         self._store.save_run(collected, expected=run)
         return await self.complete(run.job_id)
+
+    @staticmethod
+    def _normalize_coding_usage(run: RunRecord, result: RunResult) -> RunResult:
+        # SDK terminal payloads can carry valid token usage while their generic
+        # consumed_quota field remains zero. After a worker restart there may
+        # be no live observation stream to charge the missing final delta.
+        if (
+            isinstance(run.contract.operation, CodingOperation)
+            and result.metadata.get("telemetry_valid") is True
+            and result.usage is not None
+        ):
+            return replace(result, consumed_quota=float(result.usage.total_tokens))
+        return result
 
     async def checkpoint(
         self,
