@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -209,7 +210,17 @@ def _run(
 
 def _git(repository: Path, *args: str, env: dict[str, str] | None = None) -> str:
     result = _run(
-        ("git", "-c", "core.hooksPath=/dev/null", "-C", str(repository), *args), env=env
+        (
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(repository),
+            *args,
+        ),
+        env=env,
     )
     if result.returncode:
         # Git diagnostics can contain credential-bearing remote URLs.
@@ -357,6 +368,9 @@ class BubblewrapValidationRunner:
                 "--bind",
                 str(cwd),
                 "/workspace",
+                "--ro-bind-try",
+                str(cwd / ".git"),
+                "/workspace/.git",
                 "--chdir",
                 "/workspace",
                 "--setenv",
@@ -426,6 +440,7 @@ class MacOSSandboxValidationRunner:
                 f"(subpath {json.dumps(str(path.resolve()))})"
                 for path in (cwd, Path(scratch))
             )
+            git_metadata = json.dumps(str((cwd / ".git").resolve()))
             profile = (
                 "(version 1)(deny default)"
                 "(allow process-exec process-fork)"
@@ -435,6 +450,7 @@ class MacOSSandboxValidationRunner:
                 '(literal "/dev/null") (literal "/dev/urandom") '
                 '(literal "/private/etc/localtime"))'
                 f'(allow file-write* {writable} (literal "/dev/null"))'
+                f"(deny file-write* (subpath {git_metadata}))"
                 '(allow sysctl-read (sysctl-name "hw.ncpu") '
                 '(sysctl-name "hw.activecpu") (sysctl-name "hw.memsize") '
                 '(sysctl-name "hw.pagesize") (sysctl-name "kern.osrelease") '
@@ -535,6 +551,10 @@ class TrustedFinalizer:
                 env=env,
             )
             _git(checkout, "checkout", "--detach", intent.result_commit, env=env)
+            # Never execute trusted Git against metadata writable by validation.
+            # A forged core.fsmonitor hook would otherwise escape containment.
+            trusted_git = root / "trusted.git"
+            shutil.copytree(checkout / ".git", trusted_git)
             evidence = []
             for command in intent.validation_commands:
                 try:
@@ -568,13 +588,26 @@ class TrustedFinalizer:
                     )
                 if evidence[-1]["returncode"] != 0:
                     return evidence
-            # Validation that changes tracked content or HEAD cannot attest the
-            # recorded commit, even if its commands exited zero.
-            if _git(
-                checkout, "rev-parse", "HEAD", env=env
-            ) != intent.result_commit or _git(
-                checkout, "status", "--porcelain", "--untracked-files=no", env=env
-            ):
+            # Inspect content using metadata outside the sandbox's writable
+            # grants. Do not consult validation-controlled config, hooks, index,
+            # replacement refs or nested submodule repositories after execution.
+            try:
+                _git(
+                    checkout,
+                    "--git-dir",
+                    str(trusted_git),
+                    "--work-tree",
+                    str(checkout),
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                    "--quiet",
+                    intent.result_commit,
+                    "--",
+                    env=env,
+                )
+            except PublicationError:
                 evidence.append(
                     {
                         "commit": intent.result_commit,
