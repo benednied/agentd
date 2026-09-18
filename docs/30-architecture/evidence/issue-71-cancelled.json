@@ -76,5 +76,11 @@
   "publication": null,
   "controller_commit": "7671eb9a2d86c98524570f38add8286335e642c8",
   "initial_worker_commit": "509dd775c90d7831cb45efd3b163e0df25a72638",
-  "recovery_worker_commit": "b16f6c696e421afe01d1ba8799aedf2778a4cb9d"
+  "recovery_worker_commit": "b16f6c696e421afe01d1ba8799aedf2778a4cb9d",
+  "cleanup": {
+    "dedicated_worker_stopped": true,
+    "dedicated_tunnel_absent": true,
+    "journals_and_workspace_retained": true,
+    "production_service_modified": false
+  }
 }
