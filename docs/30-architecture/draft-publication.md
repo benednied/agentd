@@ -104,3 +104,11 @@ passed both the containment probe and exact-result validation using system Pytho
 and `git diff --check`. Repeat with
 `tools/qualify_publication_sandbox.py --runner macos --python /usr/bin/python3`.
 Missing or denied OS sandbox support fails closed.
+
+Callers can supply `authorization_check` to `DraftPublisher.publish`. The trusted
+callback must re-read the current job, source eligibility/revision and run
+ownership and raise when authorization was revoked. It runs after validation
+and immediately before branch push or PR creation, so an observed revocation
+during a long validation or after a push blocks subsequent effects. Authorization
+uses the latest controller snapshot: GitHub edits not yet polled, or an external
+edit racing an in-flight request, cannot be atomically fenced by GitHub's API.

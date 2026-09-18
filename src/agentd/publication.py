@@ -16,7 +16,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -607,6 +607,8 @@ class DraftPublisher:
         intent: PublicationIntent,
         collected: CollectedCodingResult,
         repository: Path,
+        *,
+        authorization_check: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         collected.verify(intent)
         with self.store.locked():
@@ -627,6 +629,8 @@ class DraftPublisher:
                 )
                 if not valid:
                     raise PublicationError("Trusted validation failed")
+            if authorization_check is not None:
+                authorization_check()
             head = self.adapter.branch_commit(intent)
             if head is not None and head != intent.result_commit:
                 raise PublicationError(
@@ -637,6 +641,8 @@ class DraftPublisher:
                     raise PublicationPending(
                         "PR creation and branch ownership unresolved"
                     )
+                if authorization_check is not None:
+                    authorization_check()
                 self.store.save(intent, "push_requested")
                 self.adapter.push(intent, repository)
                 if self.adapter.branch_commit(intent) != intent.result_commit:
@@ -647,6 +653,8 @@ class DraftPublisher:
                 # not proof it failed. Never blindly replay a non-idempotent POST.
                 if state["stage"] == "create_requested":
                     raise PublicationPending("PR creation ownership remains unresolved")
+                if authorization_check is not None:
+                    authorization_check()
                 self.store.save(intent, "create_requested")
                 pr = self.adapter.create_draft(intent, self._body(intent))
             self._verify_pr(intent, pr)
