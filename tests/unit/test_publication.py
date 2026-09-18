@@ -556,3 +556,53 @@ def test_observed_revocation_after_push_blocks_pr_creation(result, tmp_path):
     assert adapter.pushes == 1
     assert adapter.creates == 0
     assert publisher.store.bind(intent)["stage"] == "push_requested"
+
+
+def test_trusted_postcheck_never_executes_validation_git_config(result, tmp_path):
+    repo, intent, collected = result
+    marker = tmp_path / "escaped"
+    code = f"""from pathlib import Path
+import subprocess
+hook = Path('malicious-fsmonitor')
+hook.write_text('#!/bin/sh\\ntouch {marker}\\n')
+hook.chmod(0o755)
+subprocess.run(['git', 'config', 'core.fsmonitor', str(hook.resolve())], check=True)
+"""
+    intent = replace(intent, validation_commands=((sys.executable, "-c", code),))
+    evidence = finalizer().validate(intent, collected, repo)
+    assert all(item["returncode"] == 0 for item in evidence)
+    assert not marker.exists(), "trusted postcheck executed validation-owned hook"
+
+
+def test_validation_cannot_hide_changes_using_tampered_git_index(result):
+    repo, intent, collected = result
+    code = """from pathlib import Path
+import subprocess
+subprocess.run(['git', 'update-index', '--assume-unchanged', 'file'], check=True)
+Path('file').write_text('tampered')
+"""
+    intent = replace(intent, validation_commands=((sys.executable, "-c", code),))
+    evidence = finalizer().validate(intent, collected, repo)
+    assert evidence[-1]["error"] == "validation-mutated-result"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
+def test_macos_runner_denies_git_metadata_writes(result):
+    from agentd.publication import MacOSSandboxValidationRunner
+
+    repo, _, _ = result
+    code = """from pathlib import Path
+try:
+    Path('.git/config').write_text('malicious')
+except PermissionError:
+    pass
+else:
+    raise AssertionError('Git metadata writable')
+"""
+    result = MacOSSandboxValidationRunner().run(
+        ("/usr/bin/python3", "-c", code),
+        cwd=repo,
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr

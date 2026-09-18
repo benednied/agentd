@@ -30,10 +30,18 @@ def main() -> None:
         root = Path(temp)
         checkout = root / "checkout"
         checkout.mkdir()
+        (checkout / ".git").mkdir()
+        (checkout / ".git" / "config").write_text("trusted metadata")
         secret = root / "outside-secret"
         secret.write_text("synthetic-probe-secret")
         code = f"""import os, pathlib, socket
 assert 'GH_TOKEN' not in os.environ
+try:
+    pathlib.Path('.git/config').write_text('untrusted')
+except OSError:
+    pass
+else:
+    raise AssertionError('Git metadata was writable')
 try:
     pathlib.Path({str(secret)!r}).read_text()
 except (PermissionError, FileNotFoundError):
