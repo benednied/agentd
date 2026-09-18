@@ -127,4 +127,68 @@ def test_worker_envelope_records_real_usage_without_admitting_jobs(
     assert application.pool.id == "execution-envelope:run"
     assert application.pool.provider == "controller-execution-envelope"
     assert application.reservation.consumed == 20
+    from dataclasses import replace
+
+    from agentd.state.base import EntityNotFoundError
+
+    second = replace(
+        contract,
+        job_id="job-2",
+        operation=CodingOperation(replace(order, job_id="job-2")),
+    )
+    first_node = store.get_node("worker-local")
+    asyncio.run(driver.start_managed("run-2", second))
+    assert store.get_node("worker-local") == first_node
+    assert len(store.list_nodes()) == 1
+    assert store.get_quota_pool("execution-envelope:run").remaining == 180
+    assert store.get_reservation(application.reservation.id).consumed == 20
+
+    from agentd.domain.enums import JobState
+    from agentd.domain.models import StateTransition
+
+    # Reproduce the old partial state left at save_node, before any SDK call.
+    legacy_order = replace(order, job_id="legacy-job")
+    legacy_job = replace(
+        store.get_job("job"),
+        id=legacy_order.job_id,
+        quota_budget=replace(
+            store.get_job("job").quota_budget, pool_id="execution-envelope:legacy-run"
+        ),
+    )
+    store.create_job(
+        legacy_job,
+        StateTransition(legacy_job.id, None, JobState.RUNNING, "legacy setup"),
+    )
+    legacy_lease = replace(
+        store.get_workspace("run"), id="legacy-run", job_id=legacy_job.id
+    )
+    store.save_workspace(legacy_lease, expected=None)
+    proof = driver.prove_preparation_failure("legacy-run", legacy_order, legacy_lease)
+    assert proof.metadata["provider_started"] is False
+    assert proof.consumed_quota == proof.usage.total_tokens == 0
+    assert store.get_workspace("legacy-run") == legacy_lease
+    with pytest.raises(OperationError, match="cannot be ruled out"):
+        driver.prove_preparation_failure("run", order, store.get_workspace("run"))
+
+    def fail_run_insert(*args, **kwargs):
+        raise RuntimeError("forced failure after all preparation inserts")
+
+    monkeypatch.setattr(store, "_save_run_in_transaction", fail_run_insert)
+    third = replace(
+        contract,
+        job_id="job-3",
+        operation=CodingOperation(replace(order, job_id="job-3")),
+    )
+    with pytest.raises(coding_runtime.CodingPreparationError):
+        asyncio.run(driver.start_managed("run-3", third))
+    for lookup, identity in (
+        (store.get_job, "job-3"),
+        (store.get_run, "run-3"),
+        (store.get_workspace, "run-3"),
+        (store.get_quota_pool, "execution-envelope:run-3"),
+    ):
+        with pytest.raises(EntityNotFoundError):
+            lookup(identity)
+    assert len(store.list_nodes()) == 1
+    assert store.get_quota_pool("execution-envelope:run").remaining == 180
     store.close()
