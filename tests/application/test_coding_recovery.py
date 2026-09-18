@@ -347,3 +347,25 @@ def test_progress_cursor_without_new_usage_does_not_double_charge(tmp_path):
             assert rig.store.get_quota_pool("account").remaining == 988
 
     asyncio.run(scenario())
+
+
+def test_worker_terminal_result_recovers_without_live_observation_handle(tmp_path):
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            await rig.coordinator.reconcile_managed_runs()
+            rig.provider.finished.set()
+            await rig.worker.collect(rig.worker._runs[run.id].handle)
+            # Simulate the worker process losing all live handles. Its journal
+            # and terminal result remain authoritative, as in a real restart.
+            rig.server._service._runs.clear()
+            rig.worker._runs.clear()
+            await rig.reopen_controller()
+            await rig.coordinator.reconcile_managed_runs()
+            assert rig.store.get_job(rig.job.id).state is JobState.CANCELLED
+            assert rig.store.get_run(run.id).result.consumed_quota == 12
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert rig.provider.starts == len(rig.store.list_runs(rig.job.id)) == 1
+
+    asyncio.run(scenario())
