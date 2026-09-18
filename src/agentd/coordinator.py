@@ -952,9 +952,26 @@ class SchedulerCoordinator:
             driver = self._drivers.get(run.driver)
             if self._is_typed_operation_run(run, driver):
                 try:
-                    if isinstance(run.contract.operation, CodingOperation):
-                        await self._reconcile_coding_policy(job, run, snapshot, at=now)
-                    finalized_job = await self._reconcile_operation_run(run)
+                    status = None
+                    if (
+                        isinstance(run.contract.operation, CodingOperation)
+                        and run.result is None
+                    ):
+                        # A restarted worker may have durable terminal evidence
+                        # but no live handle for OBSERVE or policy commands.
+                        status = await self._operation_status(run)
+                        if (
+                            status.get("known") is True
+                            and status.get("terminal") is False
+                        ):
+                            await self._reconcile_coding_policy(
+                                job, run, snapshot, at=now
+                            )
+                            # A stop can have completed during policy delivery.
+                            status = None
+                    finalized_job = await self._reconcile_operation_run(
+                        run, status=status
+                    )
                     if finalized_job is not None:
                         finalized.append(finalized_job)
                 except BaseException as error:
