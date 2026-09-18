@@ -11,7 +11,8 @@ is introduced.
 
 The worker independently checks the profile digest/version, repository, harness,
 account binding, capabilities and runtime limits. It materializes a detached Git
-worktree at the exact base SHA in a lease unique to the durable run ID. It
+worktree at the exact base SHA in a lease unique to the durable run ID. The
+existing GitWorkspaceManager owns the editing branch and trusted commit capture. It
 rebuilds the local contract and drops the controller environment, filesystem
 scope and publication completion instructions. Repository instructions stay in
 the checked-out tree.
@@ -25,14 +26,17 @@ features are an operator contract, not security enforced by Python feature
 names. The stock Codex SDK driver intentionally does not advertise credential
 isolation; it therefore cannot enable this operation out of the box.
 
-Production enablement requires a demonstrated OS/container boundary plus a
-provider credential broker (or equivalent) such that model tools cannot read
-provider credentials, controller PSKs, SSH identities or publication credentials.
-A sandbox allowing arbitrary host reads or a container with a readable provider
-authentication file is insufficient. Publication credentials belong exclusively
-to the trusted controller finalizer. Infrastructure-specific containment and
-real provider qualification remain open under #64/#66; this increment must not
-be represented as a production-qualified deployment.
+The existing reviewed deployment provides this boundary using its image-pinned
+custom permission profile and audited bubblewrap shim. The trusted bootstrap
+`create_verified_coding_sdk` executes the existing
+`deploy/security/runtime_sandbox_probe.py` before granting credential isolation
+and network-disabled features to that SDK instance. Failure aborts startup. The
+probe checks actual credential/state read denial, sibling workspace isolation,
+outside-write denial and network denial using the pinned SDK's generated command
+path. The factory restricts runtime environment and state to the reviewed
+container layout. A generic SDK elsewhere still has no containment features.
+Publication credentials belong exclusively to the trusted controller finalizer.
+Real provider-backed end-to-end qualification remains tracked in #66.
 
 ## Ownership and reconciliation
 
@@ -60,8 +64,10 @@ and result evidence. There is no remote arbitrary-delete operation.
 ## Trusted result boundary
 
 Model summaries and claimed commit IDs are not validation evidence. On completed
-coding the adapter reads actual Git HEAD, verifies base ancestry and a clean
-workspace, and builds an incremental bundle. Git hooks, fsmonitor and replacement
+coding the adapter requires valid SDK usage evidence, uses the existing trusted
+GitWorkspaceManager to capture edits (the model does not need Git write
+authority), reads actual Git HEAD, verifies base ancestry and a clean workspace,
+and builds an incremental bundle. Git hooks, fsmonitor and replacement
 objects are disabled during trusted collection. The result binds run/job/source
 revision/repository/profile/base/result SHA and bundle SHA-256. Bundles up to
 256 KiB cross the existing authenticated result channel as bounded base64 chunks.
@@ -77,5 +83,13 @@ and capability denial, exact result/bundle collection, cancellation, runtime
 limits, lost start acknowledgement, reconnect, terminal worker restart, unresolved
 ownership, and retention. Existing authenticated worker transport tests cover
 socket reconnect and request replay. Real provider-backed remote qualification,
-provider credential containment, active ownership reattachment and deployment
+active ownership reattachment and deployment
 resource/platform inventory remain necessary before claiming #64/#66 complete.
+
+The verified SDK composition mirrors each controller-admitted work order into the
+existing SQLite run/session/reservation/usage ledger before provider start. Its
+local pool is explicitly a per-run execution envelope, never a provider quota
+snapshot or a second admission policy. The controller remains the sole account
+admission and final accounting authority. Terminal cancellation/failure retains
+observed usage; missing trustworthy usage is marked telemetry-invalid so the
+controller can keep metering unresolved rather than treating it as zero.
