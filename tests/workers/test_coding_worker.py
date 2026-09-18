@@ -379,3 +379,119 @@ def test_live_token_ceiling_cancels_provider(tmp_path):
         assert result.usage.total_tokens == 201
 
     asyncio.run(scenario())
+
+
+class TerminalProvider(Provider):
+    def __init__(self, observation_path):
+        super().__init__()
+        self.observation_path = observation_path
+        self.cancel_calls = 0
+
+    def observe(self, run_id):
+        import json
+
+        from agentd.domain.models import RunObservation
+
+        if not self.observation_path.exists():
+            return None
+        return RunObservation.from_dict(json.loads(self.observation_path.read_text()))
+
+    async def collect(self, run):
+        import json
+
+        from agentd.domain.models import RunObservation, TokenUsage
+
+        result = await super().collect(run)
+        result = replace(
+            result,
+            usage=TokenUsage(input_tokens=201),
+            metadata={"telemetry_valid": True},
+        )
+        observation = RunObservation(
+            run.id,
+            "thread",
+            "turn",
+            "1",
+            terminal=True,
+            usage=result.usage,
+            result=result,
+        )
+        self.observation_path.write_text(json.dumps(observation.to_dict()))
+        return result
+
+    async def cancel(self, run):
+        from agentd.harness.errors import RunNotActiveError
+
+        self.cancel_calls += 1
+        raise RunNotActiveError("already terminal")
+
+
+def test_terminal_usage_crossing_ceiling_never_cancels_completed_turn(tmp_path):
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        provider = TerminalProvider(tmp_path / "observation.json")
+        worker.harnesses["codex"] = provider
+        handle = await worker.start_managed("run", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.COMPLETED
+        assert result.usage.total_tokens == 201
+        assert result.metadata["coding_evidence"]["quota_ceiling_exceeded"] is True
+        assert provider.starts == 1
+        assert provider.cancel_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_restart_finalizes_persisted_provider_terminal_without_recoding(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        provider = TerminalProvider(tmp_path / "observation.json")
+        worker.harnesses["codex"] = provider
+        write = worker._write
+
+        def crash_before_result(path, value):
+            if path.name == "result.json":
+                raise OSError("simulated process loss before result persistence")
+            write(path, value)
+
+        monkeypatch.setattr(worker, "_write", crash_before_result)
+        handle = await worker.start_managed("run", contract)
+        with pytest.raises(OSError):
+            await worker.collect(handle)
+        assert not (worker._lease("run") / "result.json").exists()
+        restarted_provider = TerminalProvider(tmp_path / "observation.json")
+        restarted = CodingHarnessDriver(
+            worker.root,
+            worker.profiles,
+            {"codex": restarted_provider},
+            account_pools=worker.account_pools,
+        )
+        journal = OperationJournal(
+            tmp_path / "recovery.sqlite", node_id="worker", session_epoch="epoch"
+        )
+        assert journal.claim_run(run_id="run", start_hash="a" * 64)
+        service = ExecutionService(DriverRegistry((restarted,)), journal)
+        response = await service.execute(
+            make_request(
+                action="status",
+                request_id="status",
+                node_id="worker",
+                session_epoch="epoch",
+                run_id="run",
+                secret=b"a" * 32,
+            )
+        )
+        assert response.ok and response.payload["terminal"]
+        result = RunResult.from_dict(response.payload["result"])
+        journal.close()
+        assert result.outcome is RunOutcome.COMPLETED
+        assert result.usage.total_tokens == 201
+        assert result.metadata["coding_evidence"]["result_commit"] == result.commit
+        assert await restarted.recover_terminal("run") == result
+        assert restarted_provider.starts == 0
+        assert restarted_provider.cancel_calls == 0
+        assert provider.starts == 1
+
+    asyncio.run(scenario())
