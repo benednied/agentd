@@ -297,6 +297,21 @@ class CodingHarnessDriver:
         result: RunResult,
     ) -> RunResult:
         assert isinstance(execution.operation, CodingOperation)
+        if result.metadata.get("telemetry_valid") is True and result.usage is not None:
+            # The SDK records usage in its worker ledger and returns a zero
+            # scalar to avoid double charging there. Across transport this is a
+            # cumulative final reading; controller release uses max(previous,
+            # final) and must retain it even if the last observation was lost.
+            consumed = float(result.usage.total_tokens)
+            result = replace(
+                result,
+                consumed_quota=max(result.consumed_quota, consumed),
+                metadata={
+                    **result.metadata,
+                    "quota_ceiling_exceeded": consumed
+                    > execution.operation.work_order.maximum_quota,
+                },
+            )
         if result.outcome is RunOutcome.COMPLETED:
             if "live-token-usage" in state.driver.capabilities().features and (
                 result.metadata.get("telemetry_valid") is not True
@@ -420,6 +435,13 @@ class CodingHarnessDriver:
                 summary=summary,
                 commit=None,
                 produced_artifacts=(),
+                consumed_quota=max(
+                    collected.consumed_quota,
+                    float(collected.usage.total_tokens)
+                    if collected.metadata.get("telemetry_valid") is True
+                    and collected.usage is not None
+                    else 0,
+                ),
             )
         observation = state.driver.observe(run_id)
         usage = observation.usage if observation is not None else None
