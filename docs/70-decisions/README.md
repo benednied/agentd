@@ -11,3 +11,5 @@ read as decisions made by the documentation migration.
 - [ADR 0001: SQLite as runtime state](0001-sqlite-as-runtime-state.md)
 - [ADR 0002: Git worktrees for isolation](0002-git-worktrees-for-isolation.md)
 - [ADR 0003: Worker node versus worker backend](0003-worker-node-vs-worker-backend.md)
+- [ADR 0004: Authorized GitHub coding](0004-authorized-github-coding.md)
+- [ADR 0005: Capability-limited remote coding](0005-capability-limited-remote-coding.md)

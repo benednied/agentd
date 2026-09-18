@@ -1,4 +1,7 @@
-# Capability-limited remote coding (issues #50, #60, #64)
+# ADR 0005: Capability-limited remote coding (issues #50, #60, #64)
+
+- Decision date: 2026-09-18
+- Recorded: 2026-09-18
 
 ## Decision
 
@@ -64,8 +67,13 @@ safety over availability; active-turn reattachment is not implemented here.
 Worker session epochs must remain stable for reconnect/restart recovery; epoch
 rotation is an administrative ownership change, not a way to retry claims.
 
-Runtime and cumulative token ceilings cancel the managed harness. Observation
-and usage are forwarded to the existing controller governor. Cancellation does
+Runtime and cumulative token thresholds request cancellation of active work.
+They are not a strict cap on provider spend: batched observations and in-flight
+work can exceed the requested maximum before a stop takes effect. A proven
+terminal success is preserved rather than cancelled retroactively; its full
+usage is retained and collected evidence marks `quota_ceiling_exceeded` when
+appropriate. Observation and usage are forwarded to the existing controller
+governor. Cancellation does
 not delete the lease. A lease is retained after success, failure, cancellation
 or ambiguous setup. Explicit administrative `release(run_id)` is permitted only
 for terminal leases and removes workspace/mirror/bundle while retaining claim
