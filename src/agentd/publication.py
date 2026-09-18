@@ -681,6 +681,7 @@ class DraftPublisher:
             pr.get("headRefName") != intent.branch
             or pr.get("headRefOid") != intent.result_commit
             or pr.get("baseRefName") != intent.base_branch
+            or pr.get("isCrossRepository") is not False
             or not pr.get("isDraft")
             or not pr.get("url")
             or f"<!-- agentd-publication:{intent.branch} -->" not in pr.get("body", "")
@@ -748,7 +749,7 @@ class GitHubPublicationAdapter:
             "--limit",
             "100",
             "--json",
-            "url,headRefName,headRefOid,baseRefName,isDraft,body,state",
+            "url,headRefName,headRefOid,baseRefName,isDraft,isCrossRepository,body,state",
         )
         if len(prs) > 1:
             raise PublicationError("Multiple PRs claim this logical job")
