@@ -34,7 +34,9 @@ and network-disabled features to that SDK instance. Failure aborts startup. The
 probe checks actual credential/state read denial, sibling workspace isolation,
 outside-write denial and network denial using the pinned SDK's generated command
 path. The factory restricts runtime environment and state to the reviewed
-container layout. A generic SDK elsewhere still has no containment features.
+container layout. SDK startup uses an explicit `env -i` launch because the
+pinned SDK otherwise merges host environment into its supplied environment.
+A generic SDK elsewhere still has no containment features.
 Publication credentials belong exclusively to the trusted controller finalizer.
 Real provider-backed end-to-end qualification remains tracked in #66.
 
@@ -46,6 +48,14 @@ turn. Claims survive worker process restart. A completed adapter result is
 fsynced before it becomes visible, then imported into the worker journal on
 STATUS/COLLECT. A terminal result can be collected with a fresh request after
 controller or worker restart.
+
+A completed SDK turn whose adapter result was not yet persisted can be
+reconciled from its durable terminal observation and original claim/workspace
+manifest. This trusted path only collects/commits existing files; it never starts
+or resumes a provider turn. A terminal token sample can exceed the ceiling by
+one provider step; actual usage and the overshoot flag are retained, and an
+already-completed provider is never cancelled. A failed stop acknowledgement
+without terminal proof retains unresolved ownership.
 
 An active run whose process ownership cannot be proven after worker restart
 remains known/nonterminal. It cannot be restarted or cancelled speculatively.
@@ -67,8 +77,11 @@ Model summaries and claimed commit IDs are not validation evidence. On completed
 coding the adapter requires valid SDK usage evidence, uses the existing trusted
 GitWorkspaceManager to capture edits (the model does not need Git write
 authority), reads actual Git HEAD, verifies base ancestry and a clean workspace,
-and builds an incremental bundle. Git hooks, fsmonitor and replacement
-objects are disabled during trusted collection. The result binds run/job/source
+and builds an incremental bundle. Before trusted collection, worker-owned mirror configuration is replaced with
+minimal known policy, so model-modified includes or filter commands are never
+interpreted, including during recovery of older leases. Git hooks, fsmonitor,
+grafts and replacement objects are disabled; trusted Git subprocesses receive
+an explicit environment. The result binds run/job/source
 revision/repository/profile/base/result SHA and bundle SHA-256. Bundles up to
 256 KiB cross the existing authenticated result channel as bounded base64 chunks.
 Larger or invalid results fail collection and retain the lease for inspection.
