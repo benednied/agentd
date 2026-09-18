@@ -115,3 +115,30 @@ def test_openai_client_uses_experimental_permission_profile_wire_fields() -> Non
     serialized = repr(sdk.calls)
     assert "sandboxPolicy" not in serialized
     assert "readOnlyAccess" not in serialized
+
+
+def test_isolated_environment_uses_explicit_clean_launch(monkeypatch):
+    import agentd.harness.app_server as module
+
+    captured = []
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-inherit")
+    monkeypatch.setattr(
+        module, "AsyncCodexClient", lambda config: captured.append(config)
+    )
+    module.OpenAICodexClient(
+        environment={"PATH": "/usr/bin", "CODEX_HOME": "/private/auth"},
+        codex_bin="/pinned/codex",
+        isolated_environment=True,
+    )
+    args = captured[0].launch_args_override
+    assert args == (
+        "/usr/bin/env",
+        "-i",
+        "CODEX_HOME=/private/auth",
+        "PATH=/usr/bin",
+        "/pinned/codex",
+        "app-server",
+        "--listen",
+        "stdio://",
+    )
+    assert not any("GITHUB_TOKEN" in value for value in args)
