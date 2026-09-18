@@ -105,6 +105,7 @@ class Adapter:
             "headRefOid": intent.result_commit,
             "baseRefName": intent.base_branch,
             "isDraft": True,
+            "isCrossRepository": False,
             "body": body,
             "url": "https://github.com/owner/repo/pull/1",
         }
@@ -260,6 +261,7 @@ def test_branch_identity_uses_full_job_digest(result):
     "change",
     [
         {"isDraft": False},
+        {"isCrossRepository": True},
         {"headRefOid": "a" * 40},
         {"baseRefName": "other"},
         {"body": "unowned"},
