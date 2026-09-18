@@ -47,6 +47,12 @@ contains:
 - `source_commit`, `worker_source_commit`, and `evidence_path` for exact build
   and run provenance; and optional `controller_timeout_seconds`.
 
+The optional trusted `background_block_used_percent` setting selects the account
+headroom policy for this controller (default 75; it must remain below the existing
+90% urgent-only boundary). Only an operator can change this setting. It does not
+waive fresh quota evidence, provider exhaustion checks, or finite job limits.
+Qualification evidence records the configured threshold explicitly.
+
 For controlled qualification only, `publication_fault_directory` enables one
 lost-response injection after each successful branch push and draft creation.
 The tool records which real side effect completed, then discards its response.
@@ -67,6 +73,15 @@ identity and session epoch. A controller timeout does not authorize a new run.
 Unknown execution ownership keeps worker capacity reserved. A proven persisted
 terminal SDK result may be collected after worker restart without starting or
 resuming the model; ambiguous active ownership remains unresolved.
+
+Worker-local envelope preparation is atomic and reuses the shared worker node.
+A preparation failure before the provider boundary is terminal with zero usage.
+For legacy partial envelopes, an explicit trusted maintenance call to
+`CodingHarnessDriver.reconcile_preparation_failure` can record failure only after
+the worker is quiescent and the SDK proves both its run and session absent, with
+matching retained job/workspace identities. It requires the deployed source
+revision, retains audit evidence, and never starts a provider. This maintenance
+operation is not exposed through worker STATUS or an issue-controlled API.
 
 ## Validate, publish, and retain evidence
 

@@ -1,123 +1,136 @@
-# First real #60 qualification: stopped run and same-run recovery
+# Issue #66: real remote qualification
 
-## Outcome
+On 2026-09-18, [issue #74](https://github.com/benednied/agentd/issues/74) completed
+the real authorized GitHub issue → remote coding worker → trusted validation →
+draft PR path. The resulting [draft PR #75](https://github.com/benednied/agentd/pull/75)
+remains open for human review. No merge was attempted.
 
-The first real qualification ended **CANCELLED**, with no verified result commit
-and no draft pull request. It demonstrates quota-pressure stopping and recovery
-of one durable execution identity across controller and worker restarts. It does
-**not** establish successful completion of #66's issue-to-draft-PR path.
+## Successful run
 
-The persisted SDK terminal outcome was `CANCELLED`. An earlier interpretation
-mistook a terminal observation for successful completion. Terminal means the turn
-has ended; the separate outcome field determines whether it completed, failed,
-or was cancelled. This record corrects that interpretation.
-
-## Durable identities
-
-| Field | Identity |
+| Evidence | Observed value |
 | --- | --- |
-| Source issue | [benednied/agentd#71](https://github.com/benednied/agentd/issues/71) |
-| Source revision | `fad27d8c2d98629a63e98d87fe86dd2d502b8820a8f94ff5c5ded6d81df2001b` |
-| Logical job | `github-78f43397ecf806c6f340fb66522e1c21` |
-| Execution run | `d0ee6516-7b88-406a-a168-01f21776759d` |
-| Repository base commit | `f7d4f08f280080e14c434293c99034ba06216b6f` |
-| Initial worker implementation | `509dd775c90d7831cb45efd3b163e0df25a72638` |
-| Recovery worker implementation | `b16f6c696e421afe01d1ba8799aedf2778a4cb9d` |
-| Controller implementation | `7671eb9a2d86c98524570f38add8286335e642c8` |
-| Final job state | `CANCELLED` |
-| Result commit / draft PR | None |
+| Approved source revision | `ac67ac634f0c818030c233cb5d79a0384388005468a23780452d7af348321ee5` |
+| Durable logical job | `github-052911929abebf566a669d7c5d4946ce` |
+| Worker run | `46d57b32-3f41-4947-a9d8-aeb90b5f3326` |
+| Pinned base | `f7d4f08f280080e14c434293c99034ba06216b6f` |
+| Result commit | `6bda19b061b33c2eb6ec383f7a1058ebab8585af` |
+| Controller implementation | `ea2ae99f9bbe72c365a502dcb9363af991873c16` |
+| Worker implementation | `40b74fd1ea4a6d84f095ed96986f69e424795930` |
+| Actual provider usage | 62,439 cumulative tokens |
+| Configured stopping/runtime limits | 140,000 tokens / 180 seconds |
+| Run lifecycle elapsed time | 29.938 seconds |
+| Complete first controller invocation | 46.78 seconds, including publication recovery |
+| Final states | Provider/run `COMPLETED`, job `REVIEW`, publication `published` |
+| Result | Exactly one draft PR, #75 |
 
-The source revision above was independently reread from GitHub and recomputed
-using the source adapter; it matched the run's recorded revision and logical job
-identity. Worker and controller commit IDs were resolved from the repository.
+The worker was reached through a dedicated SSH tunnel to the existing reviewed
+Linux runtime. The existing pinned provider SDK ran inside its verified
+credential/filesystem/network boundary. The model left file edits; trusted Git
+capture created the commit and returned bounded authenticated bundle evidence.
+The publisher imported and verified that exact commit in its own object cache.
 
-## Budget and accounting
+Trusted macOS sandbox processes, not model statements, validated the change:
+`git diff --check` returned 0; a separate Python process verified that exactly
+`docs/20-using-agentd/README.md` changed and contained the required paragraph.
+Both stdout/stderr hashes and the exact result commit are retained in the
+[structured evidence](evidence/issue-74-draft.json).
 
-| Field | Observed or configured value |
-| --- | ---: |
-| Configured cumulative token maximum | 60,000 |
-| Configured runtime limit | 240 seconds |
-| Trusted cumulative input tokens | 64,329 |
-| Trusted cumulative output tokens | 681 |
-| Trusted cumulative total tokens | **65,010** |
-| Cached input tokens, already included in input count | 44,288 |
-| Usage above configured maximum | 5,010 |
-| Final durable usage-ledger charge | **65,010** |
+## Real ambiguous publication effects and replay
 
-The provider reported token usage in batches. The quota stop occurred while the
-model was inspecting the repository, before it produced a change. The final
-batch exceeded the configured maximum; the maximum is an observed-usage stop
-threshold, not a guarantee that actual provider spend cannot exceed it. Cached
-input tokens are a subset of input tokens and must not be added to the total.
+The qualification adapter deliberately discarded the response **after** a real
+successful GitHub branch push. The durable publisher subsequently found the
+intended branch at the recorded result commit. It then discarded the response
+**after** real draft creation. The next reconciliation discovered the existing
+intended draft instead of creating another one.
 
-The collected result's `consumed_quota` field was `0`, while its trusted
-usage evidence and the controller's durable usage ledger recorded `65,010`.
-The zero scalar is therefore **not** evidence of zero consumption. Qualification
-reporting uses the trusted usage counters and ledger, preserves this discrepancy,
-and does not truncate the observed charge to the requested maximum.
+A separate fresh controller invocation repeated intake and publication after
+success. It returned the same PR in 3.62 seconds. A direct GitHub lookup found
+exactly one draft at the recorded head/base. A direct SSH inspection found one
+SDK run/session for this issue, already inactive. Coding did not run again during
+either injected failure or the controller replay. The controller contains three
+historical fixture jobs; this successful issue has exactly one logical job and
+one execution run.
 
-## Recovery observations
+## Admission and authority
 
-- Exactly one logical job and one run identity represented this attempt.
-- The live controller was restarted while retaining that job and run.
-- The worker was subsequently restarted and recovered the same durable run.
-- One provider-backed coding execution was launched. Recovery did not start
-  another coding execution or replace the run identity.
-- Terminal cancellation was retained; recovery did not reinterpret it as
-  successful completion or create a replacement implementation.
-- No result commit was captured and no branch/PR publication was attempted for this run.
+The initial default policy correctly held #74 in `READY` when fresh quota reached
+76% used, above the normal 75% background threshold. The operator explicitly
+approved further token spending for this supervised qualification. A trusted
+local controller setting selected an 85% threshold, retaining 15% headroom; fresh
+provider evidence was still required and the 140,000-token/180-second bounds
+remained enforced. The normal 75% default was not changed. Issue text did not
+select the threshold, profile, worker, credentials, QoS, or publication policy.
 
-These are failure-path observations from a real provider-backed execution. They
-support the bounded-stop and no-duplicate-reexecution invariants. They do not
-qualify successful result collection, trusted validation of a changed commit, or
-idempotent draft publication for this attempt.
+The additional finite local allowance was applied once with a durable grant ID.
+Prior usage/debt was retained. No provider reset credit was consumed. The actual
+62,439-token completion was charged once, leaving local remaining quota 82,571,
+reserved quota 0, and the first attempt's debt 5,010. Provider account capacity was
+not inferred from the local allowance. This proves the configured supervised
+slice; it is not a claim that a default-policy run can ignore provider pressure.
 
-## Remaining qualification
+## Earlier failure fixtures and fixes
 
-[Issue #72](https://github.com/benednied/agentd/issues/72) narrows the success case
-to one short README paragraph. It has not been admitted or executed. The first
-local allowance is exhausted; a proposed additional allocation was rejected by
-automatic approval review and requires explicit operator approval. No provider
-quota reset was requested and no additional capacity was written to the ledger.
+- [Issue #71](https://github.com/benednied/agentd/issues/71) quota-cancelled during
+  inspection: 65,010 actual tokens against a 60,000 stopping threshold. One job
+  and run survived real controller and worker restarts without another provider
+  start. No verified result commit/PR was produced. An early interpretation of
+  a terminal flag as successful coding was corrected by the persisted cancelled
+  outcome. Full identities, admission snapshot, reservation, and charges are in
+  [the cancelled-run record](evidence/issue-71-cancelled.json).
+- [Issue #72](https://github.com/benednied/agentd/issues/72) exposed a sequential
+  worker setup bug before any provider call: recreating the shared node with a
+  new timestamp conflicted with its durable identity. Setup is now atomic and
+  reuses the node; failures roll back the entire new envelope. For the legacy
+  claim, an explicit trusted maintenance operation proved absence of an SDK run
+  and session, checked retained job/workspace identities, and recorded a
+  zero-token failure. It neither restarted the claim nor changed its identity.
+  The normal controller then released its reservation. See the
+  [pre-provider failure record](evidence/issue-72-preparation-failed.json).
 
-A successful second attempt must have its own source/job/run identities. It must
-not be represented as a replay of this cancelled attempt. #66 and #60 remain open
-until a real verified result is published as a draft PR and its publication replay
-is demonstrated. Synthetic failure/idempotency tests do not replace that evidence.
+Other real-path fixes prevent charging identical cumulative usage on a new
+progress cursor, collect durable terminal status before requesting a vanished
+live handle, and charge final SDK token usage when its generic quota scalar is
+zero after restart. Git handoff and validation protect against malicious Git
+configuration/hooks/index state. Unknown provider ownership still remains held;
+absence of a live process alone never authorizes a retry.
 
-The [structured record](evidence/issue-71-cancelled.json) was extracted from the
-trusted controller database. It contains no credentials or raw issue prompt.
+## Scenario coverage
 
-## Automated scenario coverage
+The integrated code passed **637 tests in 39.91 seconds** after the sequential
+worker fix. Ruff lint/format and documentation checks pass. The evidence below
+separates actual remote-provider behavior from controlled-provider tests.
 
-The integrated tree at `a2c8a26` passed 636 tests in 36.94 seconds. Ruff lint and
-format checks, documentation checks, and targeted typing passed. Whole-source
-`ty` diagnostics match the baseline exactly (86 existing diagnostics, none added).
-
-| Qualification scenario | Trusted automated evidence |
+| Qualification scenario | Evidence |
 | --- | --- |
-| Full issue-to-draft flow | `tests/application/test_github_coding_pipeline.py`: real Git/authenticated worker transport, controlled provider and GitHub adapter; not a real provider success |
-| Repeated, edited, unauthorized, closed or ineligible intake | `tests/unit/test_github_intake.py`: durable repeat/restart, revision approval, revocation and adversarial-text cases |
-| Unknown/stale/insufficient quota, account sharing | `tests/unit/test_unattended_quota.py`, `tests/application/test_unattended_admission.py` |
-| No compatible idle worker | Coding pipeline integration checks selection waits before dispatch |
-| Lost ACK, reconnect, controller/worker restart, unresolved ownership | `tests/application/test_coding_recovery.py`, `tests/workers/test_coding_worker.py`; real run also exercised both process restarts |
-| Mid-run quota pressure, bounded cancellation | Coding recovery/worker tests; real cancelled run above |
-| Publication failure does not repeat coding | Pipeline integration and `tests/unit/test_publication.py` restart/lost-push/lost-create cases |
-| Failed validation remains diagnosable | Publication tests retain failed evidence and refuse branch/PR publication |
-| Git metadata/credential containment | Worker configuration attack tests and actual macOS/Linux sandbox probes |
+| Real issue → remote coding → draft | #74 → #75, exact identities and process validation above |
+| Repeated intake → one job | Real controller replay; `test_github_intake.py` repeated-poll/restart cases |
+| Insufficient/stale/unknown quota → wait | Real default-policy pressure wait; `test_unattended_quota.py` and `test_unattended_admission.py` |
+| No compatible idle worker → wait | `test_github_coding_pipeline.py` selection checks |
+| Lost worker ACK, reconnect, controller/worker restart | `test_coding_recovery.py`, `test_coding_worker.py`; real #71 process restarts |
+| Mid-run pressure and bounded stop | Real #71; coding recovery/worker cancellation tests |
+| Publication failure without recoding | Real lost push/create responses and fresh controller replay; publication tests |
+| Closed/ineligible source before launch | `test_github_intake.py` closure/removal/revision authorization cases |
+| Validation failure remains diagnosable | `test_publication.py` persisted failed evidence and refused publication |
+| Containment, portable work orders, retention | Actual sandbox probes; Git configuration attack, two-worker-root, and release tests |
 
-## Cleanup and resumption
+## Actual cleanup and retained evidence
 
-The dedicated qualification worker was stopped after terminal collection. Its
-SSH tunnel was verified absent. Controller/worker journals and the isolated
-workspace are retained for diagnosis; no production service was restarted or
-modified. Worker retention behavior is separately tested, including refusal to
-release unresolved ownership and repeatable cleanup retaining terminal evidence.
+After publication and replay, the dedicated test worker and SSH tunnel were
+stopped. The successful run's retention operation was called twice over SSH.
+Its isolated worktrees/mirrors and transfer bundle were removed; its immutable
+result, claim, and worker journal were verified unchanged and retained. The
+controller's imported result ref and GitHub draft remain available. Cleanup
+started no provider calls and did not modify the production service.
 
-For an approved follow-up, preserve the existing controller/account ledger and
-its 65,010-token charge. Grant any additional finite local allowance explicitly;
-do not reset historical consumption or consume provider reset credits implicitly.
-Refresh provider quota, install the trusted profile for #72, start the isolated
-worker with the existing state identity, and explicitly approve the exact new
-source revision. The [operator guide](../40-operations/github-coding.md) describes
-the controller composition and fail-closed recovery rules.
+## Review and operational boundary
+
+Implementation remains in review PRs #67–#70 and #73. The generated draft #75 is
+an output artifact, not permission to merge. The completed slice does not claim
+public API/HA/multi-tenant readiness, or complete #23's unrelated driver matrix.
+Deployment remains limited to the reviewed containment adapter.
+
+See the [operator guide](../40-operations/github-coding.md) for setup and recovery.
+Keep durable journals and claim/result evidence according to retention policy;
+do not erase them to make unresolved ownership appear idle. The token maximum is
+an observed-usage stopping threshold: a provider batch can overshoot it, as #71
+showed. All actual consumption is retained rather than truncated to the threshold.

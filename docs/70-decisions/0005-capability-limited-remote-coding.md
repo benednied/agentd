@@ -41,7 +41,7 @@ container layout. SDK startup uses an explicit `env -i` launch because the
 pinned SDK otherwise merges host environment into its supplied environment.
 A generic SDK elsewhere still has no containment features.
 Publication credentials belong exclusively to the trusted controller finalizer.
-Real provider-backed end-to-end qualification remains tracked in #66.
+Real provider-backed end-to-end qualification is recorded in [#66 evidence](../30-architecture/issue-66-qualification.md): issue #74 produced draft PR #75.
 
 ## Ownership and reconciliation
 
