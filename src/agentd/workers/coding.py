@@ -603,6 +603,10 @@ class CodingHarnessDriver:
         state = self._runs.get(run.id)
         if state is None or state.task is None:
             raise OperationError("coding ownership is unresolved")
+        if state.task.done() and self.load_terminal_result(run.id) is None:
+            if await self.recover_terminal(run.id) is None:
+                raise CodingOwnershipUnresolved("coding stop ownership is unresolved")
+            return
         if not state.task.done():
             if not await self._cancel_active(run.id, state):
                 await asyncio.shield(state.task)
