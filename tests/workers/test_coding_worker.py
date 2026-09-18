@@ -523,6 +523,8 @@ def test_failed_stop_without_terminal_proof_keeps_ownership_unresolved(tmp_path)
             await worker.collect(handle)
         assert worker.load_terminal_result("run") is None
         assert await worker.recover_terminal("run") is None
+        with pytest.raises(CodingOwnershipUnresolved):
+            await worker.cancel(handle)
         assert provider.starts == 1
 
     asyncio.run(scenario())
