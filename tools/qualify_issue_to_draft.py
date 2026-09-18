@@ -213,6 +213,12 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
             "consumed_tokens": run.result.consumed_quota
             if run and run.result
             else None,
+            "maximum_tokens": config["maximum_tokens"],
+            "quota_ceiling_exceeded": (
+                run.result.consumed_quota > config["maximum_tokens"]
+                if run and run.result
+                else None
+            ),
             "profile_digest": profile.digest,
             "pr": published.get("url"),
             "draft": published.get("isDraft"),
