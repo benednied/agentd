@@ -382,8 +382,9 @@ def test_live_token_ceiling_cancels_provider(tmp_path):
 
 
 class TerminalProvider(Provider):
-    def __init__(self, observation_path):
+    def __init__(self, observation_path, outcome=RunOutcome.COMPLETED):
         super().__init__()
+        self.outcome = outcome
         self.observation_path = observation_path
         self.cancel_calls = 0
 
@@ -404,6 +405,7 @@ class TerminalProvider(Provider):
         result = await super().collect(run)
         result = replace(
             result,
+            outcome=self.outcome,
             usage=TokenUsage(input_tokens=201),
             metadata={"telemetry_valid": True},
         )
@@ -586,5 +588,28 @@ def test_same_portable_order_materializes_on_two_worker_roots(tmp_path):
             contract.operation.work_order.to_dict()
             == portable.operation.work_order.to_dict()
         )
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_sdk_result_exports_cumulative_usage_after_restart(tmp_path):
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        provider = TerminalProvider(tmp_path / "terminal.json", RunOutcome.CANCELLED)
+        worker.harnesses["codex"] = provider
+        handle = await worker.start_managed("run", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.CANCELLED
+        assert result.consumed_quota == result.usage.total_tokens == 201
+        assert result.metadata["quota_ceiling_exceeded"] is True
+        assert result.commit is None
+        restarted = CodingHarnessDriver(
+            worker.root,
+            worker.profiles,
+            {"codex": provider},
+            account_pools=worker.account_pools,
+        )
+        assert (await restarted.recover_terminal("run")).consumed_quota == 201
+        assert provider.starts == 1
 
     asyncio.run(scenario())
