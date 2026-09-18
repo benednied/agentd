@@ -20,15 +20,19 @@ from pathlib import Path
 from typing import Any
 
 from agentd.coding.models import RepositoryProfile, fingerprint
-from agentd.domain.enums import ArtifactKind, RunOutcome
+from agentd.domain.enums import ArtifactKind, QuotaUnit, RunOutcome
 from agentd.domain.models import (
     ArtifactRef,
     CodingOperation,
+    EffortEstimate,
     ExecutionContract,
     HarnessCapabilities,
+    Job,
+    QuotaBudget,
     RunHandle,
     RunObservation,
     RunResult,
+    WorkspaceLease,
 )
 from agentd.harness.protocol import ManagedHarnessDriver
 from agentd.workers.operations import (
@@ -39,6 +43,7 @@ from agentd.workers.operations import (
     SubprocessCommandRunner,
     _git_environment,
 )
+from agentd.workspaces.git import GitWorkspaceManager
 
 CODING_DRIVER = "remote-coding"
 MAX_BUNDLE_BYTES = 262_144
@@ -49,6 +54,8 @@ class _CodingRun:
     driver: ManagedHarnessDriver
     handle: RunHandle
     workspace: GitWorkspace
+    lease: WorkspaceLease
+    manager: GitWorkspaceManager
     task: asyncio.Task[RunResult] | None = None
 
 
@@ -78,10 +85,10 @@ class CodingHarnessDriver:
         for name, driver in self.harnesses.items():
             caps = driver.capabilities()
             models.update(caps.models)
-            features.add(f"harness:{name}")
+            features.add(f"harness-{name}")
             features.update(caps.features)
         features.update(
-            f"repository-profile:{p.digest}" for p in self.profiles.values()
+            f"repository-profile-{p.digest}" for p in self.profiles.values()
         )
         return HarnessCapabilities(
             CODING_DRIVER, frozenset(models), frozenset(features), steering=False
@@ -137,6 +144,23 @@ class CodingHarnessDriver:
         workspace = await cache.checkout(
             profile.clone_url, ArtifactRef(ArtifactKind.GIT_COMMIT, order.base_commit)
         )
+        manager = GitWorkspaceManager(lease / "coding-worktrees")
+        job = Job(
+            id=order.job_id,
+            project=order.repository,
+            repository=str(workspace.path),
+            objective=order.objective,
+            quota_budget=QuotaBudget(
+                order.expected_quota,
+                maximum=order.maximum_quota,
+                pool_id=order.account_pool_id,
+                unit=QuotaUnit.TOKENS,
+            ),
+            effort=EffortEstimate(1, 1),
+        )
+        coding_lease = await asyncio.to_thread(manager.allocate, job, order.base_commit)
+        workspace = replace(workspace, path=Path(coding_lease.working_directory))
+        self._write(lease / "workspace.json", coding_lease.to_dict())
         # Controller fields outside the typed work order are not worker authority.
         local = replace(
             execution,
@@ -145,16 +169,19 @@ class CodingHarnessDriver:
             working_directory=str(workspace.path),
             allowed_filesystem_scope=(str(workspace.path),),
             environment={},
-            operation=None,
+            operation=operation,
             resume=None,
             dependency_results={},
             scope="Only the pinned repository workspace",
             role="implementer",
             coordination_mechanisms=(),
-            completion_protocol="Commit changes locally; never push or publish.",
+            completion_protocol=(
+                "Leave file edits for trusted commit capture; "
+                "do not commit, push or publish."
+            ),
         )
         handle = await driver.start_managed(run_id, local)
-        state = _CodingRun(driver, handle, workspace)
+        state = _CodingRun(driver, handle, workspace, coding_lease, manager)
         self._runs[run_id] = state
         state.task = asyncio.create_task(self._finish(run_id, state, execution))
         return RunHandle(run_id, CODING_DRIVER, handle.external_id)
@@ -163,6 +190,7 @@ class CodingHarnessDriver:
         self, run_id: str, state: _CodingRun, execution: ExecutionContract
     ) -> RunResult:
         order = execution.operation.work_order
+        result: RunResult | None = None
         try:
             async with asyncio.timeout(order.max_runtime_seconds):
                 collection = asyncio.create_task(state.driver.collect(state.handle))
@@ -183,25 +211,71 @@ class CodingHarnessDriver:
                         collection.cancel()
                         await asyncio.gather(collection, return_exceptions=True)
             if result.outcome is RunOutcome.COMPLETED:
+                if "live-token-usage" in state.driver.capabilities().features and (
+                    result.metadata.get("telemetry_valid") is not True
+                    or result.usage is None
+                ):
+                    raise OperationError("coding completion lacks valid usage evidence")
                 evidence = await self._evidence(run_id, state, execution)
                 result = replace(
                     result,
                     commit=evidence["result_commit"],
-                    metadata={"coding_evidence": evidence},
+                    metadata={**result.metadata, "coding_evidence": evidence},
                     produced_artifacts=(),
                 )
             else:
                 result = replace(result, commit=None, produced_artifacts=())
         except TimeoutError:
             await state.driver.cancel(state.handle)
-            result = RunResult(RunOutcome.CANCELLED, "Coding runtime limit reached")
+            result = self._failure_result(
+                run_id,
+                state,
+                RunOutcome.CANCELLED,
+                "Coding execution limit reached",
+                result,
+            )
         except asyncio.CancelledError:
             await state.driver.cancel(state.handle)
-            result = RunResult(RunOutcome.CANCELLED, "Coding cancelled")
+            result = self._failure_result(
+                run_id, state, RunOutcome.CANCELLED, "Coding cancelled", result
+            )
         except Exception:
-            result = RunResult(RunOutcome.FAILED, "Trusted coding collection failed")
+            result = self._failure_result(
+                run_id,
+                state,
+                RunOutcome.FAILED,
+                "Trusted coding collection failed",
+                result,
+            )
         self._write(self._lease(run_id) / "result.json", result.to_dict())
         return result
+
+    @staticmethod
+    def _failure_result(
+        run_id: str,
+        state: _CodingRun,
+        outcome: RunOutcome,
+        summary: str,
+        collected: RunResult | None = None,
+    ) -> RunResult:
+        if collected is not None:
+            return replace(
+                collected,
+                outcome=outcome,
+                summary=summary,
+                commit=None,
+                produced_artifacts=(),
+            )
+        observation = state.driver.observe(run_id)
+        usage = observation.usage if observation is not None else None
+        valid = getattr(observation, "telemetry_valid", False) and usage is not None
+        return RunResult(
+            outcome,
+            summary,
+            usage=usage,
+            consumed_quota=float(usage.total_tokens) if usage is not None else 0,
+            metadata={"telemetry_valid": bool(valid)},
+        )
 
     async def _evidence(
         self, run_id: str, state: _CodingRun, execution: ExecutionContract
@@ -234,6 +308,9 @@ class CodingHarnessDriver:
             )
             return output.stdout
 
+        # Reuse the trusted handoff owner: the sandbox does not grant Git write
+        # authority to the model. Hooks, filters and identity are controller policy.
+        await asyncio.to_thread(state.manager.commit_changes, state.lease)
         # Read objects ourselves; model output cannot attest its own commit/tests.
         head = (await git("rev-parse", "HEAD^{commit}")).decode().strip()
         ArtifactRef(ArtifactKind.GIT_COMMIT, head)
@@ -318,8 +395,11 @@ class CodingHarnessDriver:
             if self.load_terminal_result(run.id) is None:
                 self._write(
                     self._lease(run.id) / "result.json",
-                    RunResult(
-                        RunOutcome.CANCELLED, "Coding cancelled before collection"
+                    self._failure_result(
+                        run.id,
+                        state,
+                        RunOutcome.CANCELLED,
+                        "Coding cancelled before collection",
                     ).to_dict(),
                 )
 
@@ -331,7 +411,7 @@ class CodingHarnessDriver:
         import shutil
 
         lease = self._lease(run_id)
-        for name in ("worktrees", "mirrors"):
+        for name in ("coding-worktrees", "worktrees", "mirrors"):
             if (lease / name).exists():
                 shutil.rmtree(lease / name, ignore_errors=False)
         (lease / "result.bundle").unlink(missing_ok=True)

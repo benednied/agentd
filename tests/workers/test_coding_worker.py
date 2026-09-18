@@ -88,17 +88,6 @@ class Provider:
             await self.event.wait()
         path = Path(self.execution.working_directory)
         (path / "change.txt").write_text("change\n")
-        git(path, "add", "change.txt")
-        git(
-            path,
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.test",
-            "commit",
-            "-m",
-            "Change",
-        )
         # The model's claimed commit is deliberately false.
         return RunResult(RunOutcome.COMPLETED, "tests passed", commit="f" * 40)
 
@@ -352,17 +341,23 @@ def test_profile_and_capability_mismatch_rejected(tmp_path):
 
 
 def test_live_token_ceiling_cancels_provider(tmp_path):
-    from types import SimpleNamespace
+    from agentd.domain.models import RunObservation, TokenUsage
 
     async def scenario():
         worker, provider, contract = setup(tmp_path, block=True)
-        provider.observe = lambda run_id: SimpleNamespace(
-            usage=SimpleNamespace(total_tokens=201)
+        provider.observe = lambda run_id: RunObservation(
+            run_id,
+            "thread",
+            "turn",
+            "1",
+            usage=TokenUsage(input_tokens=201),
         )
         handle = await worker.start_managed("tokens", contract)
         result = await worker.collect(handle)
         assert result.outcome is RunOutcome.CANCELLED
         assert provider.cancelled
         assert result.commit is None
+        assert result.consumed_quota == 201
+        assert result.usage.total_tokens == 201
 
     asyncio.run(scenario())
