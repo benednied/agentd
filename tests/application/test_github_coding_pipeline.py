@@ -157,6 +157,7 @@ class AmbiguousGitHub:
             "headRefOid": intent.result_commit,
             "baseRefName": intent.base_branch,
             "isDraft": True,
+            "isCrossRepository": False,
             "url": "https://github.com/test/repo/pull/1",
             "body": body,
         }
