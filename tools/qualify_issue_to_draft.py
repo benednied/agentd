@@ -268,6 +268,9 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
             if run and run.result
             else None,
             "maximum_tokens": config["maximum_tokens"],
+            "background_block_used_percent": config.get(
+                "background_block_used_percent", 75
+            ),
             "quota_ceiling_exceeded": (
                 (
                     run.result.usage.total_tokens

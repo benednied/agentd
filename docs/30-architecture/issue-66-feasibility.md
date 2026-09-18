@@ -53,11 +53,10 @@ python tools/qualify_provider_sandbox.py \
 The original live evidence above was collected with equivalent ad hoc probes;
 the packaged helper has syntax/lint validation, not a second provider run.
 
-## Remaining qualification
+## Subsequent qualification
 
-The full acceptance run still requires a real explicitly approved GitHub issue,
-one durable agentd job, account reservation, compatible remote worker selection,
-restart/acknowledgement recovery, trusted collected Git evidence, sandboxed
-validation, idempotent draft publication, and tests showing publication failure
-never reruns coding. This feasibility probe intentionally does not mark those
-acceptance criteria complete.
+The complete issue-to-draft path was subsequently proven with real issue #74 and
+draft PR #75, including controlled loss of successful publication responses and a
+fresh controller replay. See [the full qualification record](issue-66-qualification.md).
+The smoke above remains a separate feasibility result; it is not a second copy
+of that real issue run or evidence that the broader #23 driver matrix is done.
