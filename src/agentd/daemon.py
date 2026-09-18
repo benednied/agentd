@@ -1,7 +1,7 @@
 """Minimal asynchronous scheduler loop for embedding in a local daemon process."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Protocol, runtime_checkable
@@ -59,6 +59,7 @@ class AgentDaemon:
         provider_reset_remaining: float | None = None,
         clock: Callable[[], datetime] = utc_now,
         on_error: Callable[[Exception], None] | None = None,
+        source_reconciler: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -77,6 +78,7 @@ class AgentDaemon:
         ):
             raise ValueError("provider_reset_remaining must be finite and non-negative")
         self._control_plane = control_plane
+        self._source_reconciler = source_reconciler
         self._poll_interval = poll_interval
         self._dispatch_retry_base_seconds = dispatch_retry_base_seconds
         self._dispatch_retry_max_seconds = dispatch_retry_max_seconds
@@ -159,6 +161,13 @@ class AgentDaemon:
             await self._control_plane.reconcile_managed_runs(
                 self._account_snapshot, at=now
             )
+        if self._source_reconciler is not None:
+            try:
+                await self._source_reconciler()
+            except Exception as error:
+                self._record_error(error, operation="source_refresh")
+                # A failed source read must not launch previously approved work.
+                return None
         if self._dispatch_retry_at is not None and now < self._dispatch_retry_at:
             return None
         try:

@@ -47,6 +47,7 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.domain.transitions import InvalidStateTransition, can_transition
+from agentd.intake.store import IntakeStoreMixin, migrate_intake
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
 SCHEMA = """
@@ -204,7 +205,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -392,6 +393,7 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
 
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    4: migrate_intake,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
@@ -409,7 +411,7 @@ def _load[T](payload: str, factory: Callable[[dict[str, Any]], T]) -> T:
     return factory(data)
 
 
-class SQLiteStateStore:
+class SQLiteStateStore(IntakeStoreMixin):
     """A small repository implementation suitable for a local control-plane daemon."""
 
     def __init__(
@@ -859,6 +861,14 @@ class SQLiteStateStore:
         persisted = _load(row["payload"], Job.from_dict)
         if persisted != expected:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")
+        if job.state is JobState.ADMITTED:
+            source = self.github_source_for_job(job.id)
+            if source is not None and (
+                source["revoked"]
+                or not source["eligible"]
+                or source["revision"] != source["approved_revision"]
+            ):
+                raise ConcurrentStateError("GitHub source approval was revoked")
         persisted_state = JobState(row["state"])
         if persisted_state is not expected.state:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")
