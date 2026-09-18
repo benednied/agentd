@@ -1708,11 +1708,35 @@ class SchedulerCoordinator:
             cumulative = observation.normalized_cumulative_quota
             if cumulative is not None and cumulative > 0:
                 prior = self._store.list_usage_samples(run.id)
-                sequence = max((sample.sequence for sample in prior), default=-1) + 1
-                self._store.apply_usage_sample(
-                    observation.to_usage_sample(sequence),
-                    maximum=self._store.get_job(run.job_id).quota_budget.maximum,
+                matching = [
+                    sample
+                    for sample in prior
+                    if sample.thread_id == observation.thread_id
+                    and sample.turn_id == observation.turn_id
+                ]
+                previous = max(
+                    matching, key=lambda sample: sample.sequence, default=None
                 )
+                repeated = (
+                    previous is not None and previous.cumulative_quota == cumulative
+                )
+                if (
+                    repeated
+                    and previous.tokens is not None
+                    and observation.usage is not None
+                    and not observation.usage.dominates(previous.tokens)
+                ):
+                    raise LifecycleError("Remote token counters moved backwards")
+                # Progress events can advance the stream cursor without spending
+                # tokens. Reconcile a charge committed before its cursor too.
+                if not repeated or (observation.terminal and not previous.final):
+                    sequence = (
+                        max((sample.sequence for sample in prior), default=-1) + 1
+                    )
+                    self._store.apply_usage_sample(
+                        observation.to_usage_sample(sequence),
+                        maximum=self._store.get_job(run.job_id).quota_budget.maximum,
+                    )
         self._store.update_observation_cursor(
             run.id,
             session.observation_cursor,

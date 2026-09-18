@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -324,5 +324,26 @@ def test_unknown_coding_ownership_retains_account_and_worker_claim(tmp_path, los
             assert rig.store.find_active_allocation(rig.job.id).id == allocation.id
             assert rig.provider.starts == len(rig.store.list_runs(rig.job.id)) == 1
             assert await rig.plane.dispatch_next() is None
+
+    asyncio.run(scenario())
+
+
+def test_progress_cursor_without_new_usage_does_not_double_charge(tmp_path):
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            await rig.coordinator.reconcile_managed_runs()
+            initial = rig.provider.observe(run.id)
+            rig.provider.observe = lambda run_id: replace(initial, cursor="progress-13")
+            await rig.coordinator.reconcile_managed_runs()
+            assert (
+                rig.store.get_driver_session(run.id).observation_cursor == "progress-13"
+            )
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert len(rig.store.list_usage_samples(run.id)) == 1
+            await rig.reopen_controller()
+            await rig.coordinator.reconcile_managed_runs()
+            assert rig.store.get_quota_pool("account").remaining == 988
 
     asyncio.run(scenario())
