@@ -92,3 +92,15 @@ runtime without exposing host configuration. Use
 `tools/qualify_publication_sandbox.py` under the deployed validation identity to
 repeat these checks; pass only credential-free toolchain paths as runtime mounts.
 This containment probe does not itself qualify the provider-backed #66 slice.
+
+`MacOSSandboxValidationRunner` provides a deny-default `sandbox-exec` adapter for
+local macOS controllers. It grants read-only system libraries/tools and explicit
+administrative toolchain roots, plus writes to only the result checkout and a
+fresh scratch directory. Network, arbitrary home content, keychain IPC and other
+process inspection have no grants. The environment is rebuilt without publisher
+credentials. Filesystem grants apply to resolved targets, so a checkout symlink
+does not allow access to an external secret. On 2026-09-18 the real macOS runner
+passed both the containment probe and exact-result validation using system Python
+and `git diff --check`. Repeat with
+`tools/qualify_publication_sandbox.py --runner macos --python /usr/bin/python3`.
+Missing or denied OS sandbox support fails closed.

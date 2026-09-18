@@ -441,3 +441,62 @@ def test_bubblewrap_constructs_private_credential_free_boundary(tmp_path, monkey
     ]
     assert command.count("--bind") == 1
     assert not any(path in command for path in ("/home", "/root", "/Users", "/etc"))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
+def test_macos_sandbox_really_denies_secrets_and_network(tmp_path):
+    from agentd.publication import MacOSSandboxValidationRunner
+
+    secret = tmp_path / "secret"
+    secret.write_text("credential")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "escape").symlink_to(secret)
+    command = f"""import os,pathlib,socket
+assert 'GH_TOKEN' not in os.environ
+for path in ({str(secret)!r}, 'escape'):
+    try:
+        pathlib.Path(path).read_text()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('secret accessible')
+s = socket.socket()
+s.settimeout(1)
+try:
+    assert s.connect_ex(('192.0.2.1',443)) != 0
+except PermissionError:
+    pass
+pathlib.Path('verified').write_text('contained')
+"""
+    result = MacOSSandboxValidationRunner().run(
+        ("/usr/bin/python3", "-c", command),
+        cwd=checkout,
+        env={"PATH": "/usr/bin:/bin", "GH_TOKEN": "secret"},
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (checkout / "verified").read_text() == "contained"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
+def test_exact_commit_validates_in_macos_sandbox(result):
+    from agentd.publication import MacOSSandboxValidationRunner
+
+    repo, intent, collected = result
+    intent = replace(
+        intent,
+        validation_commands=(
+            (
+                "/usr/bin/python3",
+                "-c",
+                "from pathlib import Path; assert Path('file').read_text() == 'result'",
+            ),
+            ("/usr/bin/git", "diff", "--check"),
+        ),
+    )
+    evidence = TrustedFinalizer(MacOSSandboxValidationRunner()).validate(
+        intent, collected, repo
+    )
+    assert len(evidence) == 2
+    assert all(item["returncode"] == 0 for item in evidence)

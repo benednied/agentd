@@ -12,13 +12,19 @@ import sys
 import tempfile
 from pathlib import Path
 
-from agentd.publication import BubblewrapValidationRunner
+from agentd.publication import (
+    BubblewrapValidationRunner,
+    MacOSSandboxValidationRunner,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-mount", action="append", type=Path, default=[])
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--runner", choices=("bubblewrap", "macos"), default="bubblewrap"
+    )
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="agentd-publication-probe-") as temp:
         root = Path(temp)
@@ -26,19 +32,30 @@ def main() -> None:
         checkout.mkdir()
         secret = root / "outside-secret"
         secret.write_text("synthetic-probe-secret")
-        code = (
-            "import os,pathlib,socket; "
-            "assert 'GH_TOKEN' not in os.environ; "
-            f"assert not pathlib.Path({str(secret)!r}).exists(); "
-            "assert not pathlib.Path('/proc/1/environ').exists(); "
-            "s=socket.socket(); s.settimeout(2); "
-            "assert s.connect_ex(('192.0.2.1',443)) != 0; "
-            "pathlib.Path('verified').write_text('contained'); "
-            "print('containment passed')"
+        code = f"""import os, pathlib, socket
+assert 'GH_TOKEN' not in os.environ
+try:
+    pathlib.Path({str(secret)!r}).read_text()
+except (PermissionError, FileNotFoundError):
+    pass
+else:
+    raise AssertionError('external secret was readable')
+assert not pathlib.Path('/proc/1/environ').exists()
+s = socket.socket()
+s.settimeout(2)
+try:
+    assert s.connect_ex(('192.0.2.1', 443)) != 0
+except PermissionError:
+    pass
+pathlib.Path('verified').write_text('contained')
+print('containment passed')
+"""
+        runner = (
+            MacOSSandboxValidationRunner
+            if args.runner == "macos"
+            else BubblewrapValidationRunner
         )
-        result = BubblewrapValidationRunner(
-            runtime_mounts=tuple(args.runtime_mount)
-        ).run(
+        result = runner(runtime_mounts=tuple(args.runtime_mount)).run(
             (args.python, "-c", code),
             cwd=checkout,
             env={"PATH": "/usr/bin:/bin", "GH_TOKEN": "synthetic-probe-token"},
