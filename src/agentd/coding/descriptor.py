@@ -1,5 +1,7 @@
 """Capability descriptor for remote-only coding; never a local executor."""
 
+from typing import Never
+
 from agentd.domain.models import (
     ExecutionContract,
     HarnessCapabilities,
@@ -7,6 +9,7 @@ from agentd.domain.models import (
     RunObservation,
 )
 from agentd.workers.controller import OperationsHarnessDescriptor
+from agentd.workers.errors import WorkerOperationError
 
 
 class RemoteCodingDescriptor(OperationsHarnessDescriptor):
@@ -24,6 +27,9 @@ class RemoteCodingDescriptor(OperationsHarnessDescriptor):
             steering=False,
             checkpointing=False,
         )
+
+    def _fail(self) -> Never:
+        raise WorkerOperationError("Remote coding cannot execute on the controller")
 
     async def start_managed(
         self, run_id: str, execution: ExecutionContract

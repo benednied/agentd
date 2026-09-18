@@ -79,18 +79,17 @@ class RepositoryProfile:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RepositoryProfile:
-        return cls(
-            **{
-                **data,
-                "harnesses": tuple(data.get("harnesses", ("codex",))),
-                "required_capabilities": tuple(
-                    data.get("required_capabilities", ("remote-coding",))
-                ),
-                "validation_commands": tuple(
-                    tuple(argv) for argv in data.get("validation_commands", ())
-                ),
-            }
-        )
+        values: dict[str, Any] = {
+            **data,
+            "harnesses": tuple(data.get("harnesses", ("codex",))),
+            "required_capabilities": tuple(
+                data.get("required_capabilities", ("remote-coding",))
+            ),
+            "validation_commands": tuple(
+                tuple(argv) for argv in data.get("validation_commands", ())
+            ),
+        }
+        return cls(**values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,13 +159,12 @@ class CodingWorkOrder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodingWorkOrder:
-        return cls(
-            **{
-                **data,
-                "acceptance_criteria": tuple(data.get("acceptance_criteria", ())),
-                "required_capabilities": tuple(
-                    data.get("required_capabilities", ("remote-coding",))
-                ),
-                "context_references": tuple(data.get("context_references", ())),
-            }
-        )
+        values: dict[str, Any] = {
+            **data,
+            "acceptance_criteria": tuple(data.get("acceptance_criteria", ())),
+            "required_capabilities": tuple(
+                data.get("required_capabilities", ("remote-coding",))
+            ),
+            "context_references": tuple(data.get("context_references", ())),
+        }
+        return cls(**values)
