@@ -178,8 +178,22 @@ class ControlPlane:
             return
 
         if isinstance(operation, CodingOperation):
-            if operation.work_order.job_id != job.id:
-                raise ValueError("Coding work order must identify its logical job")
+            order = operation.work_order
+            if (
+                job.id != order.job_id
+                or job.base_ref != order.base_commit
+                or job.repository != f"https://github.com/{order.repository}.git"
+                or job.qos is not QoSClass.SCAVENGER
+                or job.quota_budget.pool_id != order.account_pool_id
+                or job.quota_budget.maximum != order.maximum_quota
+                or job.quota_budget.expected_path != order.expected_quota
+                or job.quota_budget.unit.value != order.quota_unit
+            ):
+                raise ValueError("Coding job does not match its bounded work order")
+            if job.artifact_outputs:
+                raise ValueError(
+                    "Coding results require independent trusted finalization"
+                )
             return
 
         declared_inputs = job.artifact_inputs
