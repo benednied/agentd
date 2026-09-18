@@ -19,6 +19,7 @@ from agentd.domain.models import (
     ArtifactSelector,
     BuildImageOperation,
     Checkpoint,
+    CodingOperation,
     DeployImageOperation,
     ExecutionContract,
     Job,
@@ -174,6 +175,11 @@ class ControlPlane:
 
         operation = job.operation
         if operation is None:
+            return
+
+        if isinstance(operation, CodingOperation):
+            if operation.work_order.job_id != job.id:
+                raise ValueError("Coding work order must identify its logical job")
             return
 
         declared_inputs = job.artifact_inputs
