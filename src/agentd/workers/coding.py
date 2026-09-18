@@ -99,6 +99,18 @@ class CodingHarnessDriver:
             CODING_DRIVER, frozenset(models), frozenset(features), steering=False
         )
 
+    @staticmethod
+    def _workspace_manager(root: Path) -> GitWorkspaceManager:
+        return GitWorkspaceManager(
+            root,
+            process_environment=_git_environment()
+            | {
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_GRAFT_FILE": os.devnull,
+            },
+            trusted_git=True,
+        )
+
     def _lease(self, run_id: str) -> Path:
         # Protocol identifiers are opaque strings, never filesystem authority.
         return self.root / hashlib.sha256(run_id.encode()).hexdigest()
@@ -149,7 +161,7 @@ class CodingHarnessDriver:
         workspace = await cache.checkout(
             profile.clone_url, ArtifactRef(ArtifactKind.GIT_COMMIT, order.base_commit)
         )
-        manager = GitWorkspaceManager(lease / "coding-worktrees")
+        manager = self._workspace_manager(lease / "coding-worktrees")
         job = Job(
             id=order.job_id,
             project=order.repository,
@@ -371,7 +383,7 @@ class CodingHarnessDriver:
                 RunHandle(run_id, order.harness),
                 workspace,
                 lease,
-                GitWorkspaceManager(root / "coding-worktrees"),
+                self._workspace_manager(root / "coding-worktrees"),
             )
             execution = ExecutionContract(
                 order.job_id,
@@ -436,6 +448,43 @@ class CodingHarnessDriver:
         if not git_dir.is_relative_to(workspace.mirror / "worktrees"):
             raise OperationError("coding Git directory escaped its lease")
 
+        # Worker-owned per-run mirror configuration is policy, never model output.
+        # Reset it before any trusted Git reads/staging so local includes,
+        # filters, pagers and fsmonitor cannot become controller code execution.
+        # This also safely handles terminal recovery from older leases which
+        # predate metadata baselines: no model-authored config is interpreted.
+        config = workspace.mirror / "config"
+        if workspace.mirror.is_symlink() or config.is_symlink() or not config.is_file():
+            raise OperationError("coding mirror configuration identity changed")
+        for anchored in (workspace.path, Path(state.lease.repository)):
+            link_path = anchored / ".git"
+            if anchored.is_symlink() or link_path.is_symlink():
+                raise OperationError("coding worktree anchor changed")
+            link = link_path.read_text().strip()
+            if not link.startswith("gitdir: ") or not Path(
+                link[8:]
+            ).resolve().is_relative_to(workspace.mirror / "worktrees"):
+                raise OperationError("coding worktree anchor escaped its mirror")
+        original_digest = hashlib.sha256(config.read_bytes()).hexdigest()
+        safe_config = "[core]\nrepositoryformatversion = 0\nbare = true\n"
+        if len(order.base_commit) == 64:
+            safe_config = (
+                "[core]\nrepositoryformatversion = 1\nbare = true\n"
+                "[extensions]\nobjectFormat = sha256\n"
+            )
+        temporary = config.with_name("config.agentd-tmp")
+        if temporary.is_symlink():
+            raise OperationError("coding config staging path is a symlink")
+        temporary.write_text(safe_config)
+        temporary.replace(config)
+        self._write(
+            self._lease(run_id) / "git-policy.json",
+            {
+                "original_config_sha256": original_digest,
+                "policy": "no-local-hooks-filters-fsmonitor-includes",
+            },
+        )
+
         async def git(*args: str) -> bytes:
             output = await self.runner.run(
                 (
@@ -448,7 +497,8 @@ class CodingHarnessDriver:
                     str(workspace.path),
                     *args,
                 ),
-                environment=_git_environment() | {"GIT_NO_REPLACE_OBJECTS": "1"},
+                environment=_git_environment()
+                | {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull},
             )
             return output.stdout
 
