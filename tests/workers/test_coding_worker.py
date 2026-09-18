@@ -298,8 +298,26 @@ def test_unresolved_claim_never_restarts(tmp_path):
         assert not (await restarted.execute(replace(request, request_id="second"))).ok
         status = await restarted.execute(replace(request, action="status", payload={}))
         assert status.payload == {"known": True, "terminal": False, "result": None}
+        heartbeat = await restarted.execute(
+            replace(
+                request,
+                action="heartbeat",
+                payload={},
+                run_id="",
+            )
+        )
+        assert heartbeat.payload["active_runs"] == 1
         await asyncio.sleep(0)
         await worker.cancel(RunHandle("run", "remote-coding"))
+        heartbeat = await restarted.execute(
+            replace(
+                request,
+                action="heartbeat",
+                payload={},
+                run_id="",
+            )
+        )
+        assert heartbeat.payload["active_runs"] == 0
         assert provider.starts == 1
         journal.close()
 
