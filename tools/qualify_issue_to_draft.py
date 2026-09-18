@@ -38,6 +38,8 @@ from agentd.publication import (
     DraftPublisher,
     GitHubPublicationAdapter,
     MacOSSandboxValidationRunner,
+    PublicationIntent,
+    PublicationPending,
     PublicationStore,
     TrustedFinalizer,
 )
@@ -67,6 +69,42 @@ class AdministrativeOracle:
         snapshot = ProviderQuotaSnapshot.from_dict(json.loads(result.stdout))
         self.store.append_provider_quota_snapshot(snapshot)
         return snapshot
+
+
+class QualificationPublicationAdapter(GitHubPublicationAdapter):
+    """Optional real-effect/lost-response injection, scoped to this test tool."""
+
+    def __init__(self, fault_directory: Path | None) -> None:
+        super().__init__()
+        self.fault_directory = fault_directory
+
+    def _lose_ack(self, action: str, intent: PublicationIntent) -> None:
+        if self.fault_directory is None:
+            return
+        self.fault_directory.mkdir(parents=True, exist_ok=True)
+        marker = self.fault_directory / f"{action}-{intent.branch.split('/')[-1]}.json"
+        try:
+            with marker.open("x") as stream:
+                json.dump(
+                    {
+                        "action": action,
+                        "job_id": intent.job_id,
+                        "result_commit": intent.result_commit,
+                    },
+                    stream,
+                )
+        except FileExistsError:
+            return
+        raise PublicationPending(f"Qualification injected lost {action} response")
+
+    def push(self, intent: PublicationIntent, repository: Path) -> None:
+        super().push(intent, repository)
+        self._lose_ack("push", intent)
+
+    def create_draft(self, intent: PublicationIntent, body: str) -> dict[str, Any]:
+        result = super().create_draft(intent, body)
+        self._lose_ack("create-draft", intent)
+        return result
 
 
 async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, Any]:
@@ -139,7 +177,11 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
     publisher_store = PublicationStore(config["database"])
     publisher = DraftPublisher(
         publisher_store,
-        GitHubPublicationAdapter(),
+        QualificationPublicationAdapter(
+            Path(config["publication_fault_directory"])
+            if config.get("publication_fault_directory")
+            else None
+        ),
         TrustedFinalizer(MacOSSandboxValidationRunner()),
     )
     publications = CodingPublicationReconciler(
