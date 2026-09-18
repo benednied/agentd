@@ -240,6 +240,20 @@ class OperationJournal:
             raise WorkerProtocolError("worker run claim state is invalid")
         return state
 
+    def unresolved_run_ids(self) -> tuple[str, ...]:
+        """Claims remain capacity owners until terminal evidence is durable."""
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            rows = self._connection.execute(
+                "SELECT c.run_id FROM worker_run_claims c "
+                "LEFT JOIN worker_run_results r ON c.node_id = r.node_id "
+                "AND c.session_epoch = r.session_epoch AND c.run_id = r.run_id "
+                "WHERE c.node_id = ? AND c.session_epoch = ? AND r.run_id IS NULL",
+                (self.node_id, self.session_epoch),
+            ).fetchall()
+        return tuple(str(row["run_id"]) for row in rows)
+
     def save_run_result(self, *, run_id: str, result: dict[str, Any]) -> None:
         """Persist terminal evidence before acknowledging collection or status."""
         self._validate_identifier(run_id, "run_id")

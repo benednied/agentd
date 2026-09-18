@@ -200,6 +200,11 @@ class ExecutionService:
         if action == "heartbeat":
             self._expect_fields(request.payload, set())
             capabilities = self._drivers.capabilities()
+            unresolved = {
+                run_id
+                for run_id in self._journal.unresolved_run_ids()
+                if self._terminal_result(run_id) is None
+            }
             return {
                 "node_id": request.node_id,
                 "session_epoch": request.session_epoch,
@@ -209,10 +214,11 @@ class ExecutionService:
                 },
                 "active_runs": len(
                     {
-                        state.handle.id
+                        state.run_id
                         for state in self._runs.values()
-                        if state.collected is None
+                        if state.collected is None and state.run_id in unresolved
                     }
+                    | unresolved
                 ),
             }
         if action == "status":

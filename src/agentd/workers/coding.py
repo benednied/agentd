@@ -403,6 +403,11 @@ class CodingHarnessDriver:
                     ).to_dict(),
                 )
 
+    async def close(self) -> None:
+        """Stop local live tasks while retaining their terminal lease evidence."""
+        for run_id in tuple(self._runs):
+            await self.cancel(RunHandle(run_id, CODING_DRIVER))
+
     def release(self, run_id: str) -> None:
         """Explicit administrative retention acknowledgement; never auto-delete."""
         if self.load_terminal_result(run_id) is None:
