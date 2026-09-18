@@ -19,7 +19,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from agentd.coding.models import CodingWorkOrder, RepositoryProfile, fingerprint
+from agentd.coding.models import (
+    CodingWorkOrder,
+    RepositoryProfile,
+    exact_commit,
+    fingerprint,
+)
 from agentd.domain.enums import ArtifactKind, QuotaUnit, RunOutcome
 from agentd.domain.models import (
     ArtifactRef,
@@ -32,9 +37,11 @@ from agentd.domain.models import (
     RunHandle,
     RunObservation,
     RunResult,
+    TokenUsage,
     WorkspaceLease,
 )
 from agentd.harness.protocol import ManagedHarnessDriver
+from agentd.workers.coding_runtime import CodingPreparationError
 from agentd.workers.operations import (
     CommandRunner,
     GitRepositoryCache,
@@ -197,7 +204,23 @@ class CodingHarnessDriver:
                 "do not commit, push or publish."
             ),
         )
-        handle = await driver.start_managed(run_id, local)
+        try:
+            handle = await driver.start_managed(run_id, local)
+        except CodingPreparationError:
+            self._write(
+                lease / "result.json",
+                RunResult(
+                    RunOutcome.FAILED,
+                    "Worker preparation failed before provider start",
+                    usage=TokenUsage(),
+                    metadata={
+                        "provider_started": False,
+                        "preparation_failure": True,
+                        "telemetry_valid": True,
+                    },
+                ).to_dict(),
+            )
+            return RunHandle(run_id, CODING_DRIVER)
         state = _CodingRun(driver, handle, workspace, coding_lease, manager)
         self._runs[run_id] = state
         state.task = asyncio.create_task(self._finish(run_id, state, execution))
@@ -333,6 +356,53 @@ class CodingHarnessDriver:
         else:
             result = replace(result, commit=None, produced_artifacts=())
         self._write(self._lease(run_id) / "result.json", result.to_dict())
+        return result
+
+    def reconcile_preparation_failure(
+        self, run_id: str, *, deployed_revision: str
+    ) -> RunResult:
+        """Explicit admin-only legacy repair after the worker has quiesced.
+
+        Never called by STATUS and never starts a provider. Existing claims,
+        ledgers and workspace records are retained for audit.
+        """
+        exact_commit(deployed_revision)
+        persisted = self.load_terminal_result(run_id)
+        if persisted is not None:
+            return persisted
+        if run_id in self._runs:
+            raise OperationError("preparation repair requires a quiescent worker")
+        root = self._lease(run_id)
+        claim = json.loads((root / "claim.json").read_text())
+        order = CodingWorkOrder.from_dict(claim["work_order"])
+        if claim["run_id"] != run_id or claim["fingerprint"] != fingerprint(
+            order.to_dict()
+        ):
+            raise OperationError("coding preparation claim identity mismatch")
+        order.validate_profile(self.profiles[order.profile_id])
+        if self.account_pools.get(order.harness) != order.account_pool_id:
+            raise OperationError("coding preparation account mismatch")
+        lease = WorkspaceLease.from_dict(
+            json.loads((root / "workspace.json").read_text())
+        )
+        if lease.job_id != order.job_id or lease.base_ref != order.base_commit:
+            raise OperationError("coding preparation workspace mismatch")
+        proof = getattr(
+            self.harnesses[order.harness], "prove_preparation_failure", None
+        )
+        if proof is None:
+            raise OperationError("coding harness cannot prove pre-provider failure")
+        result = proof(run_id, order, lease)
+        if result.metadata.get("provider_started") is not False:
+            raise OperationError("preparation proof did not exclude provider start")
+        result = replace(
+            result,
+            metadata={
+                **result.metadata,
+                "preparation_deployed_revision": deployed_revision,
+            },
+        )
+        self._write(root / "result.json", result.to_dict())
         return result
 
     async def recover_terminal(self, run_id: str) -> RunResult | None:

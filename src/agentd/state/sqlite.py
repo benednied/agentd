@@ -530,6 +530,109 @@ class SQLiteStateStore(IntakeStoreMixin):
             )
             self._insert_transition(transition)
 
+    def prepare_worker_execution(
+        self,
+        *,
+        job: Job,
+        transition: StateTransition,
+        pool: QuotaPool,
+        reservation: QuotaReservation,
+        workspace: WorkspaceLease,
+        node: WorkerNode,
+        allocation: ResourceAllocation,
+        run: RunRecord,
+    ) -> None:
+        """Atomically mirror one admitted worker envelope before provider start.
+
+        A shared worker node is stable across sequential envelopes. This method
+        creates no provider session and makes no admission decision. Any error
+        rolls back every new envelope record, leaving prior run usage intact.
+        """
+        if (
+            transition.job_id != job.id
+            or transition.from_state is not None
+            or transition.to_state != job.state
+            or reservation.job_id != job.id
+            or reservation.pool_id != pool.id
+            or workspace.job_id != job.id
+            or allocation.job_id != job.id
+            or allocation.node_id != node.id
+            or run.job_id != job.id
+            or run.node_id != node.id
+            or run.workspace_id != workspace.id
+            or run.reservation_id != reservation.id
+            or run.allocation_id != allocation.id
+        ):
+            raise ValueError("worker execution envelope identities disagree")
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO jobs(id, project, state, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    job.id,
+                    job.project,
+                    job.state.value,
+                    job.created_at.isoformat(),
+                    _dump(job),
+                ),
+            )
+            self._insert_transition(transition)
+            self._execute_insert_idempotent(
+                "quota_pools", pool.id, ("payload",), (_dump(pool),)
+            )
+            self._execute_insert_idempotent(
+                "quota_reservations",
+                reservation.id,
+                ("job_id", "pool_id", "state", "created_at", "payload"),
+                (
+                    reservation.job_id,
+                    reservation.pool_id,
+                    reservation.state.value,
+                    reservation.created_at.isoformat(),
+                    _dump(reservation),
+                ),
+                immutable_columns=("job_id", "pool_id"),
+            )
+            self._connection.execute(
+                "INSERT INTO workspaces(id, job_id, state, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    workspace.id,
+                    workspace.job_id,
+                    workspace.state.value,
+                    workspace.created_at.isoformat(),
+                    _dump(workspace),
+                ),
+            )
+            # Do not recreate a node with a fresh timestamp or reset allocation
+            # bookkeeping each time a provider envelope is mirrored.
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM nodes WHERE id = ?", (node.id,)
+                ).fetchone()
+                is None
+            ):
+                self._execute_insert_idempotent(
+                    "nodes",
+                    node.id,
+                    ("state", "payload"),
+                    (node.state.value, _dump(node)),
+                )
+            self._execute_insert_idempotent(
+                "resource_allocations",
+                allocation.id,
+                ("job_id", "node_id", "state", "created_at", "payload"),
+                (
+                    allocation.job_id,
+                    allocation.node_id,
+                    allocation.state.value,
+                    allocation.created_at.isoformat(),
+                    _dump(allocation),
+                ),
+                immutable_columns=("job_id", "node_id"),
+            )
+            self._save_run_in_transaction(run, None)
+
     def save_job(
         self,
         job: Job,

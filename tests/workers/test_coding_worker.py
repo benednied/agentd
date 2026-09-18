@@ -615,3 +615,23 @@ def test_cancelled_sdk_result_exports_cumulative_usage_after_restart(tmp_path):
         assert provider.starts == 1
 
     asyncio.run(scenario())
+
+
+def test_pre_provider_setup_error_is_terminal_without_provider_ambiguity(tmp_path):
+    from agentd.workers.coding_runtime import CodingPreparationError
+
+    async def scenario():
+        worker, provider, contract = setup(tmp_path)
+
+        async def rejected_setup(run_id, execution):
+            raise CodingPreparationError("local ledger failed before provider boundary")
+
+        provider.start_managed = rejected_setup
+        handle = await worker.start_managed("run", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.FAILED
+        assert result.metadata["provider_started"] is False
+        assert result.usage.total_tokens == result.consumed_quota == 0
+        assert provider.starts == 0
+
+    asyncio.run(scenario())
