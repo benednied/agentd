@@ -200,6 +200,11 @@ class ExecutionService:
         if action == "heartbeat":
             self._expect_fields(request.payload, set())
             capabilities = self._drivers.capabilities()
+            unresolved = {
+                run_id
+                for run_id in self._journal.unresolved_run_ids()
+                if await self._terminal_result(run_id) is None
+            }
             return {
                 "node_id": request.node_id,
                 "session_epoch": request.session_epoch,
@@ -209,10 +214,11 @@ class ExecutionService:
                 },
                 "active_runs": len(
                     {
-                        state.handle.id
+                        state.run_id
                         for state in self._runs.values()
-                        if state.collected is None
+                        if state.collected is None and state.run_id in unresolved
                     }
+                    | unresolved
                 ),
             }
         if action == "status":
@@ -228,6 +234,11 @@ class ExecutionService:
             # prevents two distinct request ids from racing the same run.
             async with self._start_lock:
                 return await self._start(request)
+        if action == "collect":
+            self._expect_fields(request.payload, set())
+            persisted = await self._terminal_result(request.run_id)
+            if persisted is not None:
+                return {"result": persisted}
         state = self._run(request.run_id)
         if action == "observe":
             return await self._observe(request, state)
@@ -251,15 +262,44 @@ class ExecutionService:
             result = state.collected
             if result is None:
                 result = await state.driver.collect(state.handle)
+                self._journal.save_run_result(
+                    run_id=state.run_id, result=result.to_dict()
+                )
                 state.collected = result
             return {"result": result.to_dict()}
         raise WorkerProtocolError(f"unknown worker action {action!r}")
+
+    async def _terminal_result(self, run_id: str) -> dict[str, Any] | None:
+        persisted = self._journal.load_run_result(run_id=run_id)
+        if persisted is not None:
+            return persisted
+        # A typed adapter may have finished while the controller disconnected.
+        # Only a prior durable claim permits importing its immutable evidence.
+        if self._journal.run_claim_state(run_id=run_id) is None:
+            return None
+        for capability in self._drivers.capabilities():
+            driver = self._drivers.get(capability.name)
+            reader = getattr(driver, "load_terminal_result", None)
+            if reader is None:
+                continue
+            result = reader(run_id)
+            if result is None:
+                reconcile = getattr(driver, "recover_terminal", None)
+                if reconcile is not None:
+                    result = await reconcile(run_id)
+            if result is not None:
+                self._journal.save_run_result(run_id=run_id, result=result.to_dict())
+                return result.to_dict()
+        return None
 
     async def _status(self, request: Envelope) -> dict[str, Any]:
         """Read worker status while serialized with durable START claims."""
 
         state = self._runs.get(request.run_id)
         if state is None:
+            persisted = await self._terminal_result(request.run_id)
+            if persisted is not None:
+                return {"known": True, "terminal": True, "result": persisted}
             # Both markers are installed before any await that could expose
             # this run to STATUS.  The durable claim also covers a worker
             # process restart where no in-memory handle survives.
@@ -297,6 +337,9 @@ class ExecutionService:
                 raise WorkerProtocolError(
                     "worker status result is malformed"
                 ) from error
+            self._journal.save_run_result(
+                run_id=state.run_id, result=state.collected.to_dict()
+            )
             status = dict(status)
             status["result"] = state.collected.to_dict()
         return status

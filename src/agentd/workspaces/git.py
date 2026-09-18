@@ -83,6 +83,8 @@ class GitWorkspaceManager:
         branch_prefix: str = "agentd",
         git_executable: str = "git",
         command_timeout_seconds: float = 30,
+        process_environment: dict[str, str] | None = None,
+        trusted_git: bool = False,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
@@ -95,6 +97,10 @@ class GitWorkspaceManager:
         self._branch_prefix = "/".join(prefix_parts) or "agentd"
         self._git_executable = git_executable
         self._command_timeout_seconds = command_timeout_seconds
+        self._process_environment = (
+            dict(process_environment) if process_environment is not None else None
+        )
+        self._trusted_git = trusted_git
 
     @property
     def root(self) -> Path:
@@ -612,11 +618,20 @@ class GitWorkspaceManager:
     ) -> subprocess.CompletedProcess[str]:
         command = (
             self._git_executable,
+            *(
+                ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+                if self._trusted_git
+                else ()
+            ),
             "-C",
             str(repository),
             *arguments,
         )
-        process_environment = os.environ.copy()
+        process_environment = (
+            os.environ.copy()
+            if self._process_environment is None
+            else dict(self._process_environment)
+        )
         process_environment["GIT_TERMINAL_PROMPT"] = "0"
         if environment is not None:
             process_environment.update(environment)
