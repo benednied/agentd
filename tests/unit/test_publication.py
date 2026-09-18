@@ -500,3 +500,57 @@ def test_exact_commit_validates_in_macos_sandbox(result):
     )
     assert len(evidence) == 2
     assert all(item["returncode"] == 0 for item in evidence)
+
+
+def test_observed_revocation_during_validation_blocks_all_publication(result, tmp_path):
+    repo, intent, collected = result
+    authorized = True
+
+    class RevokingFinalizer:
+        def validate(self, *args):
+            nonlocal authorized
+            evidence = finalizer().validate(*args)
+            authorized = False
+            return evidence
+
+    def authorization_check():
+        if not authorized:
+            raise PublicationError("source authorization revoked")
+
+    adapter = Adapter()
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"), adapter, RevokingFinalizer()
+    )
+    with pytest.raises(PublicationError, match="revoked"):
+        publisher.publish(
+            intent, collected, repo, authorization_check=authorization_check
+        )
+    assert adapter.pushes == adapter.creates == 0
+    assert publisher.store.bind(intent)["stage"] == "validated"
+
+
+def test_observed_revocation_after_push_blocks_pr_creation(result, tmp_path):
+    repo, intent, collected = result
+    authorized = True
+
+    class RevokingAdapter(Adapter):
+        def push(self, *args):
+            nonlocal authorized
+            super().push(*args)
+            authorized = False
+
+    def authorization_check():
+        if not authorized:
+            raise PublicationError("source authorization revoked")
+
+    adapter = RevokingAdapter()
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"), adapter, finalizer()
+    )
+    with pytest.raises(PublicationError, match="revoked"):
+        publisher.publish(
+            intent, collected, repo, authorization_check=authorization_check
+        )
+    assert adapter.pushes == 1
+    assert adapter.creates == 0
+    assert publisher.store.bind(intent)["stage"] == "push_requested"
