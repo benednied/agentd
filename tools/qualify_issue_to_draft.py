@@ -203,19 +203,30 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
             "issue": f"https://github.com/{profile.repository}/issues/{issue.number}",
             "source_revision": issue.revision,
             "job_id": issue.job_id,
-            "job_count": len(store.list_jobs()),
-            "run_count": len(store.list_runs()),
+            "job_count": sum(job.id == issue.job_id for job in store.list_jobs()),
+            "run_count": len(store.list_runs(issue.job_id)),
+            "controller_job_count": len(store.list_jobs()),
+            "controller_run_count": len(store.list_runs()),
             "job_state": store.get_job(issue.job_id).state.value,
             "run_id": run.id if run else None,
             "worker_id": run.node_id if run else None,
             "base_commit": config["base_commit"],
             "result_commit": run.result.commit if run and run.result else None,
-            "consumed_tokens": run.result.consumed_quota
+            "consumed_tokens": (
+                run.result.usage.total_tokens
+                if run.result.usage is not None
+                else run.result.consumed_quota
+            )
             if run and run.result
             else None,
             "maximum_tokens": config["maximum_tokens"],
             "quota_ceiling_exceeded": (
-                run.result.consumed_quota > config["maximum_tokens"]
+                (
+                    run.result.usage.total_tokens
+                    if run.result.usage is not None
+                    else run.result.consumed_quota
+                )
+                > config["maximum_tokens"]
                 if run and run.result
                 else None
             ),
