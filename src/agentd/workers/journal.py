@@ -99,6 +99,13 @@ class OperationJournal:
                     next_sequence INTEGER NOT NULL,
                     PRIMARY KEY(node_id, session_epoch)
                 );
+                CREATE TABLE IF NOT EXISTS worker_run_results (
+                    node_id TEXT NOT NULL,
+                    session_epoch TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    PRIMARY KEY(node_id, session_epoch, run_id)
+                );
                 CREATE TABLE IF NOT EXISTS worker_run_claims (
                     node_id TEXT NOT NULL,
                     session_epoch TEXT NOT NULL,
@@ -232,6 +239,33 @@ class OperationJournal:
         if state not in {"claimed", "started"}:
             raise WorkerProtocolError("worker run claim state is invalid")
         return state
+
+    def save_run_result(self, *, run_id: str, result: dict[str, Any]) -> None:
+        """Persist terminal evidence before acknowledging collection or status."""
+        self._validate_identifier(run_id, "run_id")
+        encoded = canonical_json(result).decode("utf-8")
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            existing = self.load_run_result(run_id=run_id)
+            if existing is not None and canonical_json(existing).decode() != encoded:
+                raise WorkerJournalConflictError("terminal run result changed")
+            self._connection.execute(
+                "INSERT OR IGNORE INTO worker_run_results VALUES (?, ?, ?, ?)",
+                (self.node_id, self.session_epoch, run_id, encoded),
+            )
+
+    def load_run_result(self, *, run_id: str) -> dict[str, Any] | None:
+        self._validate_identifier(run_id, "run_id")
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            row = self._connection.execute(
+                "SELECT result FROM worker_run_results WHERE node_id = ? "
+                "AND session_epoch = ? AND run_id = ?",
+                (self.node_id, self.session_epoch, run_id),
+            ).fetchone()
+        return json.loads(row["result"]) if row is not None else None
 
     def mark_run_started(self, *, run_id: str, start_hash: str) -> None:
         """Record that the worker created a run for a durable claim."""
