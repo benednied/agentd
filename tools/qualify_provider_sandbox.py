@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import suppress
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,12 @@ from agentd.harness.app_server import (
     DEFAULT_PERMISSION_PROFILE,
     OpenAICodexClient,
 )
+
+
+def _object(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("malformed provider object; qualification must wait")
+    return value
 
 
 def git(workspace: Path, *arguments: str) -> str:
@@ -64,14 +71,24 @@ async def qualify(args: argparse.Namespace) -> dict[str, Any]:
             "account/read", {"refreshToken": True}, response_model=GetAccountResponse
         )
         raw = await client.account_rate_limits()
-        buckets = raw.get("rateLimitsByLimitId") or {}
-        bucket = buckets.get("codex") or raw.get("rateLimits") or {}
-        percentages = [
-            window["usedPercent"]
-            for key in ("primary", "secondary")
-            if isinstance(window := bucket.get(key), dict)
-            and isinstance(window.get("usedPercent"), int | float)
-        ]
+        buckets = _object(raw.get("rateLimitsByLimitId") or {})
+        bucket = _object(buckets.get("codex") or raw.get("rateLimits") or {})
+        percentages: list[float] = []
+        for key in ("primary", "secondary"):
+            window = bucket.get(key)
+            if window is None:
+                continue
+            used = _object(window).get("usedPercent")
+            if (
+                isinstance(used, bool)
+                or not isinstance(used, int | float)
+                or not isfinite(used)
+                or not 0 <= used <= 100
+            ):
+                raise RuntimeError(
+                    "malformed provider percentage; qualification must wait"
+                )
+            percentages.append(float(used))
         if (
             not percentages
             or max(percentages) >= 75
@@ -97,16 +114,19 @@ async def qualify(args: argparse.Namespace) -> dict[str, Any]:
         async with asyncio.timeout(args.timeout):
             async for event in client.events(turn):
                 if event.method == "thread/tokenUsage/updated":
-                    tokens = (
-                        event.payload.get("tokenUsage", {})
-                        .get("total", {})
-                        .get("totalTokens", 0)
-                    )
-                    maximum_observed_tokens = max(maximum_observed_tokens, int(tokens))
+                    usage = _object(event.payload.get("tokenUsage"))
+                    tokens = _object(usage.get("total")).get("totalTokens")
+                    if (
+                        isinstance(tokens, bool)
+                        or not isinstance(tokens, int)
+                        or tokens < 0
+                    ):
+                        raise RuntimeError("malformed trusted token counter")
+                    maximum_observed_tokens = max(maximum_observed_tokens, tokens)
                     if maximum_observed_tokens >= args.maximum_tokens:
                         raise RuntimeError("smoke token ceiling reached")
                 if event.method in {"turn/completed", "turn/failed"}:
-                    terminal = event.payload.get("turn", {}).get("status")
+                    terminal = _object(event.payload.get("turn")).get("status")
         if terminal != "completed":
             raise RuntimeError("provider turn did not complete")
     finally:
