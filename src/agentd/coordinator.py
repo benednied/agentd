@@ -67,6 +67,7 @@ from agentd.runtime.accounts import (
     should_checkpoint_for_maximum,
     should_top_up,
     snapshot_is_stale,
+    unattended_provider_wait_reason,
 )
 from agentd.runtime.governor import (
     DEFAULT_PROVIDER_STOP_POLICY,
@@ -125,7 +126,9 @@ class SchedulerCoordinator:
         self._store = store
         self._workspaces = workspace_manager
         self._drivers = drivers
-        self._quota = quota_manager or QuotaManager(store)
+        self._quota = quota_manager or QuotaManager(
+            store, account_policy=account_policy
+        )
         self._resources = resource_manager or ResourceManager(store)
         self._backends = backends
         self._provisioner = provisioner
@@ -134,6 +137,11 @@ class SchedulerCoordinator:
         self._usage_policy = usage_policy
         self._provider_stop_policy = provider_stop_policy
         self._hard_cap_grace = hard_cap_grace
+
+    def quota_wait_reason(self, job_id: str) -> str | None:
+        """Read an unattended admission reason without dispatch side effects."""
+
+        return self._quota.wait_reason(self._store.get_job(job_id))
 
     async def dispatch_next(self) -> RunRecord | None:
         jobs = self._store.list_jobs(frozenset({JobState.READY}))
@@ -2129,6 +2137,8 @@ class SchedulerCoordinator:
         raise error
 
     def _provider_allows_placement(self, job: Job, placement: Placement) -> bool:
+        if job.qos is QoSClass.SCAVENGER:
+            return self._quota.wait_reason(job) is None
         if placement.harness != "codex" or not self._enforce_codex_account_policy:
             return True
         snapshot = self._store.latest_provider_quota_snapshot(job.quota_budget.pool_id)
@@ -2366,6 +2376,13 @@ class SchedulerCoordinator:
                 or job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}
             )
         )
+        if job.qos is QoSClass.SCAVENGER:
+            provider_has_capacity = (
+                unattended_provider_wait_reason(
+                    snapshot, at=at, policy=self._account_policy
+                )
+                is None
+            )
         if should_top_up(reservation, self._usage_policy) and provider_has_capacity:
             prior_consumed = consumed - reservation.consumed
             maximum_for_attempt = (
@@ -2380,7 +2397,7 @@ class SchedulerCoordinator:
             if top_up > 0:
                 # A local capacity race is an admission signal, not a reason
                 # to lose the already-running turn or its telemetry.
-                with suppress(ConcurrentStateError):
+                with suppress(ConcurrentStateError, QuotaAdmissionError):
                     self._quota.top_up(reservation.id, top_up)
 
         maximum_command = maximum_checkpoint_command(
