@@ -1,0 +1,80 @@
+{
+  "scope": "real-provider-cancellation-and-restart",
+  "issue": "https://github.com/benednied/agentd/issues/71",
+  "source_revision": "fad27d8c2d98629a63e98d87fe86dd2d502b8820a8f94ff5c5ded6d81df2001b",
+  "approved_revision": "fad27d8c2d98629a63e98d87fe86dd2d502b8820a8f94ff5c5ded6d81df2001b",
+  "job_id": "github-78f43397ecf806c6f340fb66522e1c21",
+  "run_id": "d0ee6516-7b88-406a-a168-01f21776759d",
+  "job_count": 1,
+  "run_count": 1,
+  "work_order_fingerprint": "60830a30115e2498ba143ea0815efd321901dfbc20679c879ede94cecb9358cc",
+  "profile_digest": "93b6357741ce1793f320068a43c586808b39e2d501c441711f79b62dc50fca7f",
+  "base_commit": "f7d4f08f280080e14c434293c99034ba06216b6f",
+  "result_commit": null,
+  "job_state": "CANCELLED",
+  "run_state": "CANCELLED",
+  "outcome": "cancelled",
+  "run_started_at": "2026-09-18T14:48:35.962768+00:00",
+  "maximum_tokens": 60000.0,
+  "runtime_limit_seconds": 240,
+  "trusted_usage": {
+    "input_tokens": 64329,
+    "cached_input_tokens": 44288,
+    "output_tokens": 681,
+    "reasoning_output_tokens": 89
+  },
+  "actual_total_tokens": 65010,
+  "legacy_result_consumed_quota": 0.0,
+  "reservation": {
+    "job_id": "github-78f43397ecf806c6f340fb66522e1c21",
+    "pool_id": "qualification-account",
+    "amount": 55000.0,
+    "id": "366645ed-5be6-4898-9076-b98c78faaba8",
+    "state": "CANCELLED",
+    "consumed": 65010.0,
+    "debt": 5010.0,
+    "unit": "tokens",
+    "created_at": "2026-09-18T14:48:35.957455+00:00",
+    "released_at": "2026-09-18T15:09:09.307394+00:00"
+  },
+  "quota_snapshot_at_admission": {
+    "pool_id": "qualification-account",
+    "bucket_id": "codex",
+    "provider": "openai-codex-chatgpt",
+    "primary_used_percent": 61.0,
+    "primary_window_minutes": 10080,
+    "primary_reset_at": "2026-09-21T06:46:54+00:00",
+    "secondary_used_percent": null,
+    "reached": false,
+    "credits_exhausted": false,
+    "observed_at": "2026-09-18T14:48:35.039887+00:00",
+    "confidence": 1.0,
+    "source": "codex-app-server"
+  },
+  "final_pool_remaining": 0.0,
+  "final_pool_debt": 5010.0,
+  "usage_samples": [
+    {
+      "sequence": 0,
+      "cumulative_quota": 15247.0,
+      "delta": 15247.0,
+      "final": false
+    },
+    {
+      "sequence": 1,
+      "cumulative_quota": 30759.0,
+      "delta": 15512.0,
+      "final": false
+    },
+    {
+      "sequence": 2,
+      "cumulative_quota": 65010.0,
+      "delta": 34251.0,
+      "final": true
+    }
+  ],
+  "publication": null,
+  "controller_commit": "7671eb9a2d86c98524570f38add8286335e642c8",
+  "initial_worker_commit": "509dd775c90d7831cb45efd3b163e0df25a72638",
+  "recovery_worker_commit": "b16f6c696e421afe01d1ba8799aedf2778a4cb9d"
+}
