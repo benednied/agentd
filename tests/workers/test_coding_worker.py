@@ -524,3 +524,67 @@ def test_failed_stop_without_terminal_proof_keeps_ownership_unresolved(tmp_path)
         assert provider.starts == 1
 
     asyncio.run(scenario())
+
+
+def test_trusted_handoff_does_not_execute_model_git_configuration(tmp_path):
+    async def scenario():
+        worker, provider, contract = setup(tmp_path)
+        original_collect = provider.collect
+        marker = tmp_path / "git-hook-executed"
+
+        async def poisoned_collect(run):
+            result = await original_collect(run)
+            path = Path(provider.execution.working_directory)
+            gitdir = Path((path / ".git").read_text().strip()[8:])
+            mirror = gitdir.parent.parent
+            with (mirror / "config").open("a") as stream:
+                stream.write(
+                    f"\n[core]\nfsmonitor = touch {marker}\n"
+                    f'[filter "evil"]\nclean = touch {marker}\n'
+                )
+            (path / ".gitattributes").write_text("*.txt filter=evil\n")
+            return result
+
+        provider.collect = poisoned_collect
+        handle = await worker.start_managed("run", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.COMPLETED
+        assert not marker.exists()
+
+    asyncio.run(scenario())
+
+
+def test_same_portable_order_materializes_on_two_worker_roots(tmp_path):
+    async def scenario():
+        first, first_provider, contract = setup(tmp_path)
+        second_provider = Provider()
+        second = CodingHarnessDriver(
+            tmp_path / "other-worker",
+            first.profiles,
+            {"codex": second_provider},
+            runner=first.runner,
+            account_pools=first.account_pools,
+        )
+        portable = ExecutionContract.from_dict(contract.to_dict())
+        first_handle = await first.start_managed("same-run", portable)
+        second_handle = await second.start_managed("same-run", portable)
+        first_result = await first.collect(first_handle)
+        second_result = await second.collect(second_handle)
+        assert (
+            first_provider.execution.working_directory
+            != second_provider.execution.working_directory
+        )
+        assert (
+            first_result.metadata["coding_evidence"]["base_commit"]
+            == second_result.metadata["coding_evidence"]["base_commit"]
+        )
+        assert (
+            first_result.metadata["coding_evidence"]["profile_digest"]
+            == second_result.metadata["coding_evidence"]["profile_digest"]
+        )
+        assert (
+            contract.operation.work_order.to_dict()
+            == portable.operation.work_order.to_dict()
+        )
+
+    asyncio.run(scenario())
