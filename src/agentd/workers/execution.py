@@ -203,7 +203,7 @@ class ExecutionService:
             unresolved = {
                 run_id
                 for run_id in self._journal.unresolved_run_ids()
-                if self._terminal_result(run_id) is None
+                if await self._terminal_result(run_id) is None
             }
             return {
                 "node_id": request.node_id,
@@ -236,7 +236,7 @@ class ExecutionService:
                 return await self._start(request)
         if action == "collect":
             self._expect_fields(request.payload, set())
-            persisted = self._terminal_result(request.run_id)
+            persisted = await self._terminal_result(request.run_id)
             if persisted is not None:
                 return {"result": persisted}
         state = self._run(request.run_id)
@@ -269,7 +269,7 @@ class ExecutionService:
             return {"result": result.to_dict()}
         raise WorkerProtocolError(f"unknown worker action {action!r}")
 
-    def _terminal_result(self, run_id: str) -> dict[str, Any] | None:
+    async def _terminal_result(self, run_id: str) -> dict[str, Any] | None:
         persisted = self._journal.load_run_result(run_id=run_id)
         if persisted is not None:
             return persisted
@@ -283,6 +283,10 @@ class ExecutionService:
             if reader is None:
                 continue
             result = reader(run_id)
+            if result is None:
+                reconcile = getattr(driver, "recover_terminal", None)
+                if reconcile is not None:
+                    result = await reconcile(run_id)
             if result is not None:
                 self._journal.save_run_result(run_id=run_id, result=result.to_dict())
                 return result.to_dict()
@@ -293,7 +297,7 @@ class ExecutionService:
 
         state = self._runs.get(request.run_id)
         if state is None:
-            persisted = self._terminal_result(request.run_id)
+            persisted = await self._terminal_result(request.run_id)
             if persisted is not None:
                 return {"known": True, "terminal": True, "result": persisted}
             # Both markers are installed before any await that could expose
