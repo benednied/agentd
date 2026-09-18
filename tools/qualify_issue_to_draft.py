@@ -43,6 +43,7 @@ from agentd.publication import (
     PublicationStore,
     TrustedFinalizer,
 )
+from agentd.runtime.accounts import AccountPolicyThresholds
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.controller import RemoteWorkerEndpoint
@@ -132,6 +133,11 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
         GitWorkspaceManager(config["unused_workspace_root"]),
         DriverRegistry([descriptor]),
         backends=BackendRegistry([backend]),
+        account_policy=AccountPolicyThresholds(
+            background_block_used_percent=config.get(
+                "background_block_used_percent", 75
+            ),
+        ),
     )
     plane = ControlPlane(store, coordinator=coordinator)
     plane.register_node(
