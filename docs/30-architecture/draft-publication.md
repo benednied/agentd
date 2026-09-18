@@ -26,12 +26,14 @@ Validation is arbitrary repository code. `TrustedFinalizer` fails closed unless
 an administrative `ValidationRunner` is explicitly injected. The supplied
 `BubblewrapValidationRunner` requires Linux user namespaces and `bwrap`. It starts
 with an empty filesystem, mounts only read-only system runtime directories,
-creates private process/network namespaces and a temporary home, and binds the
+creates private user/process/IPC/network namespaces and a temporary home, and binds the
 validation checkout as its sole writable host mount. No host home, publisher
 state, credentials, or network are exposed. Additional toolchain/dependency mounts
 are explicit administrative policy and must contain no credentials or controller
 state. If the sandbox is unavailable, validation fails; there is no fallback to
-uncontained execution.
+uncontained execution. An empty `/proc` avoids exposing host process credentials
+and supports the existing container seccomp profile; tests requiring procfs must
+use a separately configured, equally isolated runner.
 
 A deployment may inject an equivalent container/remote validation runner. Its
 implementation belongs to the trusted administrative domain. Environment filtering
@@ -77,3 +79,16 @@ credential environment filtering, result identity mismatches, immutable job
 binding, branch/PR conflicts, simulated lost push/create acknowledgements,
 controller restart, eventual-consistency absence, and independent publication
 retry without access to the original worker or checkout.
+
+The Linux runner was additionally exercised inside the existing worker runtime
+container on 2026-09-18. The actual isolated Python process returned zero after
+checking an external synthetic secret and host process environment were
+inaccessible, credential environment variables were absent, outbound networking
+was unavailable, and the mounted checkout remained writable. The runtime's
+existing seccomp profile requires explicit user/PID/IPC/network namespaces and
+an empty proc directory; unrestricted `--unshare-all` and nested proc mounts are
+not assumed. `LD_LIBRARY_PATH=/usr/local/lib` selects the mounted trusted Python
+runtime without exposing host configuration. Use
+`tools/qualify_publication_sandbox.py` under the deployed validation identity to
+repeat these checks; pass only credential-free toolchain paths as runtime mounts.
+This containment probe does not itself qualify the provider-backed #66 slice.

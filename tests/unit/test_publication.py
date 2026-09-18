@@ -421,7 +421,16 @@ def test_bubblewrap_constructs_private_credential_free_boundary(tmp_path, monkey
         timeout=60,
     )
     command, kwargs = calls[0]
-    assert "--unshare-all" in command
+    assert all(
+        flag in command
+        for flag in (
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-net",
+        )
+    )
+    assert "--proc" not in command
     assert "--die-with-parent" in command
     assert "--clearenv" in command
     assert "never-pass-this" not in command
