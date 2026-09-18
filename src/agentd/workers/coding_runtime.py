@@ -11,7 +11,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
-from agentd.domain.enums import JobState, QuotaUnit
+from agentd.coding.models import CodingWorkOrder
+from agentd.domain.enums import JobState, QuotaUnit, RunOutcome
 from agentd.domain.models import (
     CodingOperation,
     EffortEstimate,
@@ -25,18 +26,25 @@ from agentd.domain.models import (
     ResourceVector,
     RunHandle,
     RunRecord,
+    RunResult,
     StateTransition,
+    TokenUsage,
     WorkerNode,
     WorkspaceLease,
 )
 from agentd.harness.app_server import DEFAULT_CODEX_MODEL, OpenAICodexClient
 from agentd.harness.codex_sdk import CodexSdkDriver
 from agentd.harness.supervisor import RunSupervisor
+from agentd.state.base import EntityNotFoundError
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.operations import OperationError, SubprocessCommandRunner
 
 _RUNTIME_PYTHON = "/opt/agentd/venv/bin/python"
 _RUNTIME_PROBE = "/opt/agentd/security/runtime_sandbox_probe.py"
+
+
+class CodingPreparationError(OperationError):
+    """The local execution envelope failed before any provider call."""
 
 
 class _ContainedCodexDriver(CodexSdkDriver):
@@ -82,28 +90,9 @@ class _ContainedCodexDriver(CodexSdkDriver):
             effort=EffortEstimate(1, 1),
             state=JobState.RUNNING,
         )
-        self._worker_store.create_job(
-            job,
-            StateTransition(
-                job.id,
-                None,
-                JobState.RUNNING,
-                "Worker mirror of controller-admitted execution envelope",
-            ),
-        )
-        self._worker_store.save_quota_pool(
-            QuotaPool(
-                pool_id,
-                "controller-execution-envelope",
-                order.maximum_quota,
-                reserved=order.maximum_quota,
-                unit=QuotaUnit.TOKENS,
-            )
-        )
         reservation = QuotaReservation(
             job.id, pool_id, order.maximum_quota, unit=QuotaUnit.TOKENS
         )
-        self._worker_store.save_reservation(reservation)
         workspace = WorkspaceLease(
             id=run_id,
             job_id=job.id,
@@ -112,34 +101,93 @@ class _ContainedCodexDriver(CodexSdkDriver):
             working_directory=execution.working_directory,
             base_ref=order.base_commit,
         )
-        self._worker_store.save_workspace(workspace, expected=None)
-        self._worker_store.save_node(
-            WorkerNode("worker-local", {}, ResourceVector(), frozenset({"codex"}))
+        allocation = ResourceAllocation(
+            id=run_id, job_id=job.id, node_id="worker-local", resources=ResourceVector()
         )
-        self._worker_store.save_allocation(
-            ResourceAllocation(
-                id=run_id,
-                job_id=job.id,
-                node_id="worker-local",
-                resources=ResourceVector(),
+        run = RunRecord(
+            id=run_id,
+            job_id=job.id,
+            node_id="worker-local",
+            workspace_id=workspace.id,
+            reservation_id=reservation.id,
+            allocation_id=allocation.id,
+            driver="codex",
+            backend="local",
+            contract=execution,
+            handle=RunHandle(run_id, "codex"),
+        )
+        try:
+            self._worker_store.prepare_worker_execution(
+                job=job,
+                transition=StateTransition(
+                    job.id,
+                    None,
+                    JobState.RUNNING,
+                    "Worker mirror of controller-admitted execution envelope",
+                ),
+                pool=QuotaPool(
+                    pool_id,
+                    "controller-execution-envelope",
+                    order.maximum_quota,
+                    reserved=order.maximum_quota,
+                    unit=QuotaUnit.TOKENS,
+                ),
+                reservation=reservation,
+                workspace=workspace,
+                node=WorkerNode(
+                    "worker-local", {}, ResourceVector(), frozenset({"codex"})
+                ),
+                allocation=allocation,
+                run=run,
             )
-        )
-        self._worker_store.save_run(
-            RunRecord(
-                id=run_id,
-                job_id=job.id,
-                node_id="worker-local",
-                workspace_id=workspace.id,
-                reservation_id=reservation.id,
-                allocation_id=run_id,
-                driver="codex",
-                backend="local",
-                contract=execution,
-                handle=RunHandle(run_id, "codex"),
-            ),
-            expected=None,
-        )
+        except Exception as error:
+            raise CodingPreparationError(
+                "worker execution preparation failed"
+            ) from error
+        # This durable run boundary must precede every SDK/provider entrypoint.
         return await super().start_managed(run_id, execution)
+
+    def prove_preparation_failure(
+        self, run_id: str, order: CodingWorkOrder, lease: WorkspaceLease
+    ) -> RunResult:
+        """Administrative proof for legacy partial local setup, never a retry."""
+        for lookup in (
+            self._worker_store.get_run,
+            self._worker_store.get_driver_session,
+        ):
+            try:
+                lookup(run_id)
+            except EntityNotFoundError:
+                continue
+            raise OperationError("provider ownership cannot be ruled out")
+        # Legacy setup wrote the worker job/workspace before its run. Require
+        # those exact partial identities instead of accepting arbitrary run IDs.
+        job = self._worker_store.get_job(order.job_id)
+        workspace = self._worker_store.get_workspace(run_id)
+        if (
+            workspace.job_id != order.job_id
+            or job.state is not JobState.RUNNING
+            or workspace.working_directory != lease.working_directory
+            or workspace.base_ref != order.base_commit
+            or job.quota_budget.pool_id != f"execution-envelope:{run_id}"
+            or job.quota_budget.maximum != order.maximum_quota
+            or job.objective != order.objective
+            or job.repository != lease.working_directory
+        ):
+            raise OperationError("legacy worker preparation identity mismatch")
+        return RunResult(
+            RunOutcome.FAILED,
+            "Worker preparation failed before provider start",
+            usage=TokenUsage(),
+            metadata={
+                "telemetry_valid": True,
+                "provider_started": False,
+                "preparation_failure": True,
+                "preparation_proof": (
+                    "SDK run and session absent; partial job/workspace retained"
+                ),
+            },
+        )
 
     async def close(self) -> None:
         await super().close()
