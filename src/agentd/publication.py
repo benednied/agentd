@@ -387,6 +387,79 @@ class BubblewrapValidationRunner:
         return _run(arguments, timeout=timeout, env={"PATH": "/usr/bin:/bin"})
 
 
+class MacOSSandboxValidationRunner:
+    """Deny-default local validation using the operating-system sandbox.
+
+    Runtime roots are explicit read-only administrative toolchain grants. Home,
+    controller databases, network, keychain IPC and other process inspection are
+    denied. Only the result checkout and a fresh scratch directory are writable.
+    """
+
+    def __init__(
+        self,
+        *,
+        executable: str = "/usr/bin/sandbox-exec",
+        runtime_mounts: tuple[Path, ...] = (),
+    ) -> None:
+        self.executable = executable
+        self.runtime_mounts = runtime_mounts
+
+    def run(
+        self, command: Sequence[str], *, cwd: Path, env: dict[str, str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        roots = (
+            Path("/System/Library"),
+            Path("/usr/lib"),
+            Path("/usr/bin"),
+            Path("/bin"),
+            Path("/Library/Developer/CommandLineTools"),
+            *self.runtime_mounts,
+        )
+        for root in roots:
+            if str(root.resolve()) in ("/", "/Users", "/home", "/root", "/etc"):
+                raise PublicationError("Validation runtime mount is too broad")
+        with tempfile.TemporaryDirectory(prefix="agentd-validation-home-") as scratch:
+            readonly = " ".join(
+                f"(subpath {json.dumps(str(root.resolve()))})" for root in roots
+            )
+            writable = " ".join(
+                f"(subpath {json.dumps(str(path.resolve()))})"
+                for path in (cwd, Path(scratch))
+            )
+            profile = (
+                "(version 1)(deny default)"
+                "(allow process-exec process-fork)"
+                "(allow file-read-metadata)"
+                '(allow file-read-data (literal "/"))'
+                f"(allow file-read* {readonly} {writable} "
+                '(literal "/dev/null") (literal "/dev/urandom") '
+                '(literal "/private/etc/localtime"))'
+                f'(allow file-write* {writable} (literal "/dev/null"))'
+                '(allow sysctl-read (sysctl-name "hw.ncpu") '
+                '(sysctl-name "hw.activecpu") (sysctl-name "hw.memsize") '
+                '(sysctl-name "hw.pagesize") (sysctl-name "kern.osrelease") '
+                '(sysctl-name "kern.ostype") (sysctl-name "kern.osversion"))'
+            )
+            clean_env = {
+                "PATH": env["PATH"],
+                "HOME": scratch,
+                "TMPDIR": scratch,
+                "XDG_CONFIG_HOME": scratch,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+            return _run(
+                (self.executable, "-p", profile, *command),
+                cwd=cwd,
+                env=clean_env,
+                timeout=timeout,
+            )
+
+
 class TrustedFinalizer:
     """Verify Git objects and collect actual process exit evidence.
 
