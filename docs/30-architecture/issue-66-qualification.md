@@ -87,3 +87,37 @@ is demonstrated. Synthetic failure/idempotency tests do not replace that evidenc
 
 The [structured record](evidence/issue-71-cancelled.json) was extracted from the
 trusted controller database. It contains no credentials or raw issue prompt.
+
+## Automated scenario coverage
+
+The integrated tree at `a2c8a26` passed 636 tests in 36.94 seconds. Ruff lint and
+format checks, documentation checks, and targeted typing passed. Whole-source
+`ty` diagnostics match the baseline exactly (86 existing diagnostics, none added).
+
+| Qualification scenario | Trusted automated evidence |
+| --- | --- |
+| Full issue-to-draft flow | `tests/application/test_github_coding_pipeline.py`: real Git/authenticated worker transport, controlled provider and GitHub adapter; not a real provider success |
+| Repeated, edited, unauthorized, closed or ineligible intake | `tests/unit/test_github_intake.py`: durable repeat/restart, revision approval, revocation and adversarial-text cases |
+| Unknown/stale/insufficient quota, account sharing | `tests/unit/test_unattended_quota.py`, `tests/application/test_unattended_admission.py` |
+| No compatible idle worker | Coding pipeline integration checks selection waits before dispatch |
+| Lost ACK, reconnect, controller/worker restart, unresolved ownership | `tests/application/test_coding_recovery.py`, `tests/workers/test_coding_worker.py`; real run also exercised both process restarts |
+| Mid-run quota pressure, bounded cancellation | Coding recovery/worker tests; real cancelled run above |
+| Publication failure does not repeat coding | Pipeline integration and `tests/unit/test_publication.py` restart/lost-push/lost-create cases |
+| Failed validation remains diagnosable | Publication tests retain failed evidence and refuse branch/PR publication |
+| Git metadata/credential containment | Worker configuration attack tests and actual macOS/Linux sandbox probes |
+
+## Cleanup and resumption
+
+The dedicated qualification worker was stopped after terminal collection. Its
+SSH tunnel was verified absent. Controller/worker journals and the isolated
+workspace are retained for diagnosis; no production service was restarted or
+modified. Worker retention behavior is separately tested, including refusal to
+release unresolved ownership and repeatable cleanup retaining terminal evidence.
+
+For an approved follow-up, preserve the existing controller/account ledger and
+its 65,010-token charge. Grant any additional finite local allowance explicitly;
+do not reset historical consumption or consume provider reset credits implicitly.
+Refresh provider quota, install the trusted profile for #72, start the isolated
+worker with the existing state identity, and explicitly approve the exact new
+source revision. The [operator guide](../40-operations/github-coding.md) describes
+the controller composition and fail-closed recovery rules.
