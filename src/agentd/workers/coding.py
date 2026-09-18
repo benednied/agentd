@@ -34,7 +34,6 @@ from agentd.domain.models import (
     RunResult,
     WorkspaceLease,
 )
-from agentd.harness.errors import RunNotActiveError
 from agentd.harness.protocol import ManagedHarnessDriver
 from agentd.workers.operations import (
     CommandRunner,
@@ -48,6 +47,10 @@ from agentd.workspaces.git import GitWorkspaceManager
 
 CODING_DRIVER = "remote-coding"
 MAX_BUNDLE_BYTES = 262_144
+
+
+class CodingOwnershipUnresolved(OperationError):
+    """A stop request did not prove that the provider run is terminal."""
 
 
 @dataclass(slots=True)
@@ -233,6 +236,8 @@ class CodingHarnessDriver:
             result = self._failure_result(
                 run_id, state, RunOutcome.CANCELLED, "Coding cancelled", result
             )
+        except CodingOwnershipUnresolved:
+            raise
         except Exception:
             result = self._failure_result(
                 run_id,
@@ -250,12 +255,26 @@ class CodingHarnessDriver:
             return False
         try:
             await state.driver.cancel(state.handle)
-        except RunNotActiveError:
+        except Exception as error:
             observation = state.driver.observe(run_id)
             if observation is not None and observation.terminal:
                 return False
             # Absence of a live process is not proof of terminal ownership.
-            raise
+            raise CodingOwnershipUnresolved(
+                "coding stop ownership is unresolved"
+            ) from error
+        if "live-token-usage" in state.driver.capabilities().features:
+            try:
+                await asyncio.wait_for(state.driver.collect(state.handle), timeout=5)
+            except Exception as error:
+                raise CodingOwnershipUnresolved(
+                    "coding stop lacks terminal evidence"
+                ) from error
+            observation = state.driver.observe(run_id)
+            if observation is None or not observation.terminal:
+                raise CodingOwnershipUnresolved(
+                    "coding stop lacks terminal observation"
+                )
         return True
 
     async def _finalize_result(

@@ -495,3 +495,32 @@ def test_restart_finalizes_persisted_provider_terminal_without_recoding(
         assert provider.starts == 1
 
     asyncio.run(scenario())
+
+
+def test_failed_stop_without_terminal_proof_keeps_ownership_unresolved(tmp_path):
+    from agentd.domain.models import RunObservation, TokenUsage
+    from agentd.harness.errors import RunNotActiveError
+    from agentd.workers.coding import CodingOwnershipUnresolved
+
+    async def scenario():
+        worker, provider, contract = setup(tmp_path, block=True)
+        provider.observe = lambda run_id: RunObservation(
+            run_id,
+            "thread",
+            "turn",
+            "1",
+            usage=TokenUsage(input_tokens=201),
+        )
+
+        async def lost_stop(handle):
+            raise RunNotActiveError("lost ownership")
+
+        provider.cancel = lost_stop
+        handle = await worker.start_managed("run", contract)
+        with pytest.raises(CodingOwnershipUnresolved):
+            await worker.collect(handle)
+        assert worker.load_terminal_result("run") is None
+        assert await worker.recover_terminal("run") is None
+        assert provider.starts == 1
+
+    asyncio.run(scenario())
