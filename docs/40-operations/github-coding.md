@@ -47,6 +47,13 @@ contains:
 - `source_commit`, `worker_source_commit`, and `evidence_path` for exact build
   and run provenance; and optional `controller_timeout_seconds`.
 
+For controlled qualification only, `publication_fault_directory` enables one
+lost-response injection after each successful branch push and draft creation.
+The tool records which real side effect completed, then discards its response.
+The normal publication reconciler must discover the existing branch/draft on
+retry without repeating coding. Keep those markers with the qualification
+evidence; omit this setting for ordinary operation.
+
 The qualification composition currently uses the reviewed macOS validation
 runner and the separately deployed Linux coding worker. It is an internal tool,
 not a general deployment installer. The worker factory grants containment
