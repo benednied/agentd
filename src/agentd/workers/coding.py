@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from agentd.coding.models import RepositoryProfile, fingerprint
+from agentd.coding.models import CodingWorkOrder, RepositoryProfile, fingerprint
 from agentd.domain.enums import ArtifactKind, QuotaUnit, RunOutcome
 from agentd.domain.models import (
     ArtifactRef,
@@ -34,6 +34,7 @@ from agentd.domain.models import (
     RunResult,
     WorkspaceLease,
 )
+from agentd.harness.errors import RunNotActiveError
 from agentd.harness.protocol import ManagedHarnessDriver
 from agentd.workers.operations import (
     CommandRunner,
@@ -78,6 +79,7 @@ class CodingHarnessDriver:
         self.account_pools = dict(account_pools or {})
         self.runner = runner or SubprocessCommandRunner()
         self._runs: dict[str, _CodingRun] = {}
+        self._recovery_locks: dict[str, asyncio.Lock] = {}
 
     def capabilities(self) -> HarnessCapabilities:
         features = {"remote-coding"}
@@ -189,6 +191,7 @@ class CodingHarnessDriver:
     async def _finish(
         self, run_id: str, state: _CodingRun, execution: ExecutionContract
     ) -> RunResult:
+        assert isinstance(execution.operation, CodingOperation)
         order = execution.operation.work_order
         result: RunResult | None = None
         try:
@@ -197,36 +200,27 @@ class CodingHarnessDriver:
                 try:
                     while not collection.done():
                         await asyncio.wait({collection}, timeout=0.1)
+                        if collection.done():
+                            break
                         observation = state.driver.observe(run_id)
                         if (
                             observation is not None
                             and observation.usage is not None
                             and observation.usage.total_tokens >= order.maximum_quota
                         ):
-                            await state.driver.cancel(state.handle)
-                            raise TimeoutError("Coding token ceiling reached")
+                            if observation.terminal:
+                                break
+                            if await self._cancel_active(run_id, state):
+                                raise TimeoutError("Coding token ceiling reached")
+                            break
                     result = await collection
                 finally:
                     if not collection.done():
                         collection.cancel()
                         await asyncio.gather(collection, return_exceptions=True)
-            if result.outcome is RunOutcome.COMPLETED:
-                if "live-token-usage" in state.driver.capabilities().features and (
-                    result.metadata.get("telemetry_valid") is not True
-                    or result.usage is None
-                ):
-                    raise OperationError("coding completion lacks valid usage evidence")
-                evidence = await self._evidence(run_id, state, execution)
-                result = replace(
-                    result,
-                    commit=evidence["result_commit"],
-                    metadata={**result.metadata, "coding_evidence": evidence},
-                    produced_artifacts=(),
-                )
-            else:
-                result = replace(result, commit=None, produced_artifacts=())
+            return await self._finalize_result(run_id, state, execution, result)
         except TimeoutError:
-            await state.driver.cancel(state.handle)
+            await self._cancel_active(run_id, state)
             result = self._failure_result(
                 run_id,
                 state,
@@ -235,7 +229,7 @@ class CodingHarnessDriver:
                 result,
             )
         except asyncio.CancelledError:
-            await state.driver.cancel(state.handle)
+            await self._cancel_active(run_id, state)
             result = self._failure_result(
                 run_id, state, RunOutcome.CANCELLED, "Coding cancelled", result
             )
@@ -249,6 +243,136 @@ class CodingHarnessDriver:
             )
         self._write(self._lease(run_id) / "result.json", result.to_dict())
         return result
+
+    async def _cancel_active(self, run_id: str, state: _CodingRun) -> bool:
+        observation = state.driver.observe(run_id)
+        if observation is not None and observation.terminal:
+            return False
+        try:
+            await state.driver.cancel(state.handle)
+        except RunNotActiveError:
+            observation = state.driver.observe(run_id)
+            if observation is not None and observation.terminal:
+                return False
+            # Absence of a live process is not proof of terminal ownership.
+            raise
+        return True
+
+    async def _finalize_result(
+        self,
+        run_id: str,
+        state: _CodingRun,
+        execution: ExecutionContract,
+        result: RunResult,
+    ) -> RunResult:
+        assert isinstance(execution.operation, CodingOperation)
+        if result.outcome is RunOutcome.COMPLETED:
+            if "live-token-usage" in state.driver.capabilities().features and (
+                result.metadata.get("telemetry_valid") is not True
+                or result.usage is None
+            ):
+                raise OperationError("coding completion lacks valid usage evidence")
+            evidence = await self._evidence(run_id, state, execution)
+            usage = result.usage
+            evidence["quota_ceiling_exceeded"] = bool(
+                usage is not None
+                and usage.total_tokens > execution.operation.work_order.maximum_quota
+            )
+            result = replace(
+                result,
+                commit=evidence["result_commit"],
+                metadata={**result.metadata, "coding_evidence": evidence},
+                produced_artifacts=(),
+            )
+        else:
+            result = replace(result, commit=None, produced_artifacts=())
+        self._write(self._lease(run_id) / "result.json", result.to_dict())
+        return result
+
+    async def recover_terminal(self, run_id: str) -> RunResult | None:
+        """Finalize a proven durable SDK terminal result without starting a turn."""
+        lock = self._recovery_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            persisted = self.load_terminal_result(run_id)
+            if persisted is not None:
+                return persisted
+            live = self._runs.get(run_id)
+            if live is not None and live.task is not None and not live.task.done():
+                return None
+            root = self._lease(run_id)
+            if (
+                not (root / "claim.json").is_file()
+                or not (root / "workspace.json").is_file()
+            ):
+                return None
+            claim = json.loads((root / "claim.json").read_text())
+            order = CodingWorkOrder.from_dict(claim["work_order"])
+            if claim["run_id"] != run_id or claim["fingerprint"] != fingerprint(
+                order.to_dict()
+            ):
+                raise OperationError("coding recovery identity mismatch")
+            profile = self.profiles[order.profile_id]
+            order.validate_profile(profile)
+            if self.account_pools.get(order.harness) != order.account_pool_id:
+                raise OperationError("coding recovery account mismatch")
+            driver = self.harnesses[order.harness]
+            observation = driver.observe(run_id)
+            if (
+                observation is None
+                or not observation.terminal
+                or observation.result is None
+            ):
+                return None
+            if observation.run_id != run_id:
+                raise OperationError("coding recovery observation identity mismatch")
+            lease = WorkspaceLease.from_dict(
+                json.loads((root / "workspace.json").read_text())
+            )
+            if (
+                lease.job_id != order.job_id
+                or lease.base_ref != order.base_commit
+                or not Path(lease.working_directory)
+                .resolve()
+                .is_relative_to(root / "coding-worktrees")
+            ):
+                raise OperationError("coding recovery workspace identity mismatch")
+            mirror = (
+                root
+                / "mirrors"
+                / hashlib.sha256(profile.clone_url.encode()).hexdigest()
+            )
+            workspace = GitWorkspace(
+                profile.clone_url,
+                ArtifactRef(ArtifactKind.GIT_COMMIT, order.base_commit),
+                Path(lease.working_directory),
+                mirror,
+            )
+            state = _CodingRun(
+                driver,
+                RunHandle(run_id, order.harness),
+                workspace,
+                lease,
+                GitWorkspaceManager(root / "coding-worktrees"),
+            )
+            execution = ExecutionContract(
+                order.job_id,
+                order.objective,
+                "workspace",
+                order.acceptance_criteria,
+                {},
+                "implementer",
+                (lease.working_directory,),
+                "",
+                (),
+                "",
+                lease.working_directory,
+                {},
+                "standard",
+                operation=CodingOperation(order),
+            )
+            return await self._finalize_result(
+                run_id, state, execution, observation.result
+            )
 
     @staticmethod
     def _failure_result(
@@ -280,6 +404,7 @@ class CodingHarnessDriver:
     async def _evidence(
         self, run_id: str, state: _CodingRun, execution: ExecutionContract
     ) -> dict[str, Any]:
+        assert isinstance(execution.operation, CodingOperation)
         order = execution.operation.work_order
         workspace = state.workspace
 
@@ -388,7 +513,9 @@ class CodingHarnessDriver:
         if state is None or state.task is None:
             raise OperationError("coding ownership is unresolved")
         if not state.task.done():
-            await state.driver.cancel(state.handle)
+            if not await self._cancel_active(run.id, state):
+                await asyncio.shield(state.task)
+                return
             state.task.cancel()
             with suppress(asyncio.CancelledError):
                 await state.task
