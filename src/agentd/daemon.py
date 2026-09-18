@@ -60,6 +60,7 @@ class AgentDaemon:
         clock: Callable[[], datetime] = utc_now,
         on_error: Callable[[Exception], None] | None = None,
         source_reconciler: Callable[[], Awaitable[object]] | None = None,
+        result_reconciler: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -79,6 +80,7 @@ class AgentDaemon:
             raise ValueError("provider_reset_remaining must be finite and non-negative")
         self._control_plane = control_plane
         self._source_reconciler = source_reconciler
+        self._result_reconciler = result_reconciler
         self._poll_interval = poll_interval
         self._dispatch_retry_base_seconds = dispatch_retry_base_seconds
         self._dispatch_retry_max_seconds = dispatch_retry_max_seconds
@@ -168,6 +170,11 @@ class AgentDaemon:
                 self._record_error(error, operation="source_refresh")
                 # A failed source read must not launch previously approved work.
                 return None
+        if self._result_reconciler is not None:
+            try:
+                await self._result_reconciler()
+            except Exception as error:
+                self._record_error(error, operation="result_publication")
         if self._dispatch_retry_at is not None and now < self._dispatch_retry_at:
             return None
         try:
