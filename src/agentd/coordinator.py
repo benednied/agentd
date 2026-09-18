@@ -25,6 +25,7 @@ from agentd.domain.models import (
     ArtifactRef,
     BuildImageOperation,
     Checkpoint,
+    CodingOperation,
     DeployImageOperation,
     DriverSession,
     ExecutionContract,
@@ -181,7 +182,10 @@ class SchedulerCoordinator:
                 if not self._provider_allows_placement(job, placement):
                     continue
                 backend = self._select_backend(placement.node_id, job)
-                if self._backends is not None and backend is None:
+                if backend is None and (
+                    self._backends is not None
+                    or isinstance(job.operation, CodingOperation)
+                ):
                     continue
                 try:
                     return await self._dispatch(
@@ -211,7 +215,10 @@ class SchedulerCoordinator:
         backend: WorkerBackend | None,
         *,
         resolved_inputs: tuple[ArtifactRef, ...],
-        resolved_operation: BuildImageOperation | DeployImageOperation | None,
+        resolved_operation: BuildImageOperation
+        | DeployImageOperation
+        | CodingOperation
+        | None,
     ) -> RunRecord:
         reservation: QuotaReservation | None = None
         allocation_id: str | None = None
@@ -603,6 +610,8 @@ class SchedulerCoordinator:
                         # publish RUNNING so the normal idempotent terminal
                         # path can either continue or fail an unknown run.
                         status = await self._operation_status(run)
+                        if isinstance(run.contract.operation, CodingOperation):
+                            self._create_remote_driver_session(run, run.handle)
                         recovered = replace(run, state=RunState.RUNNING)
                         running, event = transition_job(
                             job,
@@ -806,6 +815,8 @@ class SchedulerCoordinator:
         ):
             raise LifecycleError(f"Remote run {run.id} returned invalid status")
         if not known:
+            if isinstance(run.contract.operation, CodingOperation):
+                raise LifecycleError("Coding worker ownership is unresolved")
             # This worker-authenticated answer is the only point at which a
             # lost START may be failed and its admission effects released.
             result = RunResult(
@@ -836,6 +847,8 @@ class SchedulerCoordinator:
             )
             return
 
+        if isinstance(run.contract.operation, CodingOperation):
+            self._create_remote_driver_session(run, run.handle)
         recovered = replace(run, state=RunState.RUNNING)
         running, event = transition_job(
             job,
@@ -939,6 +952,8 @@ class SchedulerCoordinator:
             driver = self._drivers.get(run.driver)
             if self._is_typed_operation_run(run, driver):
                 try:
+                    if isinstance(run.contract.operation, CodingOperation):
+                        await self._reconcile_coding_policy(job, run, snapshot, at=now)
                     finalized_job = await self._reconcile_operation_run(run)
                     if finalized_job is not None:
                         finalized.append(finalized_job)
@@ -1054,6 +1069,8 @@ class SchedulerCoordinator:
             return "build-image" in features
         if isinstance(operation, DeployImageOperation):
             return "deploy-image" in features
+        if isinstance(operation, CodingOperation):
+            return "remote-coding" in features
         return False
 
     async def _operation_status(self, run: RunRecord) -> dict[str, object]:
@@ -1080,6 +1097,46 @@ class SchedulerCoordinator:
         if not isinstance(status, dict):
             raise LifecycleError(f"Typed run {run.id} returned malformed status")
         return status
+
+    async def _reconcile_coding_policy(
+        self,
+        job: Job,
+        run: RunRecord,
+        snapshot: ProviderQuotaSnapshot | None,
+        *,
+        at: datetime,
+    ) -> None:
+        observation = await self._observe_run(run)
+        if observation is not None:
+            self._record_remote_observation(run, observation)
+        if observation is not None and observation.terminal:
+            return
+        if snapshot is None or snapshot.pool_id != job.quota_budget.pool_id:
+            snapshot = self._store.latest_provider_quota_snapshot(
+                job.quota_budget.pool_id
+            )
+        self._enqueue_usage_policy(job, run, snapshot, at=at, observation=observation)
+        # Coding MVP retains the stopped lease for diagnosis. It does not accept
+        # arbitrary follow-up intent or automatically resume a checkpoint.
+        for command in self._store.list_pending_run_commands(run.id):
+            if command.action in {"checkpoint", "suspend", "interrupt", "cancel"}:
+                await self._interrupt_run(run)
+            elif command.action != "steer":
+                continue
+            self._store.acknowledge_run_command(
+                RunCommandAck(
+                    command_id=command.id,
+                    run_id=run.id,
+                    observation_cursor=observation.cursor
+                    if observation
+                    else "coding-policy",
+                    metadata={
+                        "backend": run.backend,
+                        "remote": True,
+                        "coding_policy": "bounded-stop",
+                    },
+                )
+            )
 
     async def _reconcile_operation_run(
         self,
@@ -1113,6 +1170,8 @@ class SchedulerCoordinator:
         if not isinstance(known, bool) or not isinstance(terminal, bool):
             raise LifecycleError(f"Typed run {run.id} returned malformed status flags")
         if not known:
+            if isinstance(run.contract.operation, CodingOperation):
+                raise LifecycleError("Coding worker ownership is unresolved")
             if terminal or raw_result is not None:
                 raise LifecycleError(
                     f"Typed run {run.id} returned an invalid unknown status"
@@ -1406,6 +1465,12 @@ class SchedulerCoordinator:
             RunOutcome.FAILED: JobState.FAILED,
             RunOutcome.CANCELLED: JobState.CANCELLED,
         }[result.outcome]
+        if (
+            isinstance(run.contract.operation, CodingOperation)
+            and result.outcome is RunOutcome.COMPLETED
+            and job.state is JobState.RUNNING
+        ):
+            target = JobState.REVIEW
         run_state = {
             RunOutcome.COMPLETED: RunState.COMPLETED,
             RunOutcome.FAILED: RunState.FAILED,
@@ -1609,6 +1674,14 @@ class SchedulerCoordinator:
         run: RunRecord,
         handle: RunHandle,
     ) -> None:
+        try:
+            existing = self._store.get_driver_session(run.id)
+        except EntityNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing.driver != run.driver:
+                raise LifecycleError("Recovered remote session driver mismatch")
+            return
         self._store.save_driver_session(
             DriverSession(
                 run_id=run.id,
@@ -1701,7 +1774,10 @@ class SchedulerCoordinator:
         workspace: WorkspaceLease,
         *,
         artifact_inputs: tuple[ArtifactRef, ...] | None = None,
-        operation: BuildImageOperation | DeployImageOperation | None = None,
+        operation: BuildImageOperation
+        | DeployImageOperation
+        | CodingOperation
+        | None = None,
     ) -> ExecutionContract:
         dependency_results: dict[str, str] = {}
         for dependency_id in job.dependencies:
@@ -1778,7 +1854,7 @@ class SchedulerCoordinator:
         job: Job,
     ) -> tuple[
         tuple[ArtifactRef, ...],
-        BuildImageOperation | DeployImageOperation | None,
+        BuildImageOperation | DeployImageOperation | CodingOperation | None,
     ]:
         """Bind every selector/ref to verified append-only ledger provenance."""
 
@@ -2812,6 +2888,27 @@ class SchedulerCoordinator:
         compatible = self._backends.compatible(self._store.get_node(node_id))
         for backend in compatible:
             capabilities = backend.capabilities()
+            if isinstance(job.operation, CodingOperation):
+                node = self._store.get_node(node_id)
+                heartbeat = node.heartbeat
+                required = job.required_capabilities | {
+                    "remote-coding",
+                    f"repository-profile-{job.operation.work_order.profile_digest}",
+                    f"harness-{job.operation.work_order.harness}",
+                }
+                if (
+                    not capabilities.remote
+                    or not required <= capabilities.features
+                    or heartbeat is None
+                    or heartbeat.active_runs != 0
+                    or any(
+                        allocation.node_id == node_id
+                        and allocation.state.value == "ACTIVE"
+                        for allocation in self._store.list_allocations()
+                    )
+                    or utc_now() - heartbeat.observed_at > timedelta(seconds=30)
+                ):
+                    continue
             if capabilities.remote and job.operation is None:
                 # A remote code harness also needs an authenticated remote
                 # source/workspace lifecycle.  This MVP's distributed path is
