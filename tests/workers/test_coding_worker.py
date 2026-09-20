@@ -444,6 +444,131 @@ def test_terminal_usage_crossing_ceiling_never_cancels_completed_turn(tmp_path):
     asyncio.run(scenario())
 
 
+class CheckpointProvider(Provider):
+    def __init__(self):
+        super().__init__(block=True)
+
+    def observe(self, run_id):
+        from agentd.domain.models import RunObservation, TokenUsage
+
+        result = RunResult(
+            RunOutcome.CANCELLED,
+            "stopped",
+            usage=TokenUsage(input_tokens=10),
+            metadata={"telemetry_valid": True},
+        )
+        return RunObservation(
+            run_id,
+            "thread",
+            "turn",
+            "1",
+            terminal=self.cancelled,
+            usage=result.usage,
+            result=result if self.cancelled else None,
+        )
+
+    async def collect(self, run):
+        await self.event.wait()
+        return self.observe(run.id).result
+
+    async def cancel(self, run):
+        self.cancelled = True
+        self.event.set()
+
+
+def test_trusted_handoff_excludes_the_same_scratch_as_commit_capture(tmp_path):
+    async def scenario():
+        worker, provider, contract = setup(tmp_path)
+        handle = await worker.start_managed("run", contract)
+        path = Path(provider.execution.working_directory)
+        scratch = path / "pytest-of-fixture"
+        scratch.mkdir()
+        (scratch / "temporary.sqlite").write_bytes(b"test scratch")
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.COMPLETED
+        assert "pytest-of-fixture" not in git(path, "ls-tree", "--name-only", "HEAD")
+
+    asyncio.run(scenario())
+
+
+def test_checkpoint_restart_continues_edits_and_preserves_original_result(tmp_path):
+    import json
+
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        provider = CheckpointProvider()
+        worker.harnesses["codex"] = provider
+        handle = await worker.start_managed("first", contract)
+        await asyncio.sleep(0)
+        (Path(provider.execution.working_directory) / "partial.txt").write_text(
+            "retained\n"
+        )
+        await worker.interrupt(handle)
+        stopped = await worker.collect(handle)
+        checkpoint = stopped.metadata["coding_checkpoint"]
+        assert checkpoint["cumulative_quota"] == 10
+        original = (worker._lease("first") / "result.json").read_bytes()
+        await worker.interrupt(handle)
+        assert (worker._lease("first") / "result.json").read_bytes() == original
+        assert json.loads(original)["outcome"] == "cancelled"
+        new_provider = Provider()
+        restarted = CodingHarnessDriver(
+            worker.root,
+            worker.profiles,
+            {"codex": new_provider},
+            runner=worker.runner,
+            account_pools=worker.account_pools,
+        )
+        order = replace(
+            contract.operation.work_order,
+            resume_from_run_id="first",
+            prior_consumed_quota=10,
+        )
+        resumed = await restarted.start_managed(
+            "second", replace(contract, operation=CodingOperation(order))
+        )
+        path = Path(new_provider.execution.working_directory)
+        assert (path / "partial.txt").read_text() == "retained\n"
+        assert path != Path(provider.execution.working_directory)
+        assert git(path, "rev-parse", "HEAD") == checkpoint["result_commit"]
+        result = await restarted.collect(resumed)
+        assert result.outcome is RunOutcome.COMPLETED
+        assert result.metadata["coding_evidence"]["base_commit"] == order.base_commit
+        assert new_provider.starts == 1
+        assert (worker._lease("first") / "result.json").read_bytes() == original
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", ["source", "usage", "bundle"])
+def test_continuation_rejects_mismatched_or_tampered_checkpoint(tmp_path, mutation):
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        provider = CheckpointProvider()
+        worker.harnesses["codex"] = provider
+        handle = await worker.start_managed("first", contract)
+        await asyncio.sleep(0)
+        await worker.interrupt(handle)
+        order = replace(
+            contract.operation.work_order,
+            resume_from_run_id="first",
+            prior_consumed_quota=10,
+        )
+        if mutation == "source":
+            order = replace(order, source_revision="b" * 64)
+        elif mutation == "usage":
+            order = replace(order, prior_consumed_quota=9)
+        else:
+            (worker._lease("first") / "result.bundle").write_bytes(b"changed")
+        with pytest.raises(OperationError):
+            await worker.start_managed(
+                "second", replace(contract, operation=CodingOperation(order))
+            )
+        assert provider.starts == 1
+
+    asyncio.run(scenario())
+
+
 def test_restart_finalizes_persisted_provider_terminal_without_recoding(
     tmp_path, monkeypatch
 ):

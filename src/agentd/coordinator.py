@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
 from inspect import isawaitable
+from typing import Any
 
 from agentd.domain.enums import (
     ArtifactKind,
@@ -940,6 +941,13 @@ class SchedulerCoordinator:
             first_error = error
         for run in self._store.list_runs():
             job = self._store.get_job(run.job_id)
+            if (
+                job.state is JobState.SUSPENDED
+                and isinstance(job.operation, CodingOperation)
+                and run == self._store.latest_run(job.id)
+            ):
+                await self.complete(job.id)
+                continue
             if job.state not in {
                 JobState.RUNNING,
                 JobState.DRAINING,
@@ -1133,10 +1141,10 @@ class SchedulerCoordinator:
                 job.quota_budget.pool_id
             )
         self._enqueue_usage_policy(job, run, snapshot, at=at, observation=observation)
-        # Coding MVP retains the stopped lease for diagnosis. It does not accept
-        # arbitrary follow-up intent or automatically resume a checkpoint.
         for command in self._store.list_pending_run_commands(run.id):
-            if command.action in {"checkpoint", "suspend", "interrupt", "cancel"}:
+            if command.action == "cancel":
+                await self._cancel_run(run)
+            elif command.action in {"checkpoint", "suspend", "interrupt"}:
                 await self._interrupt_run(run)
             elif command.action != "steer":
                 continue
@@ -1150,7 +1158,7 @@ class SchedulerCoordinator:
                     metadata={
                         "backend": run.backend,
                         "remote": True,
-                        "coding_policy": "bounded-stop",
+                        "coding_policy": "durable-checkpoint",
                     },
                 )
             )
@@ -1374,18 +1382,58 @@ class SchedulerCoordinator:
         self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, final_run))
         return suspended
 
-    async def resume(self, job_id: str) -> Job:
+    async def resume(
+        self,
+        job_id: str,
+        *,
+        maximum_tokens: float | None = None,
+        actor: str | None = None,
+    ) -> Job:
         job = self._store.get_job(job_id)
         if job.state is not JobState.SUSPENDED:
             raise LifecycleError(f"Job {job_id} is not suspended")
+        original = job
+        if maximum_tokens is not None:
+            if (
+                not actor
+                or not actor.strip()
+                or not isinstance(job.operation, CodingOperation)
+            ):
+                raise LifecycleError(
+                    "Coding budget replanning requires an identified operator"
+                )
+            job = replace(
+                job,
+                quota_budget=replace(job.quota_budget, maximum=maximum_tokens),
+                operation=CodingOperation(
+                    replace(job.operation.work_order, maximum_quota=maximum_tokens)
+                ),
+            )
         maximum = job.quota_budget.maximum
         if maximum is not None and self._job_consumed(job.id) >= maximum - 1e-9:
             raise LifecycleError(f"Job {job_id} exhausted its cumulative quota maximum")
-        return self._transition(
+        if isinstance(job.operation, CodingOperation):
+            if self._store.latest_checkpoint(job.id) is None:
+                raise LifecycleError("Coding resume requires a durable checkpoint")
+            if should_checkpoint_for_maximum(
+                self._job_consumed(job.id), maximum, self._usage_policy
+            ):
+                raise LifecycleError(
+                    "Replan the cumulative job budget before resuming "
+                    "at its checkpoint threshold"
+                )
+        resumed, event = transition_job(
             job,
             JobState.READY,
-            "resume requested; queued for a new run attempt",
+            (
+                f"resume requested by {actor}; cumulative maximum {maximum}; "
+                "queued for a new run attempt"
+                if actor
+                else "resume requested; queued for a new run attempt"
+            ),
         )
+        self._store.save_job(resumed, event, expected=original)
+        return resumed
 
     async def request_review(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
@@ -1460,6 +1508,12 @@ class SchedulerCoordinator:
 
     async def complete(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
+        if job.state is JobState.SUSPENDED and isinstance(
+            job.operation, CodingOperation
+        ):
+            run = self._require_latest_run(job_id)
+            self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, run))
+            return job
         if job.terminal:
             latest = self._store.latest_run(job_id)
             if latest is not None:
@@ -1505,11 +1559,21 @@ class SchedulerCoordinator:
             and job.state is JobState.RUNNING
         ):
             target = JobState.REVIEW
+        checkpoint = result.metadata.get("coding_checkpoint")
+        if (
+            isinstance(run.contract.operation, CodingOperation)
+            and isinstance(checkpoint, dict)
+            and result.outcome is not RunOutcome.COMPLETED
+        ):
+            self._save_coding_checkpoint(job, run, checkpoint)
+            target = JobState.SUSPENDED
         run_state = {
             RunOutcome.COMPLETED: RunState.COMPLETED,
             RunOutcome.FAILED: RunState.FAILED,
             RunOutcome.CANCELLED: RunState.CANCELLED,
         }[result.outcome]
+        if target is JobState.SUSPENDED:
+            run_state = RunState.SUSPENDED
 
         final_run = replace(
             run,
@@ -1542,6 +1606,11 @@ class SchedulerCoordinator:
                 expected_job=job,
                 expected_run=run,
             )
+        if target is JobState.SUSPENDED:
+            self._raise_cleanup_errors(
+                self._cleanup_execution_capacity(job_id, final_run)
+            )
+            return completed
         self._raise_cleanup_errors(
             self._cleanup_job_resources(
                 job_id,
@@ -1873,6 +1942,16 @@ class SchedulerCoordinator:
         resolved_operation = (
             operation if operation is not None else self._resolve_artifacts(job)[1]
         )
+        if isinstance(resolved_operation, CodingOperation):
+            checkpoint = self._store.latest_checkpoint(job.id)
+            if checkpoint is not None:
+                resolved_operation = CodingOperation(
+                    replace(
+                        resolved_operation.work_order,
+                        resume_from_run_id=checkpoint.run_id,
+                        prior_consumed_quota=self._job_consumed(job.id),
+                    )
+                )
         typed_operation = self._is_operation_workspace(workspace)
         return ExecutionContract(
             job_id=job.id,
@@ -1905,6 +1984,83 @@ class SchedulerCoordinator:
             artifact_inputs=resolved_inputs,
             artifact_outputs=job.artifact_outputs,
             operation=resolved_operation,
+        )
+
+    def _save_coding_checkpoint(
+        self, job: Job, run: RunRecord, evidence: dict[str, Any]
+    ) -> None:
+        if not isinstance(run.contract.operation, CodingOperation):
+            raise LifecycleError("Checkpoint requires a coding operation")
+        order = run.contract.operation.work_order
+        for key, value in {
+            "run_id": run.id,
+            "job_id": job.id,
+            "repository": order.repository,
+            "base_commit": order.base_commit,
+            "source_revision": order.source_revision,
+            "profile_digest": order.profile_digest,
+        }.items():
+            if evidence.get(key) != value:
+                raise LifecycleError("Coding checkpoint identity mismatch")
+        commit = evidence.get("result_commit")
+        if (
+            not isinstance(commit, str)
+            or len(commit) not in (40, 64)
+            or any(c not in "0123456789abcdef" for c in commit)
+        ):
+            raise LifecycleError("Coding checkpoint requires an exact commit")
+        capsule = ResumeCapsule(
+            commit=commit,
+            current=("Retained coding edits require completion and validation",),
+            next_steps=(
+                "Continue the original issue from this checkpoint; "
+                "do not redo completed edits",
+            ),
+        )
+        prior = self._store.latest_checkpoint(job.id)
+        if prior is None or prior.run_id != run.id or prior.capsule != capsule:
+            self._store.save_checkpoint(
+                Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
+            )
+
+    def restore_coding_checkpoint(
+        self, job_id: str, evidence: dict[str, Any], *, actor: str
+    ) -> Job:
+        """Trusted administrative recovery of a legacy stopped coding attempt.
+
+        Evidence must be obtained from the worker's administrative capture API.
+        The original run/result/charges remain immutable; this only restores the
+        job to a suspended checkpoint, never directly admits provider work.
+        """
+        job = self._store.get_job(job_id)
+        run = self._require_latest_run(job_id)
+        if not actor.strip() or job.state not in {
+            JobState.CANCELLED,
+            JobState.FAILED,
+            JobState.SUSPENDED,
+        }:
+            raise LifecycleError(
+                "Recovery requires an identified operator and stopped job"
+            )
+        if (
+            run.result is None
+            or run.result.metadata.get("telemetry_valid") is not True
+            or run.result.usage is None
+        ):
+            raise LifecycleError("Recovery requires reconciled terminal usage")
+        if (
+            self._store.find_active_run(job.id) is not None
+            or self._store.find_active_reservation(job.id) is not None
+            or self._store.find_active_allocation(job.id) is not None
+        ):
+            raise LifecycleError("Recovery ownership or accounting is unresolved")
+        self._save_coding_checkpoint(job, run, evidence)
+        if job.state is JobState.SUSPENDED:
+            return job
+        return self._transition(
+            job,
+            JobState.SUSPENDED,
+            f"Operator {actor} restored retained coding checkpoint from run {run.id}",
         )
 
     def _resolve_artifacts(

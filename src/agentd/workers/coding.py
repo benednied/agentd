@@ -50,7 +50,7 @@ from agentd.workers.operations import (
     SubprocessCommandRunner,
     _git_environment,
 )
-from agentd.workspaces.git import GitWorkspaceManager
+from agentd.workspaces.git import _RUNTIME_SCRATCH_PATHS, GitWorkspaceManager
 
 CODING_DRIVER = "remote-coding"
 MAX_BUNDLE_BYTES = 262_144
@@ -93,6 +93,7 @@ class CodingHarnessDriver:
 
     def capabilities(self) -> HarnessCapabilities:
         features = {"remote-coding"}
+        features.add("coding-checkpoints")
         models: set[str] = set()
         for name, driver in self.harnesses.items():
             caps = driver.capabilities()
@@ -168,6 +169,28 @@ class CodingHarnessDriver:
         workspace = await cache.checkout(
             profile.clone_url, ArtifactRef(ArtifactKind.GIT_COMMIT, order.base_commit)
         )
+        resume_commit = order.base_commit
+        if order.resume_from_run_id is not None:
+            checkpoint = self._read_checkpoint(order.resume_from_run_id, order)
+            resume_commit = checkpoint["result_commit"]
+            if resume_commit != order.base_commit:
+                await self.runner.run(
+                    (
+                        "git",
+                        "-c",
+                        "core.hooksPath=" + os.devnull,
+                        "-c",
+                        "core.fsmonitor=false",
+                        "--git-dir",
+                        str(workspace.mirror),
+                        "fetch",
+                        "--no-tags",
+                        "--",
+                        str(self._lease(order.resume_from_run_id) / "result.bundle"),
+                        resume_commit,
+                    ),
+                    environment=_git_environment(),
+                )
         manager = self._workspace_manager(lease / "coding-worktrees")
         job = Job(
             id=order.job_id,
@@ -182,7 +205,7 @@ class CodingHarnessDriver:
             ),
             effort=EffortEstimate(1, 1),
         )
-        coding_lease = await asyncio.to_thread(manager.allocate, job, order.base_commit)
+        coding_lease = await asyncio.to_thread(manager.allocate, job, resume_commit)
         workspace = replace(workspace, path=Path(coding_lease.working_directory))
         self._write(lease / "workspace.json", coding_lease.to_dict())
         # Controller fields outside the typed work order are not worker authority.
@@ -244,7 +267,8 @@ class CodingHarnessDriver:
                         if (
                             observation is not None
                             and observation.usage is not None
-                            and observation.usage.total_tokens >= order.maximum_quota
+                            and observation.usage.total_tokens
+                            >= order.maximum_quota - order.prior_consumed_quota
                         ):
                             if observation.terminal:
                                 break
@@ -409,9 +433,14 @@ class CodingHarnessDriver:
         """Finalize a proven durable SDK terminal result without starting a turn."""
         lock = self._recovery_locks.setdefault(run_id, asyncio.Lock())
         async with lock:
-            persisted = self.load_terminal_result(run_id)
+            persisted = self._raw_terminal_result(run_id)
             if persisted is not None:
-                return persisted
+                if (self._lease(run_id) / "checkpoint-request.json").is_file():
+                    live = self._runs.get(run_id)
+                    if live and live.task and not live.task.done():
+                        return None
+                    await self.capture_checkpoint(run_id)
+                return self.load_terminal_result(run_id)
             live = self._runs.get(run_id)
             if live is not None and live.task is not None and not live.task.done():
                 return None
@@ -446,7 +475,14 @@ class CodingHarnessDriver:
             )
             if (
                 lease.job_id != order.job_id
-                or lease.base_ref != order.base_commit
+                or lease.base_ref
+                != (
+                    self._read_checkpoint(order.resume_from_run_id, order)[
+                        "result_commit"
+                    ]
+                    if order.resume_from_run_id is not None
+                    else order.base_commit
+                )
                 or not Path(lease.working_directory)
                 .resolve()
                 .is_relative_to(root / "coding-worktrees")
@@ -525,7 +561,12 @@ class CodingHarnessDriver:
         )
 
     async def _evidence(
-        self, run_id: str, state: _CodingRun, execution: ExecutionContract
+        self,
+        run_id: str,
+        state: _CodingRun,
+        execution: ExecutionContract,
+        *,
+        allow_empty: bool = False,
     ) -> dict[str, Any]:
         assert isinstance(execution.operation, CodingOperation)
         order = execution.operation.work_order
@@ -601,12 +642,24 @@ class CodingHarnessDriver:
         head = (await git("rev-parse", "HEAD^{commit}")).decode().strip()
         ArtifactRef(ArtifactKind.GIT_COMMIT, head)
         await git("merge-base", "--is-ancestor", order.base_commit, head)
-        if await git("status", "--porcelain=v1", "--untracked-files=all"):
+        # Match the existing trusted commit owner's scratch exclusions. Pytest
+        # can fall back to a lease-local temp directory inside the sandbox.
+        if await git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+            *_RUNTIME_SCRATCH_PATHS,
+        ):
             raise OperationError("coding result contains uncommitted changes")
-        if head == order.base_commit:
+        if head == order.base_commit and not allow_empty:
             raise OperationError("coding result contains no commit")
         bundle = self._lease(run_id) / "result.bundle"
-        await git("bundle", "create", str(bundle), "HEAD", f"^{order.base_commit}")
+        if head == order.base_commit:
+            bundle.write_bytes(b"")
+        else:
+            await git("bundle", "create", str(bundle), "HEAD", f"^{order.base_commit}")
         if bundle.stat().st_size > MAX_BUNDLE_BYTES:
             raise OperationError("coding bundle requires operator collection")
         data = bundle.read_bytes()
@@ -625,11 +678,32 @@ class CodingHarnessDriver:
             ],
         }
 
-    def load_terminal_result(self, run_id: str) -> RunResult | None:
+    def _raw_terminal_result(self, run_id: str) -> RunResult | None:
         path = self._lease(run_id) / "result.json"
         if not path.is_file():
             return None
         return RunResult.from_dict(json.loads(path.read_text()))
+
+    def load_terminal_result(self, run_id: str) -> RunResult | None:
+        result = self._raw_terminal_result(run_id)
+        root = self._lease(run_id)
+        path = root / "checkpoint.json"
+        if (root / "checkpoint-request.json").is_file() and not path.is_file():
+            return None
+        if result is not None and path.is_file():
+            checkpoint = json.loads(path.read_text())
+            result = replace(
+                result,
+                metadata={
+                    **result.metadata,
+                    "coding_checkpoint": {
+                        key: value
+                        for key, value in checkpoint.items()
+                        if key != "bundle_chunks"
+                    },
+                },
+            )
+        return result
 
     async def recover(
         self,
@@ -667,7 +741,129 @@ class CodingHarnessDriver:
         raise OperationError("remote coding does not accept out-of-order intent")
 
     async def interrupt(self, run: RunHandle) -> None:
+        # Persist intent first. A retry/restart can finish capture without
+        # starting another provider turn or confusing interruption with cancel.
+        if self._raw_terminal_result(run.id) is not None:
+            if (self._lease(run.id) / "checkpoint-request.json").is_file():
+                await self.capture_checkpoint(run.id)
+            return
+        self._write(self._lease(run.id) / "checkpoint-request.json", {"run_id": run.id})
         await self.cancel(run)
+        await self.capture_checkpoint(run.id)
+
+    def _read_checkpoint(self, run_id: str, order: CodingWorkOrder) -> dict[str, Any]:
+        root = self._lease(run_id)
+        checkpoint = json.loads((root / "checkpoint.json").read_text())
+        claim = json.loads((root / "claim.json").read_text())
+        previous = CodingWorkOrder.from_dict(claim["work_order"])
+        if claim["run_id"] != run_id or claim["fingerprint"] != fingerprint(
+            previous.to_dict()
+        ):
+            raise OperationError("checkpoint claim identity mismatch")
+        for field in (
+            "job_id",
+            "repository",
+            "profile_digest",
+            "source_revision",
+            "base_commit",
+            "objective",
+            "harness",
+            "account_pool_id",
+        ):
+            if getattr(previous, field) != getattr(order, field):
+                raise OperationError("checkpoint belongs to different work")
+        if checkpoint["run_id"] != run_id or checkpoint["job_id"] != order.job_id:
+            raise OperationError("checkpoint identity mismatch")
+        if order.prior_consumed_quota < checkpoint["cumulative_quota"]:
+            raise OperationError("continuation would erase prior usage")
+        if self.load_terminal_result(run_id) is None:
+            raise OperationError("checkpoint ownership remains unresolved")
+        bundle = root / "result.bundle"
+        if (
+            bundle.is_symlink()
+            or hashlib.sha256(bundle.read_bytes()).hexdigest()
+            != checkpoint["bundle_sha256"]
+        ):
+            raise OperationError("checkpoint bundle changed")
+        return checkpoint
+
+    async def capture_checkpoint(self, run_id: str) -> dict[str, Any]:
+        """Capture a proven stopped lease; also supports audited legacy recovery.
+
+        Administrative API only: never starts a model or rewrites the original
+        terminal result. The sidecar preserves checkpoint capture across crashes.
+        """
+        root = self._lease(run_id)
+        path = root / "checkpoint.json"
+        if path.is_file():
+            return json.loads(path.read_text())
+        result = self._raw_terminal_result(run_id)
+        live = self._runs.get(run_id)
+        if result is None or (live and live.task and not live.task.done()):
+            raise CodingOwnershipUnresolved("checkpoint requires terminal ownership")
+        if result.metadata.get("telemetry_valid") is not True or result.usage is None:
+            raise OperationError("checkpoint requires reconciled token usage")
+        claim = json.loads((root / "claim.json").read_text())
+        order = CodingWorkOrder.from_dict(claim["work_order"])
+        if claim["run_id"] != run_id or claim["fingerprint"] != fingerprint(
+            order.to_dict()
+        ):
+            raise OperationError("checkpoint claim identity mismatch")
+        order.validate_profile(self.profiles[order.profile_id])
+        lease = WorkspaceLease.from_dict(
+            json.loads((root / "workspace.json").read_text())
+        )
+        if lease.job_id != order.job_id or not Path(
+            lease.working_directory
+        ).resolve().is_relative_to(root / "coding-worktrees"):
+            raise OperationError("checkpoint workspace identity mismatch")
+        driver = self.harnesses[order.harness]
+        observation = driver.observe(run_id)
+        if observation is not None and not observation.terminal:
+            raise CodingOwnershipUnresolved("checkpoint provider is still active")
+        mirror = (
+            root
+            / "mirrors"
+            / hashlib.sha256(
+                self.profiles[order.profile_id].clone_url.encode()
+            ).hexdigest()
+        )
+        workspace = GitWorkspace(
+            self.profiles[order.profile_id].clone_url,
+            ArtifactRef(ArtifactKind.GIT_COMMIT, order.base_commit),
+            Path(lease.working_directory),
+            mirror,
+        )
+        state = _CodingRun(
+            driver,
+            RunHandle(run_id, order.harness),
+            workspace,
+            lease,
+            self._workspace_manager(root / "coding-worktrees"),
+        )
+        execution = ExecutionContract(
+            order.job_id,
+            order.objective,
+            "checkpoint",
+            (),
+            {},
+            "implementer",
+            (lease.working_directory,),
+            "",
+            (),
+            "",
+            lease.working_directory,
+            {},
+            "standard",
+            operation=CodingOperation(order),
+        )
+        evidence = await self._evidence(run_id, state, execution, allow_empty=True)
+        checkpoint = {
+            **evidence,
+            "cumulative_quota": order.prior_consumed_quota + result.usage.total_tokens,
+        }
+        self._write(path, checkpoint)
+        return checkpoint
 
     async def cancel(self, run: RunHandle) -> None:
         state = self._runs.get(run.id)

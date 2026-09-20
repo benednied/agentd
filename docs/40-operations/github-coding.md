@@ -1,5 +1,62 @@
 # Authorized GitHub coding
 
+## Checkpointing and continuation
+
+Remote coding now treats an interrupt/checkpoint separately from explicit
+cancellation. After terminal provider ownership and valid usage are established,
+the worker captures the retained edits with the trusted Git handoff owner and
+writes an immutable checkpoint sidecar. The controller records `SUSPENDED`,
+releases execution capacity, and retains the job, run history and charged usage.
+Checkpoint capture can be finished after restart without another model call.
+
+Continuation starts a **new run attempt and model session** on the same worker,
+from the verified checkpoint commit. It is not a reattachment to a dead process.
+The original issue, approval revision, repository, profile, base commit and
+account must still match. The original failed/cancelled result remains intact.
+The final draft includes the accumulated edits against the original PR base.
+The worker SDK stores a separate execution envelope for each attempt, retaining
+the logical job identity in its typed work order. Each envelope has its own
+reservation; previous worker rows and usage samples remain unchanged.
+
+`serve` automatically queues suspended checkpoints when fresh provider telemetry
+allows admission and source approval remains valid. Set
+`auto_resume_checkpoints: false` to require an operator. A provider reset does
+not refill a job's cumulative token budget. Jobs at their 90% checkpoint threshold
+remain suspended until their budget is explicitly replanned:
+
+```sh
+agentd github --config controller.json resume JOB_ID --actor operator
+agentd github --config controller.json resume JOB_ID --actor operator --maximum-tokens 2000000
+```
+
+The new maximum is cumulative across attempts, not an additional allowance.
+Remaining quota reservations, provider admission and worker limits still apply.
+Unknown ownership, invalid telemetry, changed source and tampered checkpoint
+bundles fail closed. No automatic merge or duplicate publication is introduced.
+
+For legacy cancelled/failed runs, first quiesce the dedicated worker and use
+`tools/qualify_coding_worker.py` with its existing protected deployment arguments
+plus `--capture-run RUN_ID`. This administrative mode performs the containment
+preflight and captures a proven terminal workspace without starting a model.
+Save the returned checkpoint descriptor in an operator-controlled JSON file:
+
+```sh
+agentd github --config controller.json recover JOB_ID --actor operator --checkpoint checkpoint.json
+agentd github --config controller.json resume JOB_ID --actor operator
+```
+
+`recover` only restores a suspended checkpoint; it does not execute anything or
+erase the original terminal result/accounting. The descriptor is trusted operator
+input from the worker capture command, never issue-supplied text. Retain worker
+state and bundles until all continuation/review work is resolved.
+
+Effort estimates default to half/the full profile runtime in minutes. Override
+`effort_p50_minutes` and `effort_p90_minutes` for the workload; the old fixed
+three/five-minute estimates were unsuitable for longer coding jobs. Both
+`background_block_used_percent` and `urgent_only_used_percent` are explicit
+operator policy (defaults 75 and 90, with the former strictly lower). Neither
+setting bypasses fresh observations or provider exhaustion checks.
+
 The bounded implementation composes the existing daemon, scheduler, quota
 accounting, authenticated worker protocol, and review handoff. It has no public
 control API. Enable it only inside one trusted administrative domain with a

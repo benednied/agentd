@@ -14,9 +14,9 @@ from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.descriptor import RemoteCodingDescriptor
 from agentd.coding.models import RepositoryProfile
 from agentd.coding.pipeline import CodingPublicationReconciler
-from agentd.coordinator import SchedulerCoordinator
+from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.daemon import AgentDaemon
-from agentd.domain.enums import QuotaUnit
+from agentd.domain.enums import JobState, QuotaUnit
 from agentd.domain.models import (
     EffortEstimate,
     ProviderQuotaSnapshot,
@@ -27,7 +27,7 @@ from agentd.domain.models import (
 )
 from agentd.harness.registry import DriverRegistry
 from agentd.intake.github import GitHubIssueSource
-from agentd.intake.models import IntakePolicy
+from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.intake.service import GitHubIntake
 from agentd.publication import (
     BubblewrapValidationRunner,
@@ -37,7 +37,10 @@ from agentd.publication import (
     PublicationStore,
     TrustedFinalizer,
 )
-from agentd.runtime.accounts import AccountPolicyThresholds
+from agentd.runtime.accounts import (
+    AccountPolicyThresholds,
+    unattended_provider_wait_reason,
+)
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.client import RemoteWorkerClient
@@ -104,7 +107,10 @@ def create_intake(config: dict[str, Any], store: SQLiteStateStore) -> GitHubInta
             pool_id=config["account_pool"],
             unit=QuotaUnit.TOKENS,
         ),
-        EffortEstimate(3, 5),
+        EffortEstimate(
+            config.get("effort_p50_minutes", profile.max_runtime_seconds / 120),
+            config.get("effort_p90_minutes", profile.max_runtime_seconds / 60),
+        ),
     )
     return GitHubIntake(
         store,
@@ -128,6 +134,7 @@ class CodingController:
     intake: GitHubIntake
     publications: CodingPublicationReconciler
     daemon: AgentDaemon
+    coordinator: SchedulerCoordinator
 
     async def aclose(self) -> None:
         try:
@@ -177,7 +184,8 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             account_policy=AccountPolicyThresholds(
                 background_block_used_percent=config.get(
                     "background_block_used_percent", 75
-                )
+                ),
+                urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
             ),
         )
         plane = ControlPlane(store, coordinator=coordinator)
@@ -219,6 +227,31 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         last_reports: dict[str, str] = {}
 
         async def publish() -> None:
+            if config.get("auto_resume_checkpoints", True):
+                snapshot = store.latest_provider_quota_snapshot(config["account_pool"])
+                policy = AccountPolicyThresholds(
+                    background_block_used_percent=config.get(
+                        "background_block_used_percent", 75
+                    ),
+                    urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
+                )
+                if unattended_provider_wait_reason(snapshot, policy=policy) is None:
+                    for job in store.list_jobs(frozenset({JobState.SUSPENDED})):
+                        if store.latest_checkpoint(job.id) is None:
+                            continue
+                        try:
+                            source = store.github_source_for_job(job.id)
+                            if source is None:
+                                continue
+                            await asyncio.to_thread(
+                                intake.refresh_authorization,
+                                SourceIssue.from_dict(json.loads(source["payload"])),
+                            )
+                            await coordinator.resume(job.id)
+                        except (LifecycleError, ValueError):
+                            # Resetting the provider account does not authorize
+                            # more cumulative job budget or changed source intent.
+                            continue
             for result in await publications.reconcile():
                 key = str(result.get("job_id") or result.get("url"))
                 report = json.dumps(result, sort_keys=True)
@@ -245,7 +278,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             source_reconciler=intake.poll,
             result_reconciler=publish,
         )
-        return CodingController(store, client, intake, publications, daemon)
+        return CodingController(
+            store, client, intake, publications, daemon, coordinator
+        )
     except BaseException:
         store.close()
         raise

@@ -143,16 +143,54 @@ def test_worker_envelope_records_real_usage_without_admitting_jobs(
     assert store.get_quota_pool("execution-envelope:run").remaining == 180
     assert store.get_reservation(application.reservation.id).consumed == 20
 
+    # Resume the SAME logical job through the actual persistent envelope store.
+    # The checkpoint layer has already validated the retained source and usage.
+    original_job = store.get_job("worker-envelope:run")
+    original_run = store.get_run("run")
+    resumed = replace(
+        contract,
+        working_directory=str(tmp_path / "resumed"),
+        operation=CodingOperation(
+            replace(order, resume_from_run_id="run", prior_consumed_quota=20)
+        ),
+    )
+    asyncio.run(driver.start_managed("run-resumed", resumed))
+    assert store.get_job("worker-envelope:run") == original_job
+    assert store.get_run("run") == original_run
+    assert store.get_workspace("run-resumed").job_id == "worker-envelope:run-resumed"
+    assert store.get_run("run-resumed").contract.operation.work_order.job_id == "job"
+    assert store.get_quota_pool("execution-envelope:run-resumed").remaining == 180
+    resumed_usage = store.apply_usage_sample(
+        UsageSample(
+            "run-resumed",
+            "thread-2",
+            "turn-2",
+            1,
+            7,
+            unit=QuotaUnit.TOKENS,
+            tokens=TokenUsage(output_tokens=7),
+        )
+    )
+    assert resumed_usage.pool.remaining == 173
+    assert store.get_quota_pool("execution-envelope:run").remaining == 180
+    assert store.get_reservation(application.reservation.id).consumed == 20
+    # Repeating an attempt must fail before SDK start, without overwriting it.
+    with pytest.raises(coding_runtime.CodingPreparationError):
+        asyncio.run(driver.start_managed("run-resumed", resumed))
+    assert store.get_run("run") == original_run
+    assert store.get_quota_pool("execution-envelope:run-resumed").remaining == 173
+
     from agentd.domain.enums import JobState
     from agentd.domain.models import StateTransition
 
     # Reproduce the old partial state left at save_node, before any SDK call.
     legacy_order = replace(order, job_id="legacy-job")
     legacy_job = replace(
-        store.get_job("job"),
+        store.get_job("worker-envelope:run"),
         id=legacy_order.job_id,
         quota_budget=replace(
-            store.get_job("job").quota_budget, pool_id="execution-envelope:legacy-run"
+            store.get_job("worker-envelope:run").quota_budget,
+            pool_id="execution-envelope:legacy-run",
         ),
     )
     store.create_job(
@@ -182,7 +220,7 @@ def test_worker_envelope_records_real_usage_without_admitting_jobs(
     with pytest.raises(coding_runtime.CodingPreparationError):
         asyncio.run(driver.start_managed("run-3", third))
     for lookup, identity in (
-        (store.get_job, "job-3"),
+        (store.get_job, "worker-envelope:run-3"),
         (store.get_run, "run-3"),
         (store.get_workspace, "run-3"),
         (store.get_quota_pool, "execution-envelope:run-3"),
