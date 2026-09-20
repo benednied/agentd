@@ -81,3 +81,15 @@ class GitHubIntake:
         self.store.observe_github_issue(issue, policy)
         self.store.approve_github_issue(issue, policy, actor=actor)
         return issue
+
+    def refresh_authorization(self, issue: SourceIssue) -> None:
+        """Recheck live authority at the publication boundary, including identity."""
+        policy = self.policies[issue.repository]
+        current = self.source.get(issue.repository, issue.number)
+        self.store.observe_github_issue(current, policy)
+        if (
+            current.key != issue.key
+            or current.revision != issue.revision
+            or not policy.eligible(current)
+        ):
+            raise ValueError("Source authorization changed before publication")

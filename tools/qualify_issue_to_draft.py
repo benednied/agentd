@@ -196,6 +196,7 @@ async def qualify(config: dict[str, Any], approve_as: str | None) -> dict[str, A
         {profile.id: profile},
         {profile.repository: Path(config["object_cache"])},
         {profile.repository: config["base_branch"]},
+        source_refresh=intake.refresh_authorization,
     )
 
     async def refresh_source() -> None:

@@ -124,6 +124,28 @@ started no provider calls and did not modify the production service.
 
 ## Review and operational boundary
 
+### Operational hardening, 2026-09-20
+
+The integrated suite now passes **649 tests**. The installed `agentd github`
+commands support administrative approval, continuous discovery/execution/publication,
+and durable status inspection. New coverage exercises this actual controller
+composition over authenticated TCP and real Git, including lost push/create
+responses and restart with one execution, one draft, and unchanged charged quota.
+The test provider and GitHub adapter are controlled fixtures; this is additional
+operational regression coverage, not a claim of another real provider run.
+
+New regressions verify fresh quota polling for newly ingested remote coding and
+live source authorization after validation (including closure, edits, eligibility
+removal, and identity replacement). Approval/status work without a running worker.
+Restart registration preserves remaining, reserved, and debt balances. Lint,
+formatting, documentation checks, and targeted module typing pass.
+
+The current macOS validation probe and the already deployed HP Linux validation
+probe both passed their synthetic credential, filesystem, Git metadata, and network
+checks. The HP container was healthy during inspection. The successful real #74
+result remains draft #75 at the recorded commit with passing CI; no additional
+provider work or production service restart was required for these checks.
+
 Implementation remains in review PRs #67–#70 and #73. The generated draft #75 is
 an output artifact, not permission to merge. The completed slice does not claim
 public API/HA/multi-tenant readiness, or complete #23's unrelated driver matrix.

@@ -55,6 +55,23 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("serve", help="run the continuous local scheduler service")
     commands.add_parser("doctor", help="run read-only service prerequisite checks")
 
+    github = commands.add_parser(
+        "github", help="administer the authorized GitHub issue-to-draft controller"
+    )
+    github.add_argument("--config", type=Path, required=True)
+    github_commands = github.add_subparsers(dest="github_command", required=True)
+    approval = github_commands.add_parser(
+        "approve", help="approve an exact issue revision"
+    )
+    approval.add_argument("issue_number", type=int)
+    approval.add_argument("--actor", required=True)
+    github_commands.add_parser(
+        "serve", help="discover approved issues and reconcile drafts"
+    )
+    github_commands.add_parser(
+        "status", help="show durable coding and publication outcomes"
+    )
+
     worker = commands.add_parser(
         "worker-serve",
         help="run one authenticated remote worker daemon",
@@ -195,6 +212,8 @@ def _run_process_command(
     args: argparse.Namespace,
     config: ServiceConfig,
 ) -> int | None:
+    if args.command == "github":
+        return asyncio.run(_github_command(args))
     if args.command == "serve":
         return asyncio.run(_serve_service(config))
     if args.command == "worker-serve":
@@ -219,6 +238,51 @@ def _run_process_command(
             _print_model(snapshot)
         return 0
     return None
+
+
+async def _github_command(args: argparse.Namespace) -> int:
+    from agentd.coding.controller import (
+        create_controller,
+        create_intake,
+        load_config,
+        status,
+    )
+
+    config = load_config(args.config)
+    if args.github_command != "serve":
+        with _store(config["database"]) as store:
+            if args.github_command == "status":
+                print(json.dumps(status(store), indent=2))
+            else:
+                intake = create_intake(config, store)
+                issue = await asyncio.to_thread(
+                    intake.approve,
+                    config["profile"]["repository"],
+                    args.issue_number,
+                    actor=args.actor,
+                )
+                # Materialize approved work even when it lies beyond the bounded
+                # discovery pages. This command has no execution backend.
+                await intake.reconcile(issue)
+                print(
+                    json.dumps(
+                        {"job_id": issue.job_id, "approved_revision": issue.revision},
+                        indent=2,
+                    )
+                )
+        return 0
+    runtime = create_controller(config)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for received in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(received, stop.set)
+    try:
+        await runtime.daemon.serve(stop)
+    finally:
+        for received in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(received)
+        await runtime.aclose()
+    return 0
 
 
 def _serve_worker(args: argparse.Namespace) -> int:

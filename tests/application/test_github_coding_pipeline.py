@@ -164,7 +164,10 @@ class AmbiguousGitHub:
         raise OSError("PR created but acknowledgement lost")
 
 
-def test_issue_to_one_remote_run_and_reconciled_draft(tmp_path):
+@pytest.mark.parametrize("revoke_during_validation", [False, True])
+def test_issue_to_one_remote_run_and_reconciled_draft(
+    tmp_path, revoke_during_validation
+):
     async def scenario():
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -297,10 +300,19 @@ def test_issue_to_one_remote_run_and_reconciled_draft(tmp_path):
                 list((tmp_path / "unused-controller-worktrees").glob("**/.git")) == []
             )
             github = AmbiguousGitHub()
+            current_issue = [issue]
+
+            class ValidationWithConcurrentEdit(ControlledValidation):
+                def run(self, *args, **kwargs):
+                    result = super().run(*args, **kwargs)
+                    if revoke_during_validation:
+                        current_issue[0] = replace(issue, state="closed")
+                    return result
+
             publisher = DraftPublisher(
                 PublicationStore(store.path),
                 github,
-                TrustedFinalizer(ControlledValidation()),
+                TrustedFinalizer(ValidationWithConcurrentEdit()),
             )
             pipeline = CodingPublicationReconciler(
                 store,
@@ -308,7 +320,16 @@ def test_issue_to_one_remote_run_and_reconciled_draft(tmp_path):
                 {"repo": profile},
                 {"test/repo": repo},
                 {"test/repo": "master"},
+                source_refresh=lambda _: store.observe_github_issue(
+                    current_issue[0], policy
+                ),
             )
+            if revoke_during_validation:
+                with pytest.raises(Exception, match="authorization changed"):
+                    pipeline.publish_job(job.id)
+                assert github.pushes == github.creates == 0
+                assert provider.starts == 1
+                return
             for message in ("push succeeded", "PR created"):
                 with pytest.raises(OSError, match=message):
                     pipeline.publish_job(job.id)
@@ -326,5 +347,158 @@ def test_issue_to_one_remote_run_and_reconciled_draft(tmp_path):
             await server.close()
             journal.close()
             store.close()
+
+    asyncio.run(scenario())
+
+
+def test_operating_controller_polls_executes_publishes_and_restarts(
+    tmp_path, monkeypatch
+):
+    from agentd.coding.controller import create_controller, status
+
+    async def scenario():
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-b", "master")
+        (repo / "README").write_text("base\n")
+        git(repo, "add", ".")
+        git(
+            repo,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@localhost",
+            "commit",
+            "-m",
+            "Base",
+        )
+        profile = RepositoryProfile(
+            "repo",
+            "1",
+            "test/repo",
+            "https://github.com/test/repo.git",
+            validation_commands=(
+                (
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; "
+                    "assert Path('change.txt').read_text() == 'verified\\n'",
+                ),
+            ),
+        )
+        issue = SourceIssue(
+            "test/repo",
+            7,
+            1,
+            "I_1",
+            "Make change",
+            "Intent",
+            "2026-09-20T12:00:00Z",
+            labels=("agentd:approved",),
+        )
+
+        class Source:
+            def poll(self, repository):
+                return (issue,)
+
+            def get(self, repository, number):
+                return issue
+
+        class Oracle:
+            def __init__(self, store):
+                self.store = store
+
+            async def snapshot(self):
+                snapshot = ProviderQuotaSnapshot(
+                    pool_id="account", bucket_id="account", primary_used_percent=10
+                )
+                self.store.append_provider_quota_snapshot(snapshot)
+                return snapshot
+
+        github = AmbiguousGitHub()
+        monkeypatch.setattr("agentd.coding.controller.GitHubIssueSource", Source)
+        monkeypatch.setattr(
+            "agentd.coding.controller.AdministrativeOracle",
+            lambda command, store, pool: Oracle(store),
+        )
+        monkeypatch.setattr(
+            "agentd.coding.controller.GitHubPublicationAdapter", lambda: github
+        )
+        for name in ("MacOSSandboxValidationRunner", "BubblewrapValidationRunner"):
+            monkeypatch.setattr(
+                "agentd.coding.controller." + name, ControlledValidation
+            )
+        provider = ControlledProvider()
+        worker = CodingHarnessDriver(
+            tmp_path / "worker",
+            {"repo": profile},
+            {"codex": provider},
+            runner=FixtureClone(repo),
+            account_pools={"codex": "account"},
+        )
+        journal = OperationJournal(
+            tmp_path / "worker.sqlite", node_id="worker", session_epoch="epoch"
+        )
+        server = WorkerServer(
+            "127.0.0.1",
+            0,
+            node_id="worker",
+            session_epoch="epoch",
+            secret=b"q" * 32,
+            drivers=[worker],
+            journal=journal,
+            allow_insecure_loopback=True,
+        )
+        await server.start()
+        host, port = server.address
+        secret = tmp_path / "secret"
+        secret.write_bytes(b"q" * 32)
+        secret.chmod(0o600)
+        config = {
+            "profile": profile.to_dict(),
+            "repository_id": 7,
+            "base_commit": git(repo, "rev-parse", "HEAD"),
+            "base_branch": "master",
+            "database": str(tmp_path / "controller.sqlite"),
+            "object_cache": str(repo),
+            "unused_workspace_root": str(tmp_path / "unused"),
+            "account_pool": "account",
+            "expected_tokens": 100,
+            "maximum_tokens": 200,
+            "quota_command": ["unused"],
+            "worker": {
+                "name": "remote",
+                "host": host,
+                "port": port,
+                "node_id": "worker",
+                "session_epoch": "epoch",
+                "psk_file": str(secret),
+                "allow_insecure_loopback": True,
+            },
+        }
+        runtime = create_controller(config)
+        try:
+            runtime.intake.approve("test/repo", 1, actor="operator")
+            # Discovery creates work; tick must refresh quota before admitting it.
+            for _ in range(100):
+                await runtime.daemon.tick()
+                records = status(runtime.store)
+                if records and records[0]["pr"]:
+                    break
+                await asyncio.sleep(0.01)
+            assert records[0]["publication_stage"] == "published"
+            assert github.pushes == github.creates == provider.starts == 1
+            assert runtime.store.get_quota_pool("account").remaining == 188
+            await runtime.aclose()
+            runtime = create_controller(config)
+            await runtime.daemon.tick()
+            assert status(runtime.store)[0]["pr"] == records[0]["pr"]
+            assert len(runtime.store.list_runs()) == 1
+            assert runtime.store.get_quota_pool("account").remaining == 188
+            assert github.pushes == github.creates == provider.starts == 1
+        finally:
+            await runtime.aclose()
+            await server.close()
+            journal.close()
 
     asyncio.run(scenario())

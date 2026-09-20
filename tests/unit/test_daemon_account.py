@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
+from agentd.coding.compiler import CodingJobCompiler
+from agentd.coding.models import RepositoryProfile
 from agentd.daemon import AgentDaemon
 from agentd.domain.enums import JobState, QuotaUnit
 from agentd.domain.models import (
@@ -15,6 +17,7 @@ from agentd.domain.models import (
     QuotaResetEvent,
     RunCommand,
 )
+from agentd.intake.models import SourceIssue
 
 
 def _job(identifier: str) -> Job:
@@ -145,6 +148,38 @@ def test_daemon_refreshes_on_interval_and_before_each_new_admission() -> None:
         assert plane.snapshots[-1].id == "snapshot-4"
         assert plane.reconciled[-1] == plane.snapshots[-1]
         assert plane.dispatches == 5
+
+    asyncio.run(scenario())
+
+
+def test_new_remote_coding_intake_refreshes_quota_in_the_same_tick() -> None:
+    async def scenario() -> None:
+        plane = RecordingPlane()
+        plane.jobs = []
+        oracle = RecordingOracle()
+        discovered = []
+
+        async def discover():
+            plane.jobs.extend(discovered)
+            discovered.clear()
+
+        daemon = AgentDaemon(plane, account_oracle=oracle, source_reconciler=discover)
+        await daemon.tick()
+        compiler = CodingJobCompiler(
+            RepositoryProfile(
+                "repo", "1", "test/repo", "https://github.com/test/repo.git"
+            ),
+            "a" * 40,
+            QuotaBudget(100, maximum=150, pool_id="codex", unit=QuotaUnit.TOKENS),
+            EffortEstimate(1, 2),
+        )
+        issue = SourceIssue("test/repo", 1, 1, "I_1", "Fix", "", "2026-09-20T12:00:00Z")
+        discovered.append(replace(compiler(issue), state=JobState.READY))
+        await daemon.tick()
+        assert oracle.calls == 2
+        assert plane.reconciled[-1].id == "snapshot-2"
+        await daemon.tick()
+        assert oracle.calls == 2
 
     asyncio.run(scenario())
 

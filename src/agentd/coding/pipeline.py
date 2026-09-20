@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +30,13 @@ class CodingPublicationReconciler:
         profiles: Mapping[str, RepositoryProfile],
         repositories: Mapping[str, Path],
         base_branches: Mapping[str, str],
+        *,
+        source_refresh: Callable[[SourceIssue], object] | None = None,
     ) -> None:
         self.store, self.publisher = store, publisher
         self.profiles, self.repositories = dict(profiles), dict(repositories)
         self.base_branches = dict(base_branches)
+        self.source_refresh = source_refresh
 
     async def reconcile(self) -> tuple[dict[str, Any], ...]:
         # Publisher has no execution callback. Failed GitHub calls leave REVIEW
@@ -115,6 +118,8 @@ class CodingPublicationReconciler:
         import_coding_bundle(intent, collected, evidence, cache)
 
         def authorized() -> None:
+            if self.source_refresh is not None:
+                self.source_refresh(issue)
             current = self.store.github_source_for_job(job.id)
             if (
                 self.store.get_job(job.id) != job

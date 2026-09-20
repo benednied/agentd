@@ -28,6 +28,94 @@ stale, malformed, or insufficient quota waits. The selected remote worker must
 have a fresh authenticated heartbeat, no active ownership, and matching profile
 and harness capabilities. Coding cannot fall back to a local worker.
 
+## Operate the controller
+
+The installed CLI accepts a trusted controller JSON file, using the profile,
+worker, database, quota, and repository fields described below. File references
+are resolved relative to that file, so restarting from another directory uses
+the same durable state. Use one active controller for a database/account pool.
+
+```bash
+agentd github --config /path/to/controller.json approve 123 --actor operator
+agentd github --config /path/to/controller.json serve
+agentd github --config /path/to/controller.json status
+```
+
+`approve` fetches the exact current issue, verifies repository ID and eligibility,
+and records revision-bound authority plus one queued job. It never launches a
+worker. `serve` polls the allowlisted repository automatically and directly
+refreshes known jobs even when they fall beyond discovery pages. A label alone
+never authorizes coding. `status` reports durable job/run/publication outcomes
+and draft URLs without contacting the worker or printing issue bodies.
+
+The controller defaults to a 30-second tick (`poll_interval_seconds` overrides
+it), emits changed status/publication reports, and uses authenticated heartbeats
+and fresh account telemetry for admission. New remote-coding work forces a quota
+refresh in the same tick it is discovered. Publication checks GitHub authority
+again after validation and before external side effects. Read failures defer work.
+
+Stop with SIGINT/SIGTERM and restart the same command/configuration to reconcile
+existing runs and publication. Stopping the controller does not cancel or restart
+remote coding. Worker runtime/token limits remain active. Registration preserves
+remaining, reserved, and debt counters; restarting grants no extra quota.
+
+Prepare `object_cache` as a trusted bare clone of the configured repository, and
+keep it outside worker/model access. `unused_workspace_root` is required by the
+existing scheduler interface; remote coding does not create local worktrees there.
+Use a mode-0600 `worker.psk_file`, with TLS trust paths or an explicitly configured
+loopback SSH tunnel. The controller uses the macOS sandbox on macOS and Bubblewrap
+on Linux; unavailable containment fails publication closed. Run the documented
+containment probe under the deployment identity before enabling a new layout.
+
+The ordinary CLI needs no `issue_number`, build-evidence fields, or fault directory.
+It never enables qualification fault injection. The quota command must return an
+observation for `account_pool`; an observation for another pool is rejected.
+Profile validation commands must be nonempty before any work is admitted.
+
+For example, start from this configuration and replace the repository identity,
+full base SHA, worker identity, and validation argv with deployment-specific values.
+The quota command runs from the controller's working directory, so use an installed
+executable or an absolute path. Its output must be a `ProviderQuotaSnapshot`, not
+an estimated token balance. Example token limits are stopping thresholds, not
+provider-enforced spending caps.
+
+```json
+{
+  "profile": {
+    "id": "repo",
+    "version": "1",
+    "repository": "owner/repo",
+    "clone_url": "https://github.com/owner/repo.git",
+    "validation_commands": [["git", "diff", "--check"]],
+    "max_runtime_seconds": 180
+  },
+  "repository_id": 12345,
+  "base_commit": "0000000000000000000000000000000000000000",
+  "base_branch": "main",
+  "account_pool": "codex",
+  "expected_tokens": 50000,
+  "maximum_tokens": 100000,
+  "database": "controller.sqlite",
+  "object_cache": "objects.git",
+  "unused_workspace_root": "unused-workspaces",
+  "quota_command": ["agentd", "codex-status", "--pool", "codex"],
+  "worker": {
+    "name": "coding-worker",
+    "host": "127.0.0.1",
+    "port": 38091,
+    "node_id": "coding-worker",
+    "session_epoch": "configured-worker-epoch",
+    "psk_file": "worker.psk",
+    "tls_ca": "worker-ca.crt",
+    "server_hostname": "coding-worker"
+  }
+}
+```
+
+Add the repository's meaningful test/build commands to `validation_commands`;
+`git diff --check` alone checks whitespace, not functional correctness. Install
+their dependencies in the reviewed validation runtime before running the controller.
+
 ## Run the bounded qualification composition
 
 `tools/qualify_issue_to_draft.py --config <protected-local-json> --approve-as
