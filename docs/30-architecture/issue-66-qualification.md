@@ -140,9 +140,11 @@ removal, and identity replacement). Approval/status work without a running worke
 Restart registration preserves remaining, reserved, and debt balances. Lint,
 formatting, documentation checks, and targeted module typing pass.
 
-The current macOS validation probe and the already deployed HP Linux validation
-probe both passed their synthetic credential, filesystem, Git metadata, and network
-checks. The HP container was healthy during inspection. The successful real #74
+The current macOS validation probe and the HP Linux validation probe both passed
+their synthetic credential, filesystem, Git metadata, and network checks. On the
+HP, both the existing deployment and public source commit `04b4bd8` were probed;
+the latter ran from a temporary directory without changing the service deployment.
+The HP container was healthy during inspection. The successful real #74
 result remains draft #75 at the recorded commit with passing CI; no additional
 provider work or production service restart was required for these checks.
 
