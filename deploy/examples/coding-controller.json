@@ -34,6 +34,8 @@
   "unused_workspace_root": "/home/bened/.local/state/agentd/controller/unused-workspaces",
   "quota_command": [
     "/opt/agentd/venv/bin/agentd",
+    "--db",
+    "/home/bened/.local/state/agentd/controller/state.sqlite",
     "codex-status",
     "--pool",
     "codex"

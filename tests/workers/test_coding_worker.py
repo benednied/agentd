@@ -21,6 +21,8 @@ from agentd.domain.models import (
     RunResult,
 )
 from agentd.harness.registry import DriverRegistry
+from agentd.state.sqlite import SQLiteStateStore
+from agentd.workers import coding_runtime, dependency_prep
 from agentd.workers.coding import CodingHarnessDriver
 from agentd.workers.execution import ExecutionService
 from agentd.workers.journal import OperationJournal
@@ -201,6 +203,117 @@ def test_missing_containment_fails_before_side_effects(tmp_path):
             await worker.start_managed("run", contract)
         assert provider.starts == 0
         assert not worker._lease("run").exists()
+
+    asyncio.run(scenario())
+
+
+def test_missing_dependency_venv_is_terminal_before_provider_and_survives_restart(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        async def provider_must_not_start(self, run_id, execution):
+            raise AssertionError("provider start must not follow preparation failure")
+
+        monkeypatch.setattr(
+            coding_runtime.CodexSdkDriver,
+            "start_managed",
+            provider_must_not_start,
+        )
+        base_worker, provider, contract = setup(tmp_path)
+        store = SQLiteStateStore(tmp_path / "worker-state.sqlite")
+        contained = coding_runtime._ContainedCodexDriver(
+            None,
+            store,
+            model="test-model",
+            dependency_venv=tmp_path / "dependencies" / ".venv",
+            dependency_profile_id="repo",
+        )
+        worker = CodingHarnessDriver(
+            base_worker.root,
+            base_worker.profiles,
+            {"codex": contained},
+            runner=base_worker.runner,
+            account_pools=base_worker.account_pools,
+        )
+
+        handle = await worker.start_managed("missing-venv", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.FAILED
+        assert result.consumed_quota == 0
+        assert result.usage is not None
+        assert result.usage.total_tokens == 0
+        assert result.metadata["provider_started"] is False
+        assert provider.starts == 0
+
+        restarted = CodingHarnessDriver(
+            worker.root,
+            worker.profiles,
+            {"codex": contained},
+            runner=worker.runner,
+            account_pools=worker.account_pools,
+        )
+        assert await restarted.collect(handle) == result
+        assert provider.starts == 0
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_dependency_copy_oserror_is_terminal_before_provider_and_survives_restart(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        async def provider_must_not_start(self, run_id, execution):
+            raise AssertionError("provider start must not follow preparation failure")
+
+        def copytree_must_fail(*args, **kwargs):
+            raise OSError("simulated dependency copy failure")
+
+        monkeypatch.setattr(
+            coding_runtime.CodexSdkDriver,
+            "start_managed",
+            provider_must_not_start,
+        )
+        monkeypatch.setattr(dependency_prep.shutil, "copytree", copytree_must_fail)
+        base_worker, provider, contract = setup(tmp_path)
+        dependency_venv = tmp_path / "dependencies" / ".venv"
+        dependency_venv.mkdir(parents=True)
+        (dependency_venv / "pyvenv.cfg").write_text("home = /opt/python\n")
+        store = SQLiteStateStore(tmp_path / "worker-state.sqlite")
+        contained = coding_runtime._ContainedCodexDriver(
+            None,
+            store,
+            model="test-model",
+            dependency_venv=dependency_venv,
+            dependency_profile_id="repo",
+        )
+        worker = CodingHarnessDriver(
+            base_worker.root,
+            base_worker.profiles,
+            {"codex": contained},
+            runner=base_worker.runner,
+            account_pools=base_worker.account_pools,
+        )
+
+        handle = await worker.start_managed("copy-failure", contract)
+        result = await worker.collect(handle)
+        assert result.outcome is RunOutcome.FAILED
+        assert result.consumed_quota == 0
+        assert result.usage is not None
+        assert result.usage.total_tokens == 0
+        assert result.metadata["provider_started"] is False
+        assert provider.starts == 0
+
+        restarted = CodingHarnessDriver(
+            worker.root,
+            worker.profiles,
+            {"codex": contained},
+            runner=worker.runner,
+            account_pools=worker.account_pools,
+        )
+        assert await restarted.collect(handle) == result
+        assert provider.starts == 0
+        store.close()
 
     asyncio.run(scenario())
 

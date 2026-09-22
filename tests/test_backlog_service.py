@@ -368,3 +368,97 @@ def test_transitive_revert_blocks_admission_and_publication_until_reintegrated(
         assert len(store.list_jobs()) == 1
     finally:
         store.close()
+
+
+def test_changed_publication_source_cannot_satisfy_a_dependent(tmp_path):
+    from dataclasses import replace
+
+    from agentd.publication import PublicationIntent, PublicationStore
+
+    snapshot = _graph(members=(78, 80), blockers={80: (78,)})
+
+    class PublishedIntegration(PollIntegration):
+        def observe(self, issue, *, linked_pr_numbers, **kwargs):
+            return _decision(issue.number, ready=bool(linked_pr_numbers))
+
+    reconciler, store = _real_reconciler(tmp_path, snapshot, PublishedIntegration({}))
+    old = snapshot.issues[_issue(78).key]
+    publications = PublicationStore(store.path)
+    intent = PublicationIntent(
+        job_id=old.job_id,
+        repository=old.repository,
+        issue_number=old.number,
+        source_revision=old.revision,
+        base_branch="main",
+        base_commit="a" * 40,
+        result_commit="b" * 40,
+        worker_id="worker",
+        run_id="run",
+        profile_version="1",
+        validation_commands=(("git", "diff", "--check"),),
+    )
+    publications.bind(intent)
+    publications.save(
+        intent, "published", pr={"url": "https://github.com/acme/app/pull/99"}
+    )
+    try:
+        reconciler.ledger.approve(snapshot, actor="operator")
+        assert reconciler.linked_pr_numbers(old) == (99,)
+        before = {node["issue"]: node for node in reconciler.plan(snapshot)["nodes"]}
+        assert before[78]["reason"] == "already_integrated"
+        assert before[80]["ready"]
+        changed = replace(old, body="New requirements after publication")
+        updated = replace(
+            snapshot,
+            revision="",
+            nodes=tuple(
+                replace(node, issue=changed) if node.id == old.key else node
+                for node in snapshot.nodes
+            ),
+        )
+        # Even an explicit fresh graph approval cannot make an old publication
+        # evidence for the new source revision or unlock its dependent.
+        reconciler.ledger.approve(updated, actor="operator")
+        assert reconciler.linked_pr_numbers(changed) == ()
+        after = {node["issue"]: node for node in reconciler.plan(updated)["nodes"]}
+        assert after[78]["reason"] != "already_integrated"
+        assert after[80]["reason"] == "waiting_for_prerequisite_integration"
+        assert not after[80]["ready"]
+        assert publications.get(old.job_id)["intent"]["source_revision"] == old.revision
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "identity", [{"repository": "other/app"}, {"issue_number": 99}]
+)
+def test_publication_inference_requires_matching_repository_and_issue(
+    tmp_path, identity
+):
+    from agentd.publication import PublicationIntent, PublicationStore
+
+    snapshot = _graph()
+    reconciler = _reconciler(tmp_path, snapshot, FakeIntegration({}))
+    issue = _issue(78)
+    intent = PublicationIntent(
+        **{
+            "job_id": issue.job_id,
+            "repository": issue.repository,
+            "issue_number": issue.number,
+            "source_revision": issue.revision,
+            "base_branch": "main",
+            "base_commit": "a" * 40,
+            "result_commit": "b" * 40,
+            "worker_id": "worker",
+            "run_id": "run",
+            "profile_version": "1",
+            "validation_commands": (("git", "diff", "--check"),),
+            **identity,
+        }
+    )
+    publications = PublicationStore(reconciler.intake.store.path)
+    publications.bind(intent)
+    publications.save(
+        intent, "published", pr={"url": "https://github.com/acme/app/pull/99"}
+    )
+    assert reconciler.linked_pr_numbers(issue) == ()

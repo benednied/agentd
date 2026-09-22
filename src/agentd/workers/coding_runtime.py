@@ -39,6 +39,7 @@ from agentd.harness.supervisor import RunSupervisor
 from agentd.state.base import EntityNotFoundError
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.dependency_prep import (
+    DependencyPreparationError,
     DependencyRuntimePreparation,
     PreparationMount,
 )
@@ -97,9 +98,14 @@ class _ContainedCodexDriver(CodexSdkDriver):
                 (PreparationMount(self._dependency_venv, ".venv"),),
                 (self._dependency_python_root,) if self._dependency_python_root else (),
             )
-            await asyncio.to_thread(
-                preparation.prepare, Path(execution.working_directory)
-            )
+            try:
+                await asyncio.to_thread(
+                    preparation.prepare, Path(execution.working_directory)
+                )
+            except (DependencyPreparationError, OSError) as error:
+                raise CodingPreparationError(
+                    "worker dependency preparation failed"
+                ) from error
         remaining = order.maximum_quota - order.prior_consumed_quota
         # This pool records only the already-admitted execution envelope. It
         # does not represent provider availability or make admission decisions.

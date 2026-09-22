@@ -136,7 +136,8 @@ class PublicationStore:
         """Inspect durable publication progress without binding a new intent."""
         with self._connect() as db:
             row = db.execute(
-                "SELECT stage, evidence, pr FROM draft_publications WHERE job_id = ?",
+                "SELECT stage, evidence, pr, intent FROM draft_publications "
+                "WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
         if row is None:
@@ -145,6 +146,7 @@ class PublicationStore:
             "stage": row[0],
             "evidence": json.loads(row[1]) if row[1] else None,
             "pr": json.loads(row[2]) if row[2] else None,
+            "intent": json.loads(row[3]),
         }
 
     @contextmanager

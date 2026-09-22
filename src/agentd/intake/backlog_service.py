@@ -244,7 +244,19 @@ class BacklogReconciler:
         # Our publication ledger is trusted provenance; issue prose and arbitrary
         # cross-references are not proof that a PR implements this issue.
         publication = PublicationStore(self.intake.store.path).get(issue.job_id)
-        if publication and publication["pr"]:
+        if (
+            publication
+            and publication["pr"]
+            and all(
+                publication["intent"].get(key) == expected
+                for key, expected in (
+                    ("job_id", issue.job_id),
+                    ("repository", issue.repository),
+                    ("issue_number", issue.number),
+                    ("source_revision", issue.revision),
+                )
+            )
+        ):
             url = urlparse(publication["pr"].get("url", ""))
             prefix = f"/{issue.repository}/pull/"
             if url.hostname == "github.com" and url.path.startswith(prefix):

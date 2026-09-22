@@ -82,3 +82,21 @@ def test_worker_has_private_runtime_and_uv_cache_mounts():
         item.startswith("/home/bened/.cache/uv:") and "mode=0700" in item
         for item in tmpfs
     )
+
+
+def test_example_quota_commands_use_the_controller_database_mount():
+    from agentd.cli import build_parser
+
+    for role in ("coding-controller", "coding-publisher"):
+        config = json.loads((ROOT / "deploy/examples" / f"{role}.json").read_text())
+        args = build_parser().parse_args(config["quota_command"][1:])
+        assert args.command == "codex-status"
+        assert args.pool == config["account_pool"]
+        assert args.db == config["database"]
+        mounts = _compose()["services"][role]["volumes"]
+        mount = next(
+            m
+            for m in mounts
+            if m["source"].startswith("${AGENTD_CONTROLLER_STATE_ROOT:")
+        )
+        assert Path(args.db).is_relative_to(mount["target"])
