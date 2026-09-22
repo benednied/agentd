@@ -206,7 +206,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -395,6 +395,9 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: migrate_intake,
+    # Existing v5 controllers already have source provenance but not backlog
+    # gates/bindings or durable report deduplication. Preserve all old rows.
+    5: migrate_intake,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,

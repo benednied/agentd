@@ -4,9 +4,19 @@
     "version": "1",
     "repository": "example/repository",
     "clone_url": "https://github.com/example/repository.git",
-    "harnesses": ["codex"],
-    "required_capabilities": ["remote-coding"],
-    "validation_commands": [["git", "diff", "--check"]],
+    "harnesses": [
+      "codex"
+    ],
+    "required_capabilities": [
+      "remote-coding"
+    ],
+    "validation_commands": [
+      [
+        "git",
+        "diff",
+        "--check"
+      ]
+    ],
     "max_runtime_seconds": 3600,
     "validation_timeout_seconds": 900,
     "network_policy": "disabled",
@@ -22,8 +32,13 @@
   "database": "/home/bened/.local/state/agentd/controller/state.sqlite",
   "object_cache": "/home/bened/.local/state/agentd/publication-cache/repo.git",
   "unused_workspace_root": "/home/bened/.local/state/agentd/controller/unused-workspaces",
-  "quota_command": ["/opt/agentd/venv/bin/agentd", "codex-status", "--pool", "codex"],
-  "poll_interval_seconds": 30,
+  "quota_command": [
+    "/opt/agentd/venv/bin/agentd",
+    "codex-status",
+    "--pool",
+    "codex"
+  ],
+  "poll_interval_seconds": 5,
   "publication_enabled": true,
   "worker": {
     "name": "coding-worker",
@@ -34,6 +49,9 @@
     "psk_file": "/home/bened/.local/state/agentd/transport/worker.psk",
     "tls_ca": "/home/bened/.local/state/agentd/transport/worker.crt",
     "server_hostname": "coding-worker",
-    "features": ["coding-checkpoints"]
-  }
+    "features": [
+      "coding-checkpoints"
+    ]
+  },
+  "source_poll_seconds": 60
 }

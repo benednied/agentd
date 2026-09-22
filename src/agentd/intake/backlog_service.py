@@ -361,12 +361,12 @@ class BacklogReconciler:
                 reason = "graph_approval_required"
             elif not policy.eligible(issue):
                 reason = "source_ineligible"
-            elif graph_changed:
-                reason = "executed_job_graph_changed"
             elif own.ready:
                 reason = "already_integrated"
             elif own.links:
                 reason = "existing_pull_request: " + own.reason
+            elif graph_changed:
+                reason = "executed_job_graph_changed"
             elif blockers:
                 reason = "waiting_for_prerequisite_integration"
             elif str(issue.number) in self.selection.get("product_decisions", {}):

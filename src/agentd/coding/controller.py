@@ -366,6 +366,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             ),
             account_poll_seconds=30,
             source_reconciler=(backlog or intake).poll,
+            source_poll_seconds=config.get(
+                "source_poll_seconds", 60 if backlog else None
+            ),
             result_reconciler=publish,
             admission_enabled=lambda: (
                 not Path(
