@@ -778,6 +778,10 @@ class GitHubPublicationAdapter:
         # human edit or another result, even when the first ACK was lost.
         _git(
             repository,
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.https://github.com.helper=!gh auth git-credential",
             "push",
             f"--force-with-lease=refs/heads/{intent.branch}:",
             f"https://github.com/{intent.repository}.git",

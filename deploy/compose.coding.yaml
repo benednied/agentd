@@ -1,0 +1,302 @@
+{
+  "name": "agentd-coding",
+  "services": {
+    "coding-controller": {
+      "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
+      "pull_policy": "never",
+      "user": "1000:1000",
+      "working_dir": "/tmp",
+      "read_only": true,
+      "init": true,
+      "restart": "unless-stopped",
+      "stop_grace_period": "45s",
+      "pids_limit": 512,
+      "cpus": "6.0",
+      "mem_limit": "12g",
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true",
+        "apparmor=lxc-usernsexec",
+        "seccomp=./deploy/container/seccomp-agentd.json"
+      ],
+      "entrypoint": [
+        "/opt/agentd/venv/bin/agentd"
+      ],
+      "command": [
+        "github",
+        "--config",
+        "/etc/agentd/controller.json",
+        "serve",
+        "--without-publication"
+      ],
+      "environment": {
+        "HOME": "/home/bened",
+        "PYTHONUNBUFFERED": "1",
+        "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_STATE_ROOT:?set AGENTD_CONTROLLER_STATE_ROOT}",
+          "target": "/home/bened/.local/state/agentd/controller",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_CONFIG:?set AGENTD_CONTROLLER_CONFIG}",
+          "target": "/etc/agentd/controller.json",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_GH_CONFIG:?set AGENTD_CONTROLLER_GH_CONFIG}",
+          "target": "/home/bened/.config/gh",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_PUBLICATION_CACHE:?set AGENTD_PUBLICATION_CACHE}",
+          "target": "/home/bened/.local/state/agentd/publication-cache",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_TRANSPORT:?set AGENTD_CONTROLLER_TRANSPORT}",
+          "target": "/home/bened/.local/state/agentd/transport",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_CODEX_HOME:?set AGENTD_CONTROLLER_CODEX_HOME}",
+          "target": "/home/bened/.local/share/agentd/codex-home",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,nodev,size=1073741824,uid=1000,gid=1000,mode=1770"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "networks": [
+        "coding"
+      ]
+    },
+    "coding-worker": {
+      "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
+      "pull_policy": "never",
+      "user": "1000:1000",
+      "working_dir": "/tmp",
+      "read_only": true,
+      "init": true,
+      "restart": "unless-stopped",
+      "stop_grace_period": "120s",
+      "pids_limit": 512,
+      "cpus": "6.0",
+      "mem_limit": "12g",
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true",
+        "apparmor=lxc-usernsexec",
+        "seccomp=./deploy/container/seccomp-agentd.json"
+      ],
+      "entrypoint": [
+        "/opt/agentd/venv/bin/python"
+      ],
+      "command": [
+        "/opt/agentd/tools/serve_coding_worker.py",
+        "--profiles",
+        "/home/bened/.local/state/agentd/coding-profiles.json",
+        "--account-pool",
+        "codex",
+        "--state-root",
+        "/home/bened/.local/state/agentd/worker",
+        "--workspace-root",
+        "/home/bened/.local/share/agentd/workspaces",
+        "--secret-file",
+        "/home/bened/.local/state/agentd/worker.psk",
+        "--ready-file",
+        "/home/bened/.local/state/agentd/worker.ready",
+        "--node-id",
+        "coding-worker",
+        "--session-epoch",
+        "production",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "38101",
+        "--tls-cert",
+        "/home/bened/.local/state/agentd/worker.crt",
+        "--tls-key",
+        "/home/bened/.local/state/agentd/worker.key"
+      ],
+      "environment": {
+        "HOME": "/home/bened",
+        "PYTHONUNBUFFERED": "1",
+        "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${AGENTD_WORKER_STATE_ROOT:?set AGENTD_WORKER_STATE_ROOT}",
+          "target": "/home/bened/.local/state/agentd",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_WORKSPACE_ROOT:?set AGENTD_WORKSPACE_ROOT}",
+          "target": "/home/bened/.local/share/agentd/workspaces",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_WORKER_CODEX_HOME:?set AGENTD_WORKER_CODEX_HOME}",
+          "target": "/home/bened/.local/share/agentd/codex-home",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CODEX_CONFIG:?set AGENTD_CODEX_CONFIG}",
+          "target": "/home/bened/.local/share/agentd/codex-home/config.toml",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,nodev,size=1073741824,uid=1000,gid=1000,mode=1770"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "expose": [
+        "38101"
+      ],
+      "networks": {
+        "coding": {
+          "aliases": [
+            "coding-worker"
+          ]
+        }
+      }
+    },
+    "coding-publisher": {
+      "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
+      "pull_policy": "never",
+      "user": "1000:1000",
+      "working_dir": "/tmp",
+      "read_only": true,
+      "init": true,
+      "restart": "unless-stopped",
+      "stop_grace_period": "45s",
+      "pids_limit": 256,
+      "cpus": "4.0",
+      "mem_limit": "8g",
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true",
+        "apparmor=lxc-usernsexec",
+        "seccomp=./deploy/container/seccomp-agentd.json"
+      ],
+      "entrypoint": [
+        "/opt/agentd/venv/bin/agentd"
+      ],
+      "command": [
+        "github",
+        "--config",
+        "/etc/agentd/controller.json",
+        "publish"
+      ],
+      "environment": {
+        "HOME": "/home/bened",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_STATE_ROOT:?set AGENTD_CONTROLLER_STATE_ROOT}",
+          "target": "/home/bened/.local/state/agentd/controller",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_PUBLISHER_CONFIG:?set AGENTD_PUBLISHER_CONFIG}",
+          "target": "/etc/agentd/controller.json",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_PUBLISHER_GH_CONFIG:?set AGENTD_PUBLISHER_GH_CONFIG}",
+          "target": "/home/bened/.config/gh",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_PUBLICATION_CACHE:?set AGENTD_PUBLICATION_CACHE}",
+          "target": "/home/bened/.local/state/agentd/publication-cache",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "networks": [
+        "coding"
+      ]
+    }
+  },
+  "networks": {
+    "coding": {
+      "driver": "bridge"
+    }
+  }
+}

@@ -67,6 +67,7 @@ class AgentDaemon:
         on_error: Callable[[Exception], None] | None = None,
         source_reconciler: Callable[[], Awaitable[object]] | None = None,
         result_reconciler: Callable[[], Awaitable[object]] | None = None,
+        admission_enabled: Callable[[], bool] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -87,6 +88,7 @@ class AgentDaemon:
         self._control_plane = control_plane
         self._source_reconciler = source_reconciler
         self._result_reconciler = result_reconciler
+        self._admission_enabled = admission_enabled
         self._poll_interval = poll_interval
         self._dispatch_retry_base_seconds = dispatch_retry_base_seconds
         self._dispatch_retry_max_seconds = dispatch_retry_max_seconds
@@ -188,6 +190,8 @@ class AgentDaemon:
             except Exception as error:
                 self._record_error(error, operation="result_publication")
         if self._dispatch_retry_at is not None and now < self._dispatch_retry_at:
+            return None
+        if self._admission_enabled is not None and not self._admission_enabled():
             return None
         try:
             dispatched = await self._control_plane.dispatch_next()

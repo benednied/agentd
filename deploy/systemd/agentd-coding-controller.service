@@ -1,0 +1,26 @@
+[Unit]
+Description=agentd coding controller
+Documentation=file:///home/bened/.local/share/agentd/coding-current/docs/40-operations/deployment.md
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd/coding-current
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5s
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/coding-current --env-file /home/bened/.local/share/agentd/coding-current/release.env --env-file /home/bened/.local/share/agentd/coding.env --file /home/bened/.local/share/agentd/coding-current/deploy/compose.coding.yaml config --quiet
+ExecStart=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/coding-current --env-file /home/bened/.local/share/agentd/coding-current/release.env --env-file /home/bened/.local/share/agentd/coding.env --file /home/bened/.local/share/agentd/coding-current/deploy/compose.coding.yaml up --no-deps coding-controller
+ExecStop=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/coding-current --env-file /home/bened/.local/share/agentd/coding-current/release.env --env-file /home/bened/.local/share/agentd/coding.env --file /home/bened/.local/share/agentd/coding-current/deploy/compose.coding.yaml stop coding-controller
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/bened/.local/state/agentd /home/bened/.local/share/agentd
+
+[Install]
+WantedBy=default.target

@@ -9,3 +9,5 @@ diagnosis of the reviewed single-host service.
 - [Observability](observability.md)
 - [Troubleshooting](troubleshooting.md)
 - [Authorized GitHub coding](github-coding.md)
+- [Native backlog operations](native-backlog.md)
+- [Unattended qualification](unattended-qualification.md)

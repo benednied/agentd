@@ -48,6 +48,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         bubblewrap \
         ca-certificates \
+        gh \
         git \
         libstdc++6 \
         uidmap \
@@ -89,6 +90,10 @@ COPY --chmod=0555 \
     deploy/security/runtime_sandbox_probe.py \
     deploy/security/sandbox_payload.py \
     /opt/agentd/security/
+COPY --chmod=0555 \
+    tools/qualify_coding_worker.py \
+    tools/serve_coding_worker.py \
+    /opt/agentd/tools/
 COPY --chmod=0444 deploy/container/config.toml /opt/agentd/security/config.toml
 
 ENV PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:/usr/local/bin:/usr/bin:/bin" \

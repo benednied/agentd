@@ -26,6 +26,15 @@ def migrate_intake(connection: sqlite3.Connection) -> None:
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT NOT NULL,
         revision TEXT NOT NULL, action TEXT NOT NULL, actor TEXT,
         occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_backlog_gates (
+        job_id TEXT PRIMARY KEY, graph_revision TEXT NOT NULL,
+        ready INTEGER NOT NULL, base_commit TEXT, reason TEXT NOT NULL,
+        checked_at TEXT NOT NULL, valid_until TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS controller_reports (
+        report_key TEXT PRIMARY KEY, payload TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_backlog_bindings (
+        job_id TEXT PRIMARY KEY, node_revision TEXT NOT NULL,
+        base_commit TEXT NOT NULL)""")
 
 
 class IntakeStoreMixin:
@@ -42,6 +51,105 @@ class IntakeStoreMixin:
         ) -> None: ...
         def get_job(self, job_id: str) -> Job: ...
         def list_runs(self, job_id: str | None = None) -> list[Any]: ...
+
+    def set_backlog_gate(
+        self,
+        job_id: str,
+        *,
+        graph_revision: str,
+        ready: bool,
+        base_commit: str | None,
+        reason: str,
+        checked_at: str,
+        valid_until: str,
+        defer_queued: bool = True,
+    ) -> None:
+        """Fence queued work before reconciling graph or integration changes."""
+        with self._lock, self._transaction():
+            self._connection.execute(
+                """INSERT INTO github_backlog_gates VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                graph_revision=excluded.graph_revision, ready=excluded.ready,
+                base_commit=excluded.base_commit, reason=excluded.reason,
+                checked_at=excluded.checked_at, valid_until=excluded.valid_until""",
+                (
+                    job_id,
+                    graph_revision,
+                    ready,
+                    base_commit,
+                    reason,
+                    checked_at,
+                    valid_until,
+                ),
+            )
+            try:
+                job = self.get_job(job_id)
+            except LookupError:
+                return
+            # Recompile an unstarted work order only after fresh proof. Never
+            # replace a running attempt, checkpoint, publication, or its charges.
+            if (
+                defer_queued
+                and (not self.list_runs(job.id))
+                and job.state in {JobState.READY, JobState.PLANNING}
+                and (not ready or job.base_ref != base_commit)
+            ):
+                updated, event = transition_job(job, JobState.BACKLOG, reason)
+                self._save_job_in_transaction(updated, event, job)
+
+    def backlog_gate(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM github_backlog_gates WHERE job_id=?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def backlog_binding(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM github_backlog_bindings WHERE job_id=?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def bind_backlog_job(self, job_id: str, revision: str, base_commit: str) -> None:
+        """A graph edit cannot repurpose an executed logical job or checkpoint."""
+        with self._lock, self._transaction():
+            previous = self.backlog_binding(job_id)
+            if self.list_runs(job_id):
+                if previous is None or (
+                    previous["node_revision"],
+                    previous["base_commit"],
+                ) != (revision, base_commit):
+                    raise ValueError("executed backlog job cannot change graph or base")
+                return
+            self._connection.execute(
+                "INSERT INTO github_backlog_bindings VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET "
+                "node_revision=excluded.node_revision, "
+                "base_commit=excluded.base_commit",
+                (job_id, revision, base_commit),
+            )
+
+    def changed_report(self, key: str, report: dict[str, Any]) -> bool:
+        """Suppress unchanged state notifications across service restarts."""
+        # Fresh polling timestamps are available in status but are not a state
+        # transition. Exhaustion, freshness changes, and amounts remain visible.
+        value = json.loads(json.dumps(report))
+        if isinstance(value.get("quota"), dict):
+            value["quota"].pop("provider_observed_at", None)
+        payload = json.dumps(value, sort_keys=True)
+        with self._lock, self._transaction():
+            previous = self._connection.execute(
+                "SELECT payload FROM controller_reports WHERE report_key=?", (key,)
+            ).fetchone()
+            if previous and previous[0] == payload:
+                return False
+            self._connection.execute(
+                "INSERT INTO controller_reports VALUES (?, ?) "
+                "ON CONFLICT(report_key) DO UPDATE SET payload=excluded.payload",
+                (key, payload),
+            )
+            return True
 
     def observe_github_issue(self, issue: SourceIssue, policy: IntakePolicy) -> str:
         if (issue.repository, issue.repository_id) != (

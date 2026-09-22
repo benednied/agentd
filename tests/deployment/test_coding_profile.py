@@ -1,0 +1,59 @@
+"""Static checks for the dedicated Linux coding worker deployment."""
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).parents[2]
+
+
+def _compose() -> dict:
+    return json.loads((ROOT / "deploy/compose.coding.yaml").read_text())
+
+
+def test_worker_profile_file_is_reachable_inside_the_worker_mount():
+    """The worker command must consume a file from its mounted state volume."""
+    worker = _compose()["services"]["coding-worker"]
+    profile_arg = worker["command"][worker["command"].index("--profiles") + 1]
+    state_mount = next(
+        volume
+        for volume in worker["volumes"]
+        if volume["target"] == "/home/bened/.local/state/agentd"
+    )
+    assert profile_arg.startswith(state_mount["target"] + "/")
+    relative = Path(profile_arg).relative_to(state_mount["target"])
+    env = {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in (ROOT / "deploy/env/coding-worker.env.example")
+        .read_text()
+        .splitlines()
+        if "=" in line and not line.startswith("#")
+    }
+    assert env["AGENTD_CODING_PROFILES"] == str(
+        Path(env["AGENTD_WORKER_STATE_ROOT"]) / relative
+    )
+    assert env["AGENTD_CODING_WORKER_PSK"] == str(
+        Path(env["AGENTD_WORKER_STATE_ROOT"]) / "worker.psk"
+    )
+
+
+def test_worker_tls_is_internal_only_and_controller_has_no_worker_secret_mount():
+    services = _compose()["services"]
+    assert "ports" not in services["coding-worker"]
+    assert "38101" in services["coding-worker"]["expose"]
+    controller_targets = {
+        item["target"] for item in services["coding-controller"]["volumes"]
+    }
+    assert "/home/bened/.local/state/agentd/worker.psk" not in controller_targets
+
+
+def test_runtime_image_contains_worker_entrypoint_and_gh_client():
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "apt-get install" in dockerfile and "gh" in dockerfile
+    assert "tools/serve_coding_worker.py" in dockerfile
+    assert "USER 1000:1000" in dockerfile
+
+
+def test_compose_duration_uses_docker_units():
+    for service in _compose()["services"].values():
+        value = service["stop_grace_period"]
+        assert value[-1:] in {"s", "m", "h"}, value
