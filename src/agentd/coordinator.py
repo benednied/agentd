@@ -25,6 +25,7 @@ from agentd.domain.models import (
     ArtifactRef,
     BuildImageOperation,
     Checkpoint,
+    CodingOperation,
     DeployImageOperation,
     DriverSession,
     ExecutionContract,
@@ -181,7 +182,10 @@ class SchedulerCoordinator:
                 if not self._provider_allows_placement(job, placement):
                     continue
                 backend = self._select_backend(placement.node_id, job)
-                if self._backends is not None and backend is None:
+                if backend is None and (
+                    self._backends is not None
+                    or isinstance(job.operation, CodingOperation)
+                ):
                     continue
                 try:
                     return await self._dispatch(
@@ -211,7 +215,10 @@ class SchedulerCoordinator:
         backend: WorkerBackend | None,
         *,
         resolved_inputs: tuple[ArtifactRef, ...],
-        resolved_operation: BuildImageOperation | DeployImageOperation | None,
+        resolved_operation: BuildImageOperation
+        | DeployImageOperation
+        | CodingOperation
+        | None,
     ) -> RunRecord:
         reservation: QuotaReservation | None = None
         allocation_id: str | None = None
@@ -603,6 +610,8 @@ class SchedulerCoordinator:
                         # publish RUNNING so the normal idempotent terminal
                         # path can either continue or fail an unknown run.
                         status = await self._operation_status(run)
+                        if isinstance(run.contract.operation, CodingOperation):
+                            self._create_remote_driver_session(run, run.handle)
                         recovered = replace(run, state=RunState.RUNNING)
                         running, event = transition_job(
                             job,
@@ -806,6 +815,8 @@ class SchedulerCoordinator:
         ):
             raise LifecycleError(f"Remote run {run.id} returned invalid status")
         if not known:
+            if isinstance(run.contract.operation, CodingOperation):
+                raise LifecycleError("Coding worker ownership is unresolved")
             # This worker-authenticated answer is the only point at which a
             # lost START may be failed and its admission effects released.
             result = RunResult(
@@ -836,6 +847,8 @@ class SchedulerCoordinator:
             )
             return
 
+        if isinstance(run.contract.operation, CodingOperation):
+            self._create_remote_driver_session(run, run.handle)
         recovered = replace(run, state=RunState.RUNNING)
         running, event = transition_job(
             job,
@@ -939,7 +952,26 @@ class SchedulerCoordinator:
             driver = self._drivers.get(run.driver)
             if self._is_typed_operation_run(run, driver):
                 try:
-                    finalized_job = await self._reconcile_operation_run(run)
+                    status = None
+                    if (
+                        isinstance(run.contract.operation, CodingOperation)
+                        and run.result is None
+                    ):
+                        # A restarted worker may have durable terminal evidence
+                        # but no live handle for OBSERVE or policy commands.
+                        status = await self._operation_status(run)
+                        if (
+                            status.get("known") is True
+                            and status.get("terminal") is False
+                        ):
+                            await self._reconcile_coding_policy(
+                                job, run, snapshot, at=now
+                            )
+                            # A stop can have completed during policy delivery.
+                            status = None
+                    finalized_job = await self._reconcile_operation_run(
+                        run, status=status
+                    )
                     if finalized_job is not None:
                         finalized.append(finalized_job)
                 except BaseException as error:
@@ -1054,6 +1086,8 @@ class SchedulerCoordinator:
             return "build-image" in features
         if isinstance(operation, DeployImageOperation):
             return "deploy-image" in features
+        if isinstance(operation, CodingOperation):
+            return "remote-coding" in features
         return False
 
     async def _operation_status(self, run: RunRecord) -> dict[str, object]:
@@ -1081,6 +1115,46 @@ class SchedulerCoordinator:
             raise LifecycleError(f"Typed run {run.id} returned malformed status")
         return status
 
+    async def _reconcile_coding_policy(
+        self,
+        job: Job,
+        run: RunRecord,
+        snapshot: ProviderQuotaSnapshot | None,
+        *,
+        at: datetime,
+    ) -> None:
+        observation = await self._observe_run(run)
+        if observation is not None:
+            self._record_remote_observation(run, observation)
+        if observation is not None and observation.terminal:
+            return
+        if snapshot is None or snapshot.pool_id != job.quota_budget.pool_id:
+            snapshot = self._store.latest_provider_quota_snapshot(
+                job.quota_budget.pool_id
+            )
+        self._enqueue_usage_policy(job, run, snapshot, at=at, observation=observation)
+        # Coding MVP retains the stopped lease for diagnosis. It does not accept
+        # arbitrary follow-up intent or automatically resume a checkpoint.
+        for command in self._store.list_pending_run_commands(run.id):
+            if command.action in {"checkpoint", "suspend", "interrupt", "cancel"}:
+                await self._interrupt_run(run)
+            elif command.action != "steer":
+                continue
+            self._store.acknowledge_run_command(
+                RunCommandAck(
+                    command_id=command.id,
+                    run_id=run.id,
+                    observation_cursor=observation.cursor
+                    if observation
+                    else "coding-policy",
+                    metadata={
+                        "backend": run.backend,
+                        "remote": True,
+                        "coding_policy": "bounded-stop",
+                    },
+                )
+            )
+
     async def _reconcile_operation_run(
         self,
         run: RunRecord,
@@ -1102,6 +1176,9 @@ class SchedulerCoordinator:
         # worker status query (which could now report ``known=False``) is
         # needed to finish the same idempotent completion path.
         if run.result is not None:
+            normalized = self._normalize_coding_usage(run, run.result)
+            if normalized != run.result:
+                self._store.save_run(replace(run, result=normalized), expected=run)
             return await self.complete(run.job_id)
 
         backend = self._backend_for_run(run)
@@ -1113,6 +1190,8 @@ class SchedulerCoordinator:
         if not isinstance(known, bool) or not isinstance(terminal, bool):
             raise LifecycleError(f"Typed run {run.id} returned malformed status flags")
         if not known:
+            if isinstance(run.contract.operation, CodingOperation):
+                raise LifecycleError("Coding worker ownership is unresolved")
             if terminal or raw_result is not None:
                 raise LifecycleError(
                     f"Typed run {run.id} returned an invalid unknown status"
@@ -1155,9 +1234,23 @@ class SchedulerCoordinator:
                     metadata={"error_type": type(error).__name__},
                 )
 
+        result = self._normalize_coding_usage(run, result)
         collected = replace(run, result=result)
         self._store.save_run(collected, expected=run)
         return await self.complete(run.job_id)
+
+    @staticmethod
+    def _normalize_coding_usage(run: RunRecord, result: RunResult) -> RunResult:
+        # SDK terminal payloads can carry valid token usage while their generic
+        # consumed_quota field remains zero. After a worker restart there may
+        # be no live observation stream to charge the missing final delta.
+        if (
+            isinstance(run.contract.operation, CodingOperation)
+            and result.metadata.get("telemetry_valid") is True
+            and result.usage is not None
+        ):
+            return replace(result, consumed_quota=float(result.usage.total_tokens))
+        return result
 
     async def checkpoint(
         self,
@@ -1406,6 +1499,12 @@ class SchedulerCoordinator:
             RunOutcome.FAILED: JobState.FAILED,
             RunOutcome.CANCELLED: JobState.CANCELLED,
         }[result.outcome]
+        if (
+            isinstance(run.contract.operation, CodingOperation)
+            and result.outcome is RunOutcome.COMPLETED
+            and job.state is JobState.RUNNING
+        ):
+            target = JobState.REVIEW
         run_state = {
             RunOutcome.COMPLETED: RunState.COMPLETED,
             RunOutcome.FAILED: RunState.FAILED,
@@ -1609,6 +1708,14 @@ class SchedulerCoordinator:
         run: RunRecord,
         handle: RunHandle,
     ) -> None:
+        try:
+            existing = self._store.get_driver_session(run.id)
+        except EntityNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing.driver != run.driver:
+                raise LifecycleError("Recovered remote session driver mismatch")
+            return
         self._store.save_driver_session(
             DriverSession(
                 run_id=run.id,
@@ -1635,11 +1742,35 @@ class SchedulerCoordinator:
             cumulative = observation.normalized_cumulative_quota
             if cumulative is not None and cumulative > 0:
                 prior = self._store.list_usage_samples(run.id)
-                sequence = max((sample.sequence for sample in prior), default=-1) + 1
-                self._store.apply_usage_sample(
-                    observation.to_usage_sample(sequence),
-                    maximum=self._store.get_job(run.job_id).quota_budget.maximum,
+                matching = [
+                    sample
+                    for sample in prior
+                    if sample.thread_id == observation.thread_id
+                    and sample.turn_id == observation.turn_id
+                ]
+                previous = max(
+                    matching, key=lambda sample: sample.sequence, default=None
                 )
+                repeated = (
+                    previous is not None and previous.cumulative_quota == cumulative
+                )
+                if (
+                    repeated
+                    and previous.tokens is not None
+                    and observation.usage is not None
+                    and not observation.usage.dominates(previous.tokens)
+                ):
+                    raise LifecycleError("Remote token counters moved backwards")
+                # Progress events can advance the stream cursor without spending
+                # tokens. Reconcile a charge committed before its cursor too.
+                if not repeated or (observation.terminal and not previous.final):
+                    sequence = (
+                        max((sample.sequence for sample in prior), default=-1) + 1
+                    )
+                    self._store.apply_usage_sample(
+                        observation.to_usage_sample(sequence),
+                        maximum=self._store.get_job(run.job_id).quota_budget.maximum,
+                    )
         self._store.update_observation_cursor(
             run.id,
             session.observation_cursor,
@@ -1701,7 +1832,10 @@ class SchedulerCoordinator:
         workspace: WorkspaceLease,
         *,
         artifact_inputs: tuple[ArtifactRef, ...] | None = None,
-        operation: BuildImageOperation | DeployImageOperation | None = None,
+        operation: BuildImageOperation
+        | DeployImageOperation
+        | CodingOperation
+        | None = None,
     ) -> ExecutionContract:
         dependency_results: dict[str, str] = {}
         for dependency_id in job.dependencies:
@@ -1778,7 +1912,7 @@ class SchedulerCoordinator:
         job: Job,
     ) -> tuple[
         tuple[ArtifactRef, ...],
-        BuildImageOperation | DeployImageOperation | None,
+        BuildImageOperation | DeployImageOperation | CodingOperation | None,
     ]:
         """Bind every selector/ref to verified append-only ledger provenance."""
 
@@ -2812,6 +2946,27 @@ class SchedulerCoordinator:
         compatible = self._backends.compatible(self._store.get_node(node_id))
         for backend in compatible:
             capabilities = backend.capabilities()
+            if isinstance(job.operation, CodingOperation):
+                node = self._store.get_node(node_id)
+                heartbeat = node.heartbeat
+                required = job.required_capabilities | {
+                    "remote-coding",
+                    f"repository-profile-{job.operation.work_order.profile_digest}",
+                    f"harness-{job.operation.work_order.harness}",
+                }
+                if (
+                    not capabilities.remote
+                    or not required <= capabilities.features
+                    or heartbeat is None
+                    or heartbeat.active_runs != 0
+                    or any(
+                        allocation.node_id == node_id
+                        and allocation.state.value == "ACTIVE"
+                        for allocation in self._store.list_allocations()
+                    )
+                    or utc_now() - heartbeat.observed_at > timedelta(seconds=30)
+                ):
+                    continue
             if capabilities.remote and job.operation is None:
                 # A remote code harness also needs an authenticated remote
                 # source/workspace lifecycle.  This MVP's distributed path is

@@ -22,7 +22,8 @@ deliberately left alone; the historical metrics are not current repository claim
 
 - Open SQLite with foreign keys, the configured busy timeout, and WAL for files.
 - Treat version 0 to 1 as base-schema bootstrap; the current supported upgrade
-  path is the explicit idempotent `v1 -> v2 -> v3 -> v4` chain.
+  path is the explicit idempotent `v1 -> v2 -> v3 -> v4 -> v5` chain. Version 5 adds GitHub source
+  observations and approval events.
 - Increment `SCHEMA_VERSION` only with an explicit idempotent migration from every
   supported prior version; reject databases newer than the binary.
 - Keep multi-statement mutations atomic through `_transaction()` and preserve the

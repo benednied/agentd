@@ -132,6 +132,21 @@ class PublicationStore:
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=30)
 
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        """Inspect durable publication progress without binding a new intent."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT stage, evidence, pr FROM draft_publications WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "stage": row[0],
+            "evidence": json.loads(row[1]) if row[1] else None,
+            "pr": json.loads(row[2]) if row[2] else None,
+        }
+
     @contextmanager
     def locked(self) -> Iterator[None]:
         # No long SQLite write transaction: quota/scheduler operations continue.

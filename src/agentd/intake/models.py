@@ -57,7 +57,8 @@ class SourceIssue:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SourceIssue:
-        return cls(**{**data, "labels": tuple(data.get("labels", ()))})
+        values: dict[str, Any] = {**data, "labels": tuple(data.get("labels", ()))}
+        return cls(**values)
 
 
 @dataclass(frozen=True, slots=True)

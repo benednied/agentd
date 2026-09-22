@@ -1,0 +1,45 @@
+{
+  "issue": "https://github.com/benednied/agentd/issues/72",
+  "source_revision": "80bd5e2c443ed8d497d762024f7ada7448cd4333776a2f0fc9fef94f88dc7833",
+  "job_id": "github-d1cd7b1f94323dc5495e6d5cbda3c40a",
+  "job_count": 1,
+  "run_count": 1,
+  "controller_job_count": 2,
+  "controller_run_count": 2,
+  "job_state": "FAILED",
+  "run_id": "16237150-3dfe-4f4c-9e47-9d324984122a",
+  "worker_id": "qualification-worker",
+  "base_commit": "f7d4f08f280080e14c434293c99034ba06216b6f",
+  "result_commit": null,
+  "consumed_tokens": 0,
+  "maximum_tokens": 140000,
+  "quota_ceiling_exceeded": false,
+  "profile_digest": "883800cc8f248cd7e91a8f83ce3113ebf99f93005c96d137012b590bf21036c5",
+  "pr": null,
+  "draft": null,
+  "runtime_seconds": 3.83,
+  "source_commit": "40b74fd1ea4a6d84f095ed96986f69e424795930",
+  "worker_source_commit": "40b74fd1ea4a6d84f095ed96986f69e424795930",
+  "error_type": null,
+  "terminal_proof": {
+    "outcome": "failed",
+    "summary": "Worker preparation failed before provider start",
+    "commit": null,
+    "consumed_quota": 0,
+    "metadata": {
+      "telemetry_valid": true,
+      "provider_started": false,
+      "preparation_failure": true,
+      "preparation_proof": "SDK run and session absent; partial job/workspace retained",
+      "preparation_deployed_revision": "169a26979b032950b6a81bd5f9267e6679bebed5"
+    },
+    "usage": {
+      "input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_output_tokens": 0
+    },
+    "produced_artifacts": []
+  },
+  "scope": "proven-pre-provider-preparation-failure"
+}
