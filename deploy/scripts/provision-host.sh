@@ -98,6 +98,15 @@ install -d -o 1000 -g 1000 -m 0700 "$unit_dir"
 install -o 1000 -g 1000 -m 0644 \
     "$SCRIPT_DIR/../systemd/agentd.service" \
     "$unit_dir/agentd.service"
+install -o 1000 -g 1000 -m 0644 \
+    "$SCRIPT_DIR/../systemd/agentd-worker.service" \
+    "$unit_dir/agentd-worker.service"
+install -o 1000 -g 1000 -m 0644 \
+    "$SCRIPT_DIR/../systemd/agentd-publisher.service" \
+    "$unit_dir/agentd-publisher.service"
+install -o 1000 -g 1000 -m 0644 \
+    "$SCRIPT_DIR/../systemd/agentd-coding-controller.service" \
+    "$unit_dir/agentd-coding-controller.service"
 
 printf '%s\n' \
     "Provisioned exact agentd paths, $config_status reviewed config.toml, and auth.json." \

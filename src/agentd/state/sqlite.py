@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime
 from math import isfinite
 from pathlib import Path
 from threading import RLock
@@ -205,7 +206,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -394,6 +395,9 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: migrate_intake,
+    # Existing v5 controllers already have source provenance but not backlog
+    # gates/bindings or durable report deduplication. Preserve all old rows.
+    5: migrate_intake,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
@@ -965,6 +969,13 @@ class SQLiteStateStore(IntakeStoreMixin):
         if persisted != expected:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")
         if job.state is JobState.ADMITTED:
+            gate = self.backlog_gate(job.id)
+            if gate is not None and (
+                not gate["ready"]
+                or gate["base_commit"] != job.base_ref
+                or datetime.fromisoformat(gate["valid_until"]) <= utc_now()
+            ):
+                raise ConcurrentStateError("Backlog integration evidence is not ready")
             source = self.github_source_for_job(job.id)
             if source is not None and (
                 source["revoked"]

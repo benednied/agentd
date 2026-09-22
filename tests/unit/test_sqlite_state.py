@@ -94,3 +94,30 @@ def test_non_state_metadata_update_does_not_forge_history(
 
     assert store.get_job(job.id).selected_harness == "fake"
     assert len(store.list_transitions(job.id)) == 1
+
+
+def test_v5_existing_controller_gains_backlog_tables_without_losing_history(tmp_path):
+    database = tmp_path / "legacy.sqlite"
+    with SQLiteStateStore(database):
+        pass
+    with sqlite3.connect(database) as connection:
+        for table in (
+            "github_backlog_gates",
+            "github_backlog_bindings",
+            "controller_reports",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("PRAGMA user_version = 5")
+        connection.execute(
+            "INSERT INTO github_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("issue", "job", "rev", "rev", "operator", "then", 1, 0, "{}"),
+        )
+    with SQLiteStateStore(database) as store:
+        assert store.schema_version == SCHEMA_VERSION
+        assert store.backlog_binding("job") is None
+        assert store.backlog_gate("job") is None
+        assert store.changed_report("first", {"state": "waiting"})
+        assert store.github_source_for_job("job")["approved_revision"] == "rev"
+    with SQLiteStateStore(database) as reopened:
+        assert not reopened.changed_report("first", {"state": "waiting"})
+        assert reopened.github_source_for_job("job")["approved_by"] == "operator"
