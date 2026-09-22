@@ -27,6 +27,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.RUNNING: frozenset(
         {
             JobState.DRAINING,
+            JobState.SUSPENDED,
             JobState.CHECKPOINTED,
             JobState.METERING_PENDING,
             JobState.REVIEW,
@@ -74,8 +75,8 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         }
     ),
     JobState.COMPLETED: frozenset(),
-    JobState.FAILED: frozenset(),
-    JobState.CANCELLED: frozenset(),
+    JobState.FAILED: frozenset({JobState.SUSPENDED}),
+    JobState.CANCELLED: frozenset({JobState.SUSPENDED}),
 }
 
 

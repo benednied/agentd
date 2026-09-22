@@ -73,17 +73,21 @@ class _ContainedCodexDriver(CodexSdkDriver):
         if not isinstance(execution.operation, CodingOperation):
             raise OperationError("contained SDK requires a typed coding order")
         order = execution.operation.work_order
+        remaining = order.maximum_quota - order.prior_consumed_quota
         # This pool records only the already-admitted execution envelope. It
         # does not represent provider availability or make admission decisions.
         pool_id = f"execution-envelope:{run_id}"
         job = Job(
-            id=order.job_id,
+            # The SDK ledger mirrors an individual admitted envelope. A logical
+            # controller job may have many attempts, each with its own active
+            # reservation. Keep the logical identity in the immutable contract.
+            id=f"worker-envelope:{run_id}",
             project=order.repository,
             repository=execution.working_directory,
             objective=order.objective,
             quota_budget=QuotaBudget(
-                order.expected_quota,
-                maximum=order.maximum_quota,
+                min(order.expected_quota, remaining),
+                maximum=remaining,
                 pool_id=pool_id,
                 unit=QuotaUnit.TOKENS,
             ),
@@ -91,7 +95,7 @@ class _ContainedCodexDriver(CodexSdkDriver):
             state=JobState.RUNNING,
         )
         reservation = QuotaReservation(
-            job.id, pool_id, order.maximum_quota, unit=QuotaUnit.TOKENS
+            job.id, pool_id, remaining, unit=QuotaUnit.TOKENS
         )
         workspace = WorkspaceLease(
             id=run_id,
@@ -113,7 +117,7 @@ class _ContainedCodexDriver(CodexSdkDriver):
             allocation_id=allocation.id,
             driver="codex",
             backend="local",
-            contract=execution,
+            contract=replace(execution, job_id=job.id),
             handle=RunHandle(run_id, "codex"),
         )
         try:
@@ -128,8 +132,8 @@ class _ContainedCodexDriver(CodexSdkDriver):
                 pool=QuotaPool(
                     pool_id,
                     "controller-execution-envelope",
-                    order.maximum_quota,
-                    reserved=order.maximum_quota,
+                    remaining,
+                    reserved=remaining,
                     unit=QuotaUnit.TOKENS,
                 ),
                 reservation=reservation,
@@ -145,7 +149,7 @@ class _ContainedCodexDriver(CodexSdkDriver):
                 "worker execution preparation failed"
             ) from error
         # This durable run boundary must precede every SDK/provider entrypoint.
-        return await super().start_managed(run_id, execution)
+        return await super().start_managed(run_id, run.contract)
 
     def prove_preparation_failure(
         self, run_id: str, order: CodingWorkOrder, lease: WorkspaceLease

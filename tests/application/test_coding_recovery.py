@@ -50,6 +50,13 @@ class PausedProvider(ControlledProvider):
         self.finished = asyncio.Event()
 
     def observe(self, run_id):
+        result = RunResult(
+            RunOutcome.CANCELLED,
+            "bounded stop",
+            usage=TokenUsage(input_tokens=12),
+            consumed_quota=12,
+            metadata={"telemetry_valid": True},
+        )
         return RunObservation(
             run_id,
             "provider-thread",
@@ -57,11 +64,14 @@ class PausedProvider(ControlledProvider):
             "usage-12",
             cumulative_quota=12,
             unit=QuotaUnit.TOKENS,
+            usage=result.usage,
+            terminal=self.finished.is_set(),
+            result=result if self.finished.is_set() else None,
         )
 
     async def collect(self, run):
         await self.finished.wait()
-        return RunResult(RunOutcome.CANCELLED, "bounded stop", consumed_quota=12)
+        return self.observe(run.id).result
 
     async def cancel(self, run):
         self.cancels += 1
@@ -74,6 +84,39 @@ class LostStartAckBackend(RemoteWorkerBackend):
         raise WorkerStartUncertainError(
             "worker started; controller acknowledgement lost"
         )
+
+
+def test_legacy_recovery_preserves_terminal_run_and_requires_matching_evidence(
+    tmp_path,
+):
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            path = Path(rig.provider.execution.working_directory)
+            (path / "retained.txt").write_text("partial implementation\n")
+            await rig.worker.cancel(rig.worker._runs[run.id].handle)
+            await rig.coordinator.reconcile_managed_runs()
+            original = rig.store.get_run(run.id)
+            assert rig.store.get_job(rig.job.id).state is JobState.CANCELLED
+            checkpoint = await rig.worker.capture_checkpoint(run.id)
+            with pytest.raises(LifecycleError, match="identity mismatch"):
+                rig.coordinator.restore_coding_checkpoint(
+                    rig.job.id, {**checkpoint, "job_id": "other"}, actor="operator"
+                )
+            recovered = rig.coordinator.restore_coding_checkpoint(
+                rig.job.id, checkpoint, actor="operator"
+            )
+            assert recovered.state is JobState.SUSPENDED
+            assert rig.store.get_run(run.id) == original
+            await rig.coordinator.resume(
+                rig.job.id, maximum_tokens=300, actor="operator"
+            )
+            assert rig.store.get_job(rig.job.id).quota_budget.maximum == 300
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert rig.provider.starts == 1
+
+    asyncio.run(scenario())
 
 
 @dataclass
@@ -287,7 +330,7 @@ def test_coding_stale_admission_and_midrun_pressure_survive_restart(tmp_path):
             assert commands[0].action == "checkpoint"
             assert commands[0].id.startswith("provider-quota-checkpoint:" + run.id)
             assert rig.provider.cancels >= 1
-            assert rig.store.get_job(rig.job.id).state is JobState.CANCELLED
+            assert rig.store.get_job(rig.job.id).state is JobState.SUSPENDED
             assert rig.store.get_quota_pool("account").remaining == 988
             await rig.reopen_controller()
             await rig.coordinator.recover_managed_runs()
@@ -295,6 +338,18 @@ def test_coding_stale_admission_and_midrun_pressure_survive_restart(tmp_path):
             assert rig.store.list_run_commands(run.id) == commands
             assert rig.provider.starts == len(rig.store.list_runs(rig.job.id)) == 1
             assert await rig.plane.dispatch_next() is None
+            # Fresh reset evidence allows another bounded attempt, preserving
+            # the same job, checkpoint and charged prior usage.
+            rig.quota(10)
+            await rig.coordinator.resume(rig.job.id)
+            rig.provider.finished = asyncio.Event()
+            await rig.plane.refresh_worker_heartbeats()
+            resumed = await rig.plane.dispatch_next()
+            assert resumed is not None and resumed.id != run.id
+            assert resumed.contract.operation.work_order.resume_from_run_id == run.id
+            assert resumed.contract.operation.work_order.prior_consumed_quota == 12
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert rig.provider.starts == 2
 
     asyncio.run(scenario())
 

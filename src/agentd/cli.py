@@ -71,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
     github_commands.add_parser(
         "status", help="show durable coding and publication outcomes"
     )
+    resume_coding = github_commands.add_parser(
+        "resume", help="resume a retained coding checkpoint"
+    )
+    resume_coding.add_argument("job_id")
+    resume_coding.add_argument("--actor", required=True)
+    resume_coding.add_argument("--maximum-tokens", type=float)
+    recover_coding = github_commands.add_parser(
+        "recover", help="import a trusted worker checkpoint for a stopped legacy run"
+    )
+    recover_coding.add_argument("job_id")
+    recover_coding.add_argument("--checkpoint", type=Path, required=True)
+    recover_coding.add_argument("--actor", required=True)
 
     worker = commands.add_parser(
         "worker-serve",
@@ -249,6 +261,24 @@ async def _github_command(args: argparse.Namespace) -> int:
     )
 
     config = load_config(args.config)
+    if args.github_command in {"resume", "recover"}:
+        runtime = create_controller(config)
+        try:
+            coordinator = runtime.coordinator
+            if args.github_command == "recover":
+                job = coordinator.restore_coding_checkpoint(
+                    args.job_id,
+                    json.loads(args.checkpoint.read_text()),
+                    actor=args.actor,
+                )
+            else:
+                job = await coordinator.resume(
+                    args.job_id, maximum_tokens=args.maximum_tokens, actor=args.actor
+                )
+            print(json.dumps({"job_id": job.id, "state": job.state.value}))
+        finally:
+            await runtime.aclose()
+        return 0
     if args.github_command != "serve":
         with _store(config["database"]) as store:
             if args.github_command == "status":

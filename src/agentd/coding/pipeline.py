@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -62,11 +63,18 @@ class CodingPublicationReconciler:
             or run.result is None
             or run.result.outcome is not RunOutcome.COMPLETED
             or run.state is not RunState.COMPLETED
-            or job.operation != run.contract.operation
+            or not isinstance(job.operation, CodingOperation)
             or not isinstance(run.contract.operation, CodingOperation)
         ):
             raise PublicationError("Coding job has no completed review handoff")
         order = run.contract.operation.work_order
+        if (
+            replace(order, resume_from_run_id=None, prior_consumed_quota=0)
+            != job.operation.work_order
+        ):
+            raise PublicationError(
+                "Coding continuation changed the approved work order"
+            )
         profile = self.profiles[order.profile_id]
         order.validate_profile(profile)
         source = self.store.github_source_for_job(job.id)

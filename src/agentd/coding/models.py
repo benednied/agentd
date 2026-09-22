@@ -111,8 +111,20 @@ class CodingWorkOrder:
     required_capabilities: tuple[str, ...] = ("remote-coding",)
     context_references: tuple[str, ...] = ()
     quota_unit: str = "tokens"
+    resume_from_run_id: str | None = None
+    prior_consumed_quota: float = 0
 
     def __post_init__(self) -> None:
+        if self.resume_from_run_id is not None and (
+            not self.resume_from_run_id or "\0" in self.resume_from_run_id
+        ):
+            raise ValueError("resume requires an opaque prior run identity")
+        if not isfinite(self.prior_consumed_quota) or not (
+            0 <= self.prior_consumed_quota < self.maximum_quota
+        ):
+            raise ValueError("continuation requires remaining cumulative quota")
+        if self.prior_consumed_quota and self.resume_from_run_id is None:
+            raise ValueError("prior usage requires a checkpoint run")
         repository_name(self.repository)
         exact_commit(self.base_commit)
         for digest in (self.profile_digest, self.source_revision):
@@ -155,7 +167,13 @@ class CodingWorkOrder:
             raise ValueError("work order exceeds profile runtime limit")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Preserve existing claim fingerprints for pre-continuation work orders.
+        if self.resume_from_run_id is None:
+            data.pop("resume_from_run_id")
+        if not self.prior_consumed_quota:
+            data.pop("prior_consumed_quota")
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodingWorkOrder:

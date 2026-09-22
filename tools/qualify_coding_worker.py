@@ -40,6 +40,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--tls-key", type=Path)
     result.add_argument("--port", type=int, default=0)
     result.add_argument("--lifetime-seconds", type=float, default=1800)
+    result.add_argument(
+        "--capture-run",
+        action="append",
+        default=[],
+        help="Administrative capture of a retained terminal run; never starts a model",
+    )
     return result
 
 
@@ -89,6 +95,24 @@ async def run(args: argparse.Namespace) -> None:
         {"codex": sdk},
         account_pools={"codex": args.account_pool},
     )
+    if args.capture_run:
+        try:
+            for run_id in args.capture_run:
+                checkpoint = await coding.capture_checkpoint(run_id)
+                print(
+                    json.dumps(
+                        {
+                            key: value
+                            for key, value in checkpoint.items()
+                            if key != "bundle_chunks"
+                        }
+                    ),
+                    flush=True,
+                )
+        finally:
+            await coding.close()
+            await sdk.close()
+        return
     journal = OperationJournal(
         state_root / "worker.sqlite",
         node_id=args.node_id,
