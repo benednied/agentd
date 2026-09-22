@@ -239,7 +239,11 @@ def create_controller(config: dict[str, Any]) -> CodingController:
     client = endpoint._create_client(endpoint.load_secret({}))
     owner = ControllerLock(Path(config["database"]).expanduser().resolve())
     owner.acquire()
-    store = SQLiteStateStore(config["database"])
+    try:
+        store = SQLiteStateStore(config["database"])
+    except BaseException:
+        owner.release()
+        raise
     try:
         intake = create_intake(config, store)
         backlog = create_backlog(config, intake) if config.get("backlog") else None

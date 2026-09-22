@@ -22,11 +22,13 @@ The gate passes only when all of these thresholds hold for the full window:
 - zero controller database-lock violations or concurrent controller owners;
 - zero unauthorised dispatches, duplicate jobs, duplicate runs, or duplicate
   publication side effects;
-- zero worker authentication, TLS, containment, or readiness failures after
-  the initial startup checks;
+- no unhandled worker authentication, TLS, containment, or readiness failures;
+  deliberately injected stale-heartbeat, stale-quota, and lost-response cases
+  must fail closed, preserve durable state, and leave no unauthorized side
+  effect;
 - every admitted run has one durable terminal/review outcome or an explicitly
   retained checkpoint with ownership unresolved and capacity reserved;
-- no quota observation is stale or for the wrong account pool;
+- no admission uses a stale quota observation or one for the wrong account pool;
 - every publication attempt has matching source revision, base/result commits,
   validation evidence, and durable reconciliation state; and
 - every restart/recovery test preserves job identity, usage accounting,
@@ -39,5 +41,8 @@ quota snapshots, backlog snapshot and approval revision, job/run history,
 validation reports, bundle manifests, and publication URLs or blocked reasons.
 Include negative evidence for incomplete reads, changed issues, missing worker
 heartbeats, stale quota, ambiguous pull requests, and lost publication
-responses. Do not claim the gate passed until an operator has reviewed this
-bundle against every threshold.
+responses. The repository dependency runtime still needs preparation; its
+current Goldenage-specific monkeypatch is not a productized deployment step.
+There has been no live migration or completed 24-hour qualification yet. Do
+not claim the gate passed until an operator has reviewed this bundle against
+every threshold.

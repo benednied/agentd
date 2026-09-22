@@ -141,7 +141,7 @@ def test_collector_explicit_mapping_uses_pinned_target():
             }
         if "/check-runs?" in endpoint:
             return {"check_runs": []}
-        if endpoint.endswith("/status"):
+        if "/status?" in endpoint:
             return {"statuses": []}
         if "/compare/" in endpoint:
             return {"status": "identical", "total_commits": 0, "commits": []}
@@ -190,7 +190,7 @@ def test_collector_requires_graphql_closing_reference_for_timeline_pr():
             }
         if "/check-runs?" in endpoint:
             return {"check_runs": []}
-        if endpoint.endswith("/status"):
+        if "/status?" in endpoint:
             return {"statuses": []}
         if "/compare/" in endpoint:
             return {"status": "identical", "total_commits": 0, "commits": []}
@@ -223,3 +223,35 @@ def test_collector_requires_graphql_closing_reference_for_timeline_pr():
     )
     assert decision.ready
     assert decision.links == ("https://github.com/acme/project/pull/7",)
+
+
+def test_legacy_status_pagination_fails_closed_at_bound():
+    source = GitHubIntegrationSource(
+        get=lambda endpoint: {
+            "statuses": [{"context": str(i), "state": "success"} for i in range(100)]
+        }
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="commit-status pagination"):
+        source._checks("acme/project", "a" * 40)
+
+
+def test_legacy_status_failure_on_later_page_is_not_hidden():
+    def get(endpoint):
+        if "/check-runs?" in endpoint:
+            return {"check_runs": []}
+        if endpoint.endswith("page=1"):
+            return {
+                "statuses": [
+                    {"context": str(i), "state": "success"} for i in range(100)
+                ]
+            }
+        return {"statuses": [{"context": "late-ci", "state": "failure"}]}
+
+    checks = GitHubIntegrationSource(get=get)._checks("acme/project", "a" * 40)
+    decision = IntegrationEvidenceEvaluator(
+        IntegrationPolicy("acme/project", "main", ("prerequisite",))
+    ).evaluate([_pr(checks=checks)])
+    assert decision.status is IntegrationStatus.BLOCKED
+    assert "failing checks" in decision.reason

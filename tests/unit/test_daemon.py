@@ -186,3 +186,37 @@ def test_daemon_rejects_nonpositive_worker_heartbeat_interval() -> None:
         assert "worker_heartbeat_seconds" in str(error)
     else:
         raise AssertionError("nonpositive heartbeat interval was accepted")
+
+
+def test_drain_preserves_collection_and_publication_until_admission_resumes() -> None:
+    async def scenario() -> None:
+        class Plane:
+            dispatches = 0
+            collections = 0
+
+            async def reconcile_managed_runs(self, _snapshot, *, at):
+                self.collections += 1
+                return ()
+
+            async def dispatch_next(self):
+                self.dispatches += 1
+
+        plane = Plane()
+        enabled = False
+        publications = []
+
+        async def publish():
+            publications.append(True)
+
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            admission_enabled=lambda: enabled,
+            result_reconciler=publish,
+        )
+        await daemon.tick()
+        assert (plane.dispatches, plane.collections, len(publications)) == (0, 1, 1)
+        enabled = True
+        await daemon.tick()
+        assert (plane.dispatches, plane.collections, len(publications)) == (1, 2, 2)
+
+    asyncio.run(scenario())

@@ -556,13 +556,23 @@ class GitHubIntegrationSource:
                 break
         if not complete:
             raise ValueError("GitHub check-run pagination is truncated")
-        status_data = self._get(f"repos/{repository}/commits/{sha}/status")
-        checks.extend(
-            CheckEvidence(
-                str(status.get("context", "")), "completed", status.get("state")
+        status_complete = False
+        for page in range(1, 11):
+            status_data = self._get(
+                f"repos/{repository}/commits/{sha}/status?per_page=100&page={page}"
             )
-            for status in status_data.get("statuses", ())
-        )
+            statuses = status_data.get("statuses", ())
+            checks.extend(
+                CheckEvidence(
+                    str(status.get("context", "")), "completed", status.get("state")
+                )
+                for status in statuses
+            )
+            if len(statuses) < 100:
+                status_complete = True
+                break
+        if not status_complete:
+            raise ValueError("GitHub commit-status pagination is truncated")
         return tuple(checks)
 
     def _contains(self, repository: str, merged_sha: str, target_commit: str) -> bool:

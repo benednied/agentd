@@ -17,6 +17,19 @@ from agentd.intake.models import SourceIssue
 from agentd.intake.service import GitHubIntake
 
 
+def prerequisite_closure(snapshot: BacklogSnapshot, key: str) -> tuple[str, ...]:
+    """Every reachable prerequisite, once, in deterministic graph order."""
+    reached: set[str] = set()
+    pending = list(snapshot.blockers[key])
+    while pending:
+        dependency = pending.pop()
+        if dependency in reached:
+            continue
+        reached.add(dependency)
+        pending.extend(snapshot.blockers[dependency])
+    return tuple(node for node in snapshot.order if node in reached)
+
+
 def node_revision(snapshot: BacklogSnapshot, key: str) -> str:
     """Approval covers intent and all prerequisite identities and intent."""
     visited: set[str] = set()
@@ -340,7 +353,7 @@ class BacklogReconciler:
                     "reason": evidence[dep].reason,
                     "links": list(evidence[dep].links),
                 }
-                for dep in snapshot.blockers[key]
+                for dep in prerequisite_closure(snapshot, key)
                 if not evidence[dep].ready
             ]
             ready = False
@@ -454,7 +467,7 @@ class BacklogReconciler:
         base = self.integration.target_commit(
             self.repository, self.config["base_branch"]
         )
-        for dep in snapshot.blockers[issue.key]:
+        for dep in prerequisite_closure(snapshot, issue.key):
             prerequisite = snapshot.issues[dep]
             evidence = self.integration.observe(
                 prerequisite,

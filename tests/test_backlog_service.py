@@ -323,3 +323,48 @@ def test_stale_gate_rejects_admission_from_real_store(tmp_path):
         store.save_job(admitted, event, expected=job)
     assert store.get_job(job.id).state is JobState.READY
     store.close()
+
+
+def test_transitive_revert_blocks_admission_and_publication_until_reintegrated(
+    tmp_path,
+):
+    snapshot = _graph(members=(78,), blockers={78: (79,), 79: (80,)})
+    integration = PollIntegration(
+        {
+            77: _decision(77),
+            78: _decision(78),
+            79: _decision(79, ready=True),
+            80: _decision(80, reason="pull request change was reverted"),
+        }
+    )
+    reconciler, store = _real_reconciler(tmp_path, snapshot, integration)
+    try:
+        reconciler.ledger.approve(snapshot, actor="operator")
+        asyncio.run(reconciler.poll())
+        assert store.list_jobs() == []
+        blocked = reconciler.plan(snapshot)["nodes"][0]
+        assert blocked["blockers"][0]["issue"] == 80
+        assert not blocked["ready"]
+
+        integration.decisions[80] = _decision(80, ready=True)
+        asyncio.run(reconciler.poll())
+        job = store.list_jobs()[0]
+        assert job.state is JobState.READY
+        assert job.base_ref == integration.commits[-1]
+        # Isolate native graph refresh from the legacy source fetch: both
+        # resume and publication invoke this shared authorization entry point.
+        reconciler.intake.refresh_authorization = lambda issue: None
+        reconciler.refresh_authorization(_issue(78))
+        integration.decisions[80] = _decision(
+            80, reason="pull request change was reverted"
+        )
+        with pytest.raises(ValueError, match="prerequisite no longer integrated"):
+            reconciler.refresh_authorization(_issue(78))
+        asyncio.run(reconciler.poll())
+        assert store.get_job(job.id).state is JobState.BACKLOG
+        integration.decisions[80] = _decision(80, ready=True)
+        asyncio.run(reconciler.poll())
+        assert store.get_job(job.id).state is JobState.READY
+        assert len(store.list_jobs()) == 1
+    finally:
+        store.close()
