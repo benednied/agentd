@@ -45,6 +45,16 @@ systemctl --user enable agentd.service
 The committed `deploy/container/config.toml` is installed atomically and later
 deployment owns policy changes so the release-coupled copy can be backed up.
 
+The coding profile uses `deploy/compose.coding.yaml` and three independent
+units: `agentd-coding-controller.service`, `agentd-worker.service`, and
+`agentd-publisher.service`. The worker runs
+`tools/serve_coding_worker.py`, which registers the real `CodingHarnessDriver`
+and waits indefinitely for a supervisor signal. Its durable journal, PSK,
+profiles, and TLS keypair live under the worker state root. Controller health
+uses authenticated worker heartbeats and durable run ownership.
+The publisher runs only the publication command and has its own configuration
+file. Each unit stops only its own Compose service.
+
 ## SHA-versioned deployment
 
 Deployment accepts a full lowercase 40-character Git SHA, exports that tree to a

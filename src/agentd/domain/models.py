@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from agentd.coding.models import CodingWorkOrder
 from agentd.domain.enums import (
     AgentRequestKind,
     AllocationState,
@@ -334,7 +335,25 @@ class DeployImageOperation(Serializable):
         )
 
 
-JobOperation = BuildImageOperation | DeployImageOperation
+@dataclass(frozen=True, slots=True)
+class CodingOperation(Serializable):
+    """Portable coding intent; policy and local paths belong to the worker."""
+
+    work_order: CodingWorkOrder
+    kind: OperationKind = field(default=OperationKind.CODE, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.work_order, CodingWorkOrder):
+            raise TypeError("Coding operation requires a typed work order")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodingOperation:
+        if set(data) != {"kind", "work_order"} or data["kind"] != "code":
+            raise ValueError("Coding operation fields are invalid")
+        return cls(CodingWorkOrder.from_dict(data["work_order"]))
+
+
+JobOperation = BuildImageOperation | DeployImageOperation | CodingOperation
 
 
 def operation_from_dict(data: dict[str, Any]) -> JobOperation:
@@ -343,6 +362,8 @@ def operation_from_dict(data: dict[str, Any]) -> JobOperation:
     if not isinstance(data, dict):
         raise TypeError("A job operation must be an object")
     kind = data.get("kind")
+    if kind == OperationKind.CODE.value:
+        return CodingOperation.from_dict(data)
     if kind == OperationKind.BUILD_IMAGE.value:
         return BuildImageOperation.from_dict(data)
     if kind == OperationKind.DEPLOY_IMAGE.value:
@@ -769,7 +790,7 @@ class Job(Serializable):
         if len(set(output_names)) != len(output_names):
             raise ValueError("Job artifact_outputs must have unique names")
         if self.operation is not None and not isinstance(
-            self.operation, (BuildImageOperation, DeployImageOperation)
+            self.operation, (BuildImageOperation, DeployImageOperation, CodingOperation)
         ):
             raise TypeError("Job operation must be a supported typed operation")
 
@@ -1311,7 +1332,7 @@ class ExecutionContract(Serializable):
             raise TypeError(
                 "ExecutionContract artifact_inputs must be resolved ArtifactRef values"
             )
-        if self.operation is not None:
+        if isinstance(self.operation, (BuildImageOperation, DeployImageOperation)):
             operation_input = (
                 self.operation.source_input
                 if isinstance(self.operation, BuildImageOperation)

@@ -1,0 +1,26 @@
+[Unit]
+Description=agentd coding controller
+Documentation=file:///home/bened/.local/share/agentd/coding-current/docs/40-operations/deployment.md
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd/coding-current
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5s
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/home/bened/.local/share/agentd/coding-current/deploy/scripts/coding-compose.sh config --quiet
+ExecStart=/home/bened/.local/share/agentd/coding-current/deploy/scripts/coding-compose.sh up --no-deps coding-controller
+ExecStop=/home/bened/.local/share/agentd/coding-current/deploy/scripts/coding-compose.sh stop coding-controller
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/bened/.local/state/agentd /home/bened/.local/share/agentd
+
+[Install]
+WantedBy=default.target

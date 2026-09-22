@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime
 from math import isfinite
 from pathlib import Path
 from threading import RLock
@@ -47,6 +48,7 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.domain.transitions import InvalidStateTransition, can_transition
+from agentd.intake.store import IntakeStoreMixin, migrate_intake
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
 SCHEMA = """
@@ -204,7 +206,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -392,6 +394,10 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
 
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    4: migrate_intake,
+    # Existing v5 controllers already have source provenance but not backlog
+    # gates/bindings or durable report deduplication. Preserve all old rows.
+    5: migrate_intake,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
@@ -409,7 +415,7 @@ def _load[T](payload: str, factory: Callable[[dict[str, Any]], T]) -> T:
     return factory(data)
 
 
-class SQLiteStateStore:
+class SQLiteStateStore(IntakeStoreMixin):
     """A small repository implementation suitable for a local control-plane daemon."""
 
     def __init__(
@@ -527,6 +533,109 @@ class SQLiteStateStore:
                 ),
             )
             self._insert_transition(transition)
+
+    def prepare_worker_execution(
+        self,
+        *,
+        job: Job,
+        transition: StateTransition,
+        pool: QuotaPool,
+        reservation: QuotaReservation,
+        workspace: WorkspaceLease,
+        node: WorkerNode,
+        allocation: ResourceAllocation,
+        run: RunRecord,
+    ) -> None:
+        """Atomically mirror one admitted worker envelope before provider start.
+
+        A shared worker node is stable across sequential envelopes. This method
+        creates no provider session and makes no admission decision. Any error
+        rolls back every new envelope record, leaving prior run usage intact.
+        """
+        if (
+            transition.job_id != job.id
+            or transition.from_state is not None
+            or transition.to_state != job.state
+            or reservation.job_id != job.id
+            or reservation.pool_id != pool.id
+            or workspace.job_id != job.id
+            or allocation.job_id != job.id
+            or allocation.node_id != node.id
+            or run.job_id != job.id
+            or run.node_id != node.id
+            or run.workspace_id != workspace.id
+            or run.reservation_id != reservation.id
+            or run.allocation_id != allocation.id
+        ):
+            raise ValueError("worker execution envelope identities disagree")
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO jobs(id, project, state, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    job.id,
+                    job.project,
+                    job.state.value,
+                    job.created_at.isoformat(),
+                    _dump(job),
+                ),
+            )
+            self._insert_transition(transition)
+            self._execute_insert_idempotent(
+                "quota_pools", pool.id, ("payload",), (_dump(pool),)
+            )
+            self._execute_insert_idempotent(
+                "quota_reservations",
+                reservation.id,
+                ("job_id", "pool_id", "state", "created_at", "payload"),
+                (
+                    reservation.job_id,
+                    reservation.pool_id,
+                    reservation.state.value,
+                    reservation.created_at.isoformat(),
+                    _dump(reservation),
+                ),
+                immutable_columns=("job_id", "pool_id"),
+            )
+            self._connection.execute(
+                "INSERT INTO workspaces(id, job_id, state, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    workspace.id,
+                    workspace.job_id,
+                    workspace.state.value,
+                    workspace.created_at.isoformat(),
+                    _dump(workspace),
+                ),
+            )
+            # Do not recreate a node with a fresh timestamp or reset allocation
+            # bookkeeping each time a provider envelope is mirrored.
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM nodes WHERE id = ?", (node.id,)
+                ).fetchone()
+                is None
+            ):
+                self._execute_insert_idempotent(
+                    "nodes",
+                    node.id,
+                    ("state", "payload"),
+                    (node.state.value, _dump(node)),
+                )
+            self._execute_insert_idempotent(
+                "resource_allocations",
+                allocation.id,
+                ("job_id", "node_id", "state", "created_at", "payload"),
+                (
+                    allocation.job_id,
+                    allocation.node_id,
+                    allocation.state.value,
+                    allocation.created_at.isoformat(),
+                    _dump(allocation),
+                ),
+                immutable_columns=("job_id", "node_id"),
+            )
+            self._save_run_in_transaction(run, None)
 
     def save_job(
         self,
@@ -859,6 +968,21 @@ class SQLiteStateStore:
         persisted = _load(row["payload"], Job.from_dict)
         if persisted != expected:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")
+        if job.state is JobState.ADMITTED:
+            gate = self.backlog_gate(job.id)
+            if gate is not None and (
+                not gate["ready"]
+                or gate["base_commit"] != job.base_ref
+                or datetime.fromisoformat(gate["valid_until"]) <= utc_now()
+            ):
+                raise ConcurrentStateError("Backlog integration evidence is not ready")
+            source = self.github_source_for_job(job.id)
+            if source is not None and (
+                source["revoked"]
+                or not source["eligible"]
+                or source["revision"] != source["approved_revision"]
+            ):
+                raise ConcurrentStateError("GitHub source approval was revoked")
         persisted_state = JobState(row["state"])
         if persisted_state is not expected.state:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")

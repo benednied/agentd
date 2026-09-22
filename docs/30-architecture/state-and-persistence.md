@@ -24,11 +24,12 @@ The following multi-record operations are atomic:
 - reset-event identity/application, Agent Request append/update operations, and
   authenticated worker-heartbeat updates on the existing node snapshot.
 
-`SCHEMA_VERSION = 4` is recorded through SQLite `PRAGMA user_version`. Version 0
+`SCHEMA_VERSION = 5` is recorded through SQLite `PRAGMA user_version`. Version 0
 databases bootstrap the base schema as version 1; the explicit idempotent migration
 chain then applies `v1 -> v2` (artifacts and Agent Requests), `v2 -> v3` (the reset
-ledger), and `v3 -> v4` (remove the digest-wide artifact uniqueness and enforce
-producer-slot ownership). Databases newer than the running binary are rejected.
+ledger), `v3 -> v4` (remove the digest-wide artifact uniqueness and enforce
+producer-slot ownership), and `v4 -> v5` (GitHub source observations and approval
+events). Databases newer than the running binary are rejected.
 Future schema changes require another explicit idempotent migration.
 
 Memory-only state includes App Server client objects, stream tasks, fake and CLI

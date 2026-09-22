@@ -55,6 +55,60 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("serve", help="run the continuous local scheduler service")
     commands.add_parser("doctor", help="run read-only service prerequisite checks")
 
+    github = commands.add_parser(
+        "github", help="administer the authorized GitHub issue-to-draft controller"
+    )
+    github.add_argument("--config", type=Path, required=True)
+    github_commands = github.add_subparsers(dest="github_command", required=True)
+    approval = github_commands.add_parser(
+        "approve", help="approve an exact issue revision"
+    )
+    approval.add_argument("issue_number", type=int)
+    approval.add_argument("--actor", required=True)
+    github_serve = github_commands.add_parser(
+        "serve", help="discover approved issues and reconcile drafts"
+    )
+    github_serve.add_argument("--without-publication", action="store_true")
+    github_commands.add_parser("publish", help="run only trusted draft publication")
+    github_commands.add_parser("health", help="check durable telemetry readiness")
+    github_commands.add_parser(
+        "drain", help="stop admission while collecting active work"
+    )
+    github_commands.add_parser(
+        "undrain", help="restore admission under existing policy"
+    )
+    github_commands.add_parser(
+        "plan", help="preview native graph and integration waits"
+    )
+    graph_approval = github_commands.add_parser(
+        "approve-graph", help="approve the exact previewed graph revision"
+    )
+    graph_approval.add_argument("--revision", required=True)
+    graph_approval.add_argument("--actor", required=True)
+    graph_approval.add_argument("--mode", choices=("exact", "bounded"), default="exact")
+    graph_import = github_commands.add_parser(
+        "import-graph", help="preview or explicitly apply native relationships"
+    )
+    graph_import.add_argument("manifest", type=Path)
+    graph_import.add_argument("--apply", action="store_true")
+    graph_import.add_argument("--revision")
+    graph_import.add_argument("--actor")
+    github_commands.add_parser(
+        "status", help="show durable coding and publication outcomes"
+    )
+    resume_coding = github_commands.add_parser(
+        "resume", help="resume a retained coding checkpoint"
+    )
+    resume_coding.add_argument("job_id")
+    resume_coding.add_argument("--actor", required=True)
+    resume_coding.add_argument("--maximum-tokens", type=float)
+    recover_coding = github_commands.add_parser(
+        "recover", help="import a trusted worker checkpoint for a stopped legacy run"
+    )
+    recover_coding.add_argument("job_id")
+    recover_coding.add_argument("--checkpoint", type=Path, required=True)
+    recover_coding.add_argument("--actor", required=True)
+
     worker = commands.add_parser(
         "worker-serve",
         help="run one authenticated remote worker daemon",
@@ -195,6 +249,8 @@ def _run_process_command(
     args: argparse.Namespace,
     config: ServiceConfig,
 ) -> int | None:
+    if args.command == "github":
+        return asyncio.run(_github_command(args))
     if args.command == "serve":
         return asyncio.run(_serve_service(config))
     if args.command == "worker-serve":
@@ -219,6 +275,150 @@ def _run_process_command(
             _print_model(snapshot)
         return 0
     return None
+
+
+async def _github_command(args: argparse.Namespace) -> int:
+    from agentd.coding.controller import (
+        create_backlog,
+        create_controller,
+        create_intake,
+        health,
+        load_config,
+        status,
+    )
+
+    config = load_config(args.config)
+    if args.github_command == "import-graph":
+        import sqlite3
+        from contextlib import closing
+
+        from agentd.intake.backlog_import import BacklogManifest, NativeGraphImporter
+
+        manifest = BacklogManifest.from_dict(json.loads(args.manifest.read_text()))
+        if (manifest.repository, manifest.repository_id) != (
+            config["profile"]["repository"],
+            config["repository_id"],
+        ):
+            raise ValueError("manifest repository does not match configured authority")
+        if args.apply and (not args.actor or not args.revision):
+            raise ValueError("import --apply requires --actor and preview --revision")
+
+        def import_graph() -> object:
+            Path(config["database"]).parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(config["database"])) as connection:
+                importer = NativeGraphImporter(connection)
+                if args.apply:
+                    return {
+                        "applied": importer.apply(manifest, args.revision, args.actor)
+                    }
+                return importer.preview(manifest)
+
+        print(json.dumps(await asyncio.to_thread(import_graph), indent=2))
+        return 0
+    if args.github_command in {"drain", "undrain"}:
+        marker = Path(config["drain_file"])
+        if args.github_command == "drain":
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch(mode=0o600)
+        else:
+            marker.unlink(missing_ok=True)
+        print(json.dumps({"draining": marker.exists()}))
+        return 0
+    if args.github_command == "publish":
+        from agentd.coding.controller import serve_publisher
+
+        await serve_publisher(config)
+        return 0
+    if args.github_command in {"resume", "recover"}:
+        runtime = create_controller(config)
+        try:
+            coordinator = runtime.coordinator
+            if args.github_command == "recover":
+                job = coordinator.restore_coding_checkpoint(
+                    args.job_id,
+                    json.loads(args.checkpoint.read_text()),
+                    actor=args.actor,
+                )
+            else:
+                job = await coordinator.resume(
+                    args.job_id, maximum_tokens=args.maximum_tokens, actor=args.actor
+                )
+            print(json.dumps({"job_id": job.id, "state": job.state.value}))
+        finally:
+            await runtime.aclose()
+        return 0
+    if args.github_command != "serve":
+        with _store(config["database"]) as store:
+            if args.github_command == "health":
+                report = health(config, store)
+                print(json.dumps(report, indent=2))
+                return 0 if report["admission_telemetry_ready"] else 1
+            if args.github_command == "status":
+                if config.get("backlog"):
+                    backlog = create_backlog(config, create_intake(config, store))
+                    print(
+                        json.dumps(
+                            {"jobs": status(store), "backlog": backlog.ledger.status()},
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(json.dumps(status(store), indent=2))
+            elif args.github_command in {"plan", "approve-graph"}:
+                if not config.get("backlog"):
+                    raise ValueError("configure a backlog epic or explicit issue set")
+                backlog = create_backlog(config, create_intake(config, store))
+                if args.github_command == "plan":
+                    snapshot = await asyncio.to_thread(backlog.discover)
+                    plan = await asyncio.to_thread(backlog.plan, snapshot)
+                    print(
+                        json.dumps(
+                            {"graph": snapshot.to_dict(), "plan": plan}, indent=2
+                        )
+                    )
+                else:
+                    grant = await asyncio.to_thread(
+                        backlog.approve,
+                        actor=args.actor,
+                        revision=args.revision,
+                        mode=args.mode,
+                    )
+                    print(json.dumps(grant, indent=2))
+            else:
+                if config.get("backlog"):
+                    raise ValueError(
+                        "use plan and approve-graph for a graph controller"
+                    )
+                intake = create_intake(config, store)
+                issue = await asyncio.to_thread(
+                    intake.approve,
+                    config["profile"]["repository"],
+                    args.issue_number,
+                    actor=args.actor,
+                )
+                # Materialize approved work even when it lies beyond the bounded
+                # discovery pages. This command has no execution backend.
+                await intake.reconcile(issue)
+                print(
+                    json.dumps(
+                        {"job_id": issue.job_id, "approved_revision": issue.revision},
+                        indent=2,
+                    )
+                )
+        return 0
+    config["publication_enabled"] = not args.without_publication
+    runtime = create_controller(config)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for received in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(received, stop.set)
+    try:
+        await runtime.daemon.serve(stop)
+    finally:
+        for received in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(received)
+        await runtime.aclose()
+    return 0
 
 
 def _serve_worker(args: argparse.Namespace) -> int:
