@@ -28,6 +28,9 @@ from agentd.workers.server import WorkerServer
 
 def parser(*, include_lifetime: bool = True) -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    # Keep the production parser shape compatible with the persistent runner;
+    # the omitted option must still be present as an explicit unbounded value.
+    result.set_defaults(lifetime_seconds=None)
     result.add_argument("--profiles", type=Path, required=True)
     result.add_argument("--account-pool", required=True)
     result.add_argument("--state-root", type=Path, required=True)
@@ -36,6 +39,10 @@ def parser(*, include_lifetime: bool = True) -> argparse.ArgumentParser:
     result.add_argument("--ready-file", type=Path, required=True)
     result.add_argument("--node-id", required=True)
     result.add_argument("--session-epoch", required=True)
+    result.add_argument("--model", default="gpt-5.6-luna")
+    result.add_argument("--dependency-venv", type=Path)
+    result.add_argument("--dependency-profile-id")
+    result.add_argument("--dependency-python-root", type=Path)
     result.add_argument("--host", default="127.0.0.1")
     result.add_argument("--tls-cert", type=Path)
     result.add_argument("--tls-key", type=Path)
@@ -102,6 +109,10 @@ async def _run_locked(args: argparse.Namespace) -> None:
     sdk = await create_verified_coding_sdk(
         state_root / "sdk.sqlite",
         environment=environment,
+        model=args.model,
+        dependency_venv=args.dependency_venv,
+        dependency_profile_id=args.dependency_profile_id,
+        dependency_python_root=args.dependency_python_root,
     )
     coding = CodingHarnessDriver(
         workspace_root,

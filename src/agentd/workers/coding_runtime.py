@@ -7,6 +7,7 @@ successfully under the same environment used to start the SDK.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +38,10 @@ from agentd.harness.codex_sdk import CodexSdkDriver
 from agentd.harness.supervisor import RunSupervisor
 from agentd.state.base import EntityNotFoundError
 from agentd.state.sqlite import SQLiteStateStore
+from agentd.workers.dependency_prep import (
+    DependencyRuntimePreparation,
+    PreparationMount,
+)
 from agentd.workers.operations import OperationError, SubprocessCommandRunner
 
 _RUNTIME_PYTHON = "/opt/agentd/venv/bin/python"
@@ -51,10 +56,20 @@ class _ContainedCodexDriver(CodexSdkDriver):
     """SDK with a worker-local execution-envelope ledger, never a quota oracle."""
 
     def __init__(
-        self, supervisor: RunSupervisor, store: SQLiteStateStore, *, model: str
+        self,
+        supervisor: RunSupervisor,
+        store: SQLiteStateStore,
+        *,
+        model: str,
+        dependency_venv: Path | None = None,
+        dependency_profile_id: str | None = None,
+        dependency_python_root: Path | None = None,
     ) -> None:
         super().__init__(supervisor, model=model)
         self._worker_store = store
+        self._dependency_venv = dependency_venv
+        self._dependency_profile_id = dependency_profile_id
+        self._dependency_python_root = dependency_python_root
 
     def capabilities(self) -> HarnessCapabilities:
         capabilities = super().capabilities()
@@ -73,6 +88,18 @@ class _ContainedCodexDriver(CodexSdkDriver):
         if not isinstance(execution.operation, CodingOperation):
             raise OperationError("contained SDK requires a typed coding order")
         order = execution.operation.work_order
+        if (
+            self._dependency_venv is not None
+            and order.profile_id == self._dependency_profile_id
+        ):
+            preparation = DependencyRuntimePreparation(
+                self._dependency_venv.parent,
+                (PreparationMount(self._dependency_venv, ".venv"),),
+                (self._dependency_python_root,) if self._dependency_python_root else (),
+            )
+            await asyncio.to_thread(
+                preparation.prepare, Path(execution.working_directory)
+            )
         remaining = order.maximum_quota - order.prior_consumed_quota
         # This pool records only the already-admitted execution envelope. It
         # does not represent provider availability or make admission decisions.
@@ -203,6 +230,9 @@ async def create_verified_coding_sdk(
     *,
     environment: Mapping[str, str],
     model: str = DEFAULT_CODEX_MODEL,
+    dependency_venv: Path | None = None,
+    dependency_profile_id: str | None = None,
+    dependency_python_root: Path | None = None,
 ) -> CodexSdkDriver:
     """Run the image-pinned probe, then grant narrowly proven capabilities.
 
@@ -212,6 +242,10 @@ async def create_verified_coding_sdk(
     accepted. State paths must remain beneath the protected deployment state
     root, outside every coding workspace.
     """
+    if dependency_venv is not None and not dependency_profile_id:
+        raise OperationError(
+            "dependency preparation requires an explicit profile identity"
+        )
     state_path = state_path.resolve()
     state_root = Path("/home/bened/.local/state/agentd").resolve()
     if not state_path.is_relative_to(state_root):
@@ -239,4 +273,11 @@ async def create_verified_coding_sdk(
         ),
         model=model,
     )
-    return _ContainedCodexDriver(supervisor, store, model=model)
+    return _ContainedCodexDriver(
+        supervisor,
+        store,
+        model=model,
+        dependency_venv=dependency_venv,
+        dependency_profile_id=dependency_profile_id,
+        dependency_python_root=dependency_python_root,
+    )

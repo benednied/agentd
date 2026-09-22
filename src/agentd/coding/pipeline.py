@@ -47,6 +47,21 @@ class CodingPublicationReconciler:
         for job in self.store.list_jobs(frozenset({JobState.REVIEW})):
             if not isinstance(job.operation, CodingOperation):
                 continue
+            # A published ledger row is terminal.  It may outlive the profile
+            # that produced it (for example after a Mac-to-Linux deployment
+            # change), so do not reconstruct the old intent or revalidate it.
+            # The publication store is the durable source of the PR summary;
+            # returning it also keeps restart reconciliation observable.
+            publication = self.publisher.store.get(job.id)
+            if publication is not None and publication["stage"] == "published":
+                results.append(
+                    {
+                        "job_id": job.id,
+                        "publication_stage": "published",
+                        "pr": publication["pr"],
+                    }
+                )
+                continue
             try:
                 results.append(await asyncio.to_thread(self.publish_job, job.id))
             except Exception as error:

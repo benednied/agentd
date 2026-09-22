@@ -1,6 +1,7 @@
 """Real Git and authenticated TCP across intake, scheduling and publication."""
 
 import asyncio
+import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
@@ -495,6 +496,32 @@ def test_operating_controller_polls_executes_publishes_and_restarts(
             assert status(runtime.store)[0]["pr"] == records[0]["pr"]
             assert len(runtime.store.list_runs()) == 1
             assert runtime.store.get_quota_pool("account").remaining == 188
+            assert github.pushes == github.creates == provider.starts == 1
+            published_job_id = runtime.store.list_jobs()[0].id
+            await runtime.aclose()
+
+            # A restart may load a profile for a different host/runtime.  The
+            # already-published ledger row is terminal and must be reported
+            # from durable state without revalidating the old Mac work order
+            # or touching the model/GitHub adapter again.
+            config["profile"] = replace(profile, version="linux-v2").to_dict()
+            runtime = create_controller(config)
+            await runtime.daemon.tick()
+            restarted = status(runtime.store)[0]
+            assert restarted["publication_stage"] == "published"
+            assert restarted["pr"] == records[0]["pr"]
+            assert github.pushes == github.creates == provider.starts == 1
+
+            # A non-terminal ledger entry still takes the strict publication
+            # path and rejects an immutable old profile before any side effect.
+            with sqlite3.connect(config["database"]) as database:
+                database.execute(
+                    "UPDATE draft_publications SET stage = 'pending' WHERE job_id = ?",
+                    (published_job_id,),
+                )
+                database.commit()
+            with pytest.raises(ValueError, match="repository profile mismatch"):
+                runtime.publications.publish_job(published_job_id)
             assert github.pushes == github.creates == provider.starts == 1
         finally:
             await runtime.aclose()

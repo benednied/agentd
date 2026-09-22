@@ -31,9 +31,7 @@ def test_worker_profile_file_is_reachable_inside_the_worker_mount():
     assert env["AGENTD_CODING_PROFILES"] == str(
         Path(env["AGENTD_WORKER_STATE_ROOT"]) / relative
     )
-    assert env["AGENTD_CODING_WORKER_PSK"] == str(
-        Path(env["AGENTD_WORKER_STATE_ROOT"]) / "worker.psk"
-    )
+    assert env["AGENTD_CODING_WORKER_PSK"].endswith("/coding-transport/worker.psk")
 
 
 def test_worker_tls_is_internal_only_and_controller_has_no_worker_secret_mount():
@@ -57,3 +55,18 @@ def test_compose_duration_uses_docker_units():
     for service in _compose()["services"].values():
         value = service["stop_grace_period"]
         assert value[-1:] in {"s", "m", "h"}, value
+
+
+def test_coding_units_use_the_optional_host_override_wrapper():
+    wrapper = ROOT / "deploy/scripts/coding-compose.sh"
+    text = wrapper.read_text()
+    assert "coding.override.yaml" in text
+    assert '--file "$override"' in text
+    for name in (
+        "agentd-coding-controller.service",
+        "agentd-worker.service",
+        "agentd-publisher.service",
+    ):
+        unit = (ROOT / "deploy/systemd" / name).read_text()
+        assert "coding-compose.sh" in unit
+        assert "/usr/bin/docker compose" not in unit

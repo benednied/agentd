@@ -123,6 +123,7 @@ def create_intake(config: dict[str, Any], store: SQLiteStateStore) -> GitHubInta
             config.get("effort_p50_minutes", profile.max_runtime_seconds / 120),
             config.get("effort_p90_minutes", profile.max_runtime_seconds / 60),
         ),
+        acceptance_criteria=tuple(config.get("acceptance_criteria", ())),
     )
     return GitHubIntake(
         store,

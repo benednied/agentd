@@ -13,8 +13,7 @@ units='agentd-coding-controller.service agentd-worker.service agentd-publisher.s
 compose() {
   location=$1
   shift
-  docker compose --project-directory "$location" --env-file "$location/release.env" \
-    --env-file "$base/coding.env" --file "$location/deploy/compose.coding.yaml" "$@"
+  "$location/deploy/scripts/coding-compose.sh" "$@"
 }
 compose "$release" config --quiet
 previous=''

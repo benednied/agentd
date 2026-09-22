@@ -136,21 +136,21 @@
         "--workspace-root",
         "/home/bened/.local/share/agentd/workspaces",
         "--secret-file",
-        "/home/bened/.local/state/agentd/worker.psk",
+        "/home/bened/.local/state/agentd/transport/worker.psk",
         "--ready-file",
         "/home/bened/.local/state/agentd/worker.ready",
         "--node-id",
-        "coding-worker",
+        "${AGENTD_CODING_NODE_ID:-coding-worker}",
         "--session-epoch",
-        "production",
+        "${AGENTD_CODING_SESSION_EPOCH:-production}",
         "--host",
         "0.0.0.0",
         "--port",
         "38101",
         "--tls-cert",
-        "/home/bened/.local/state/agentd/worker.crt",
+        "/home/bened/.local/state/agentd/transport/worker.crt",
         "--tls-key",
-        "/home/bened/.local/state/agentd/worker.key"
+        "/home/bened/.local/state/agentd/transport/worker.key"
       ],
       "environment": {
         "HOME": "/home/bened",
@@ -163,6 +163,15 @@
           "source": "${AGENTD_WORKER_STATE_ROOT:?set AGENTD_WORKER_STATE_ROOT}",
           "target": "/home/bened/.local/state/agentd",
           "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${AGENTD_CONTROLLER_TRANSPORT:?set AGENTD_CONTROLLER_TRANSPORT}",
+          "target": "/home/bened/.local/state/agentd/transport",
+          "read_only": true,
           "bind": {
             "create_host_path": false
           }

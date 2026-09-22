@@ -17,6 +17,12 @@ The host paths come from `deploy/env/coding.env.example`: `coding-config`,
 The Compose services mount those paths at the in-container paths used by the
 example JSON. Prepare the Linux host in this order:
 
+For host-specific read-only mounts, place a reviewed Compose override at
+`/home/bened/.local/share/agentd/coding.override.yaml`. The coding systemd
+units and release script add this regular non-symlink file automatically when
+it exists. Keep the generic `compose.coding.yaml` portable; use the override
+for machine-specific runtime or dependency virtualenv paths.
+
 1. Create the exact state directories as the service account:
 
    ```bash
@@ -24,6 +30,9 @@ example JSON. Prepare the Linux host in this order:
    install -d -m 0700 /home/bened/.local/state/agentd/coding-config
    install -d -m 0700 /home/bened/.local/state/agentd/coding-transport
    install -d -m 0700 /home/bened/.local/state/agentd/coding-publication-cache
+   install -d -m 0700 /home/bened/.local/state/agentd/coding-worker
+   install -d -m 0700 /home/bened/.local/share/agentd/workspaces/coding-worker
+   install -d -m 0700 /home/bened/.local/share/agentd/coding-worker-codex-home
    ```
 
 2. Initialize the trusted bare object cache from the reviewed repository and
@@ -44,6 +53,9 @@ example JSON. Prepare the Linux host in this order:
    umask 077
    openssl rand -out /home/bened/.local/state/agentd/coding-transport/worker.psk 32
    chmod 600 /home/bened/.local/state/agentd/coding-transport/worker.psk
+   # Install the qualification-approved coding-profiles.json beside worker.psk.
+   install -m 0600 /absolute/reviewed/coding-profiles.json \
+     /home/bened/.local/state/agentd/coding-worker/coding-profiles.json
    # Install reviewed worker.crt and worker.key into coding-transport/.
    chmod 600 /home/bened/.local/state/agentd/coding-transport/worker.key
    chmod 644 /home/bened/.local/state/agentd/coding-transport/worker.crt
@@ -136,3 +148,14 @@ inspect `health` and `status` before explicitly running `undrain`. Rollback
 preserves current databases, quota accounting and checkpoints; only use a
 release compatible with that state. Migration from the older laptop-controlled
 Goldenage worker is a separate handoff and is not performed by this script.
+
+The persistent worker accepts an explicit `--model` (default `gpt-5.6-luna`).
+For a prebuilt Python environment, specify `--dependency-venv`,
+`--dependency-profile-id`, and `--dependency-python-root`. Preparation applies
+only to that profile, copies the environment into the fresh lease, relocates
+entrypoints, and removes editable links to the preparation checkout. External
+symlinks must resolve under the explicitly configured interpreter installation;
+mount that installation read-only at the same path. No package download occurs
+inside a coding run. The publisher independently needs its own read-only runtime
+mounts and validation commands in its trusted profile. Previously published
+ledger entries remain terminal when a new platform profile is installed.

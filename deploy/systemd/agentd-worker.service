@@ -12,8 +12,8 @@ TimeoutStartSec=infinity
 TimeoutStopSec=2min
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 UMask=0077
-ExecStart=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/coding-current --env-file /home/bened/.local/share/agentd/coding-current/release.env --env-file /home/bened/.local/share/agentd/coding.env --file /home/bened/.local/share/agentd/coding-current/deploy/compose.coding.yaml up --no-deps coding-worker
-ExecStop=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd/coding-current --env-file /home/bened/.local/share/agentd/coding-current/release.env --env-file /home/bened/.local/share/agentd/coding.env --file /home/bened/.local/share/agentd/coding-current/deploy/compose.coding.yaml stop coding-worker
+ExecStart=/home/bened/.local/share/agentd/coding-current/deploy/scripts/coding-compose.sh up --no-deps coding-worker
+ExecStop=/home/bened/.local/share/agentd/coding-current/deploy/scripts/coding-compose.sh stop coding-worker
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
