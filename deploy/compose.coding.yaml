@@ -207,7 +207,7 @@
       "tmpfs": [
         "/tmp:rw,noexec,nosuid,nodev,size=1073741824,uid=1000,gid=1000,mode=1770",
         "/run/agentd:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700",
-        "/home/bened/.cache/uv:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700"
+        "/home/bened/.cache/uv:rw,exec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700"
       ],
       "healthcheck": {
         "disable": true
