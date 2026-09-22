@@ -18,6 +18,7 @@ from agentd.publication import (
     DraftPublisher,
     PublicationError,
     PublicationIntent,
+    ensure_authorized_base,
     import_coding_bundle,
 )
 from agentd.state.sqlite import SQLiteStateStore
@@ -123,6 +124,12 @@ class CodingPublicationReconciler:
             True,
         )
         cache = self.repositories[order.repository]
+        ensure_authorized_base(
+            cache,
+            profile.repository,
+            profile.clone_url,
+            intent.base_commit,
+        )
         import_coding_bundle(intent, collected, evidence, cache)
 
         def authorized() -> None:

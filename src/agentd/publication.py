@@ -243,6 +243,46 @@ def _git(repository: Path, *args: str, env: dict[str, str] | None = None) -> str
     return result.stdout.strip()
 
 
+def ensure_authorized_base(
+    repository: Path,
+    expected_repository: str,
+    clone_url: str,
+    base_commit: str,
+) -> None:
+    """Fetch the approved base from the controller-owned profile remote.
+
+    The worker bundle is allowed to provide the result objects, but it cannot
+    establish the authorized base.  The profile's immutable GitHub clone URL
+    is the only source accepted for that boundary.
+    """
+    if clone_url != f"https://github.com/{expected_repository}.git":
+        raise PublicationError("Profile clone URL does not match authorized repository")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit):
+        raise PublicationError("Authorized base must be an exact Git object identity")
+    try:
+        _git(repository, "cat-file", "-e", f"{base_commit}^{{commit}}")
+    except PublicationError:
+        _git(
+            repository,
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.https://github.com.helper=!gh auth git-credential",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            clone_url,
+            base_commit,
+        )
+        _git(repository, "cat-file", "-e", f"{base_commit}^{{commit}}")
+    _git(
+        repository,
+        "update-ref",
+        "refs/agentd/bases/" + base_commit,
+        base_commit,
+    )
+
+
 def import_coding_bundle(
     intent: PublicationIntent,
     collected: CollectedCodingResult,
@@ -251,8 +291,9 @@ def import_coding_bundle(
 ) -> str:
     """Import authenticated bounded worker evidence into a trusted object cache.
 
-    The cache already contains the pinned base from the allowlisted repository.
-    Neither worker paths nor worker remotes/configuration are consulted. Keep
+    The caller must first ensure the pinned base was fetched from the
+    allowlisted repository. Neither worker paths nor worker
+    remotes/configuration are consulted. Keep
     the returned controller ref until publication retention policy permits GC.
     """
     collected.verify(intent)

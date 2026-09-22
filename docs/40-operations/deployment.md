@@ -50,7 +50,8 @@ units: `agentd-coding-controller.service`, `agentd-worker.service`, and
 `agentd-publisher.service`. The worker runs
 `tools/serve_coding_worker.py`, which registers the real `CodingHarnessDriver`
 and waits indefinitely for a supervisor signal. Its durable journal, PSK,
-profiles, TLS keypair, and readiness file live under the worker state root.
+profiles, and TLS keypair live under the worker state root. Controller health
+uses authenticated worker heartbeats and durable run ownership.
 The publisher runs only the publication command and has its own configuration
 file. Each unit stops only its own Compose service.
 

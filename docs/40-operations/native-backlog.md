@@ -115,3 +115,24 @@ The dependency qualification environment currently uses a Goldenage-specific
 monkeypatch and has not yet been productized into a general deployment step.
 There is no live migration or completed unattended qualification from this
 document.
+
+## Dedicated release activation
+
+The generic `deploy.sh` and `rollback.sh` manage the legacy single-service
+profile. For the coding profile, prepare a SHA-versioned image and release tree,
+with `release.env` containing its `AGENTD_IMAGE`, and install the reviewed
+`coding.env` at `/home/bened/.local/share/agentd/coding.env`. Then invoke:
+
+```bash
+./deploy/scripts/coding-release.sh activate /absolute/prepared-release
+# To select a previously prepared compatible release:
+./deploy/scripts/coding-release.sh rollback /absolute/previous-release
+```
+
+This script manages the separate `coding-current` symlink. It drains an active
+coding controller, refuses unresolved execution ownership, and leaves the new
+release drained. Startup success is not a readiness or qualification result;
+inspect `health` and `status` before explicitly running `undrain`. Rollback
+preserves current databases, quota accounting and checkpoints; only use a
+release compatible with that state. Migration from the older laptop-controlled
+Goldenage worker is a separate handoff and is not performed by this script.

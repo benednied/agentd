@@ -321,6 +321,68 @@ def test_bundle_import_verified_then_validated_from_custom_retention_ref(
     assert finalizer().validate(intent, collected, cache)[0]["returncode"] == 0
 
 
+def test_bundle_import_fetches_new_authorized_base_before_verification(
+    result, tmp_path, monkeypatch
+):
+    """An old cache must fetch the controller-approved base before bundle verify."""
+    from agentd import publication
+    from agentd.publication import ensure_authorized_base, import_coding_bundle
+
+    repo, original, _ = result
+    cache = tmp_path / "cache"
+    git(tmp_path, "clone", "--bare", str(repo), str(cache))
+    git(cache, "update-ref", "refs/heads/master", original.base_commit)
+    git(cache, "reflog", "expire", "--expire=now", "--all")
+    git(cache, "gc", "--prune=now")
+    (repo / "file").write_text("authorized base")
+    git(repo, "commit", "-am", "authorized base")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "file").write_text("worker result")
+    git(repo, "commit", "-am", "worker result")
+    result_commit = git(repo, "rev-parse", "HEAD")
+    intent = replace(original, base_commit=base, result_commit=result_commit)
+    collected = CollectedCodingResult(
+        "job", "owner/repo", base, result_commit, "worker", "run", True
+    )
+    evidence = bundle_evidence(repo, intent, tmp_path)
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "push", str(remote), "HEAD")
+    with pytest.raises(subprocess.CalledProcessError):
+        git(cache, "cat-file", "-e", f"{base}^{{commit}}")
+    real_git = publication._git
+
+    def map_profile_remote(repository, *args, **kwargs):
+        args = tuple(
+            str(remote) if arg == "https://github.com/owner/repo.git" else arg
+            for arg in args
+        )
+        return real_git(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", map_profile_remote)
+    ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", base
+    )
+    original_mapped = publication._git
+
+    def deny_fetch(repository, *args, **kwargs):
+        if "fetch" in args:
+            raise AssertionError("retry unexpectedly fetched an already retained base")
+        return original_mapped(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", deny_fetch)
+    ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", base
+    )
+    monkeypatch.setattr(publication, "_git", original_mapped)
+    ref = import_coding_bundle(intent, collected, evidence, cache)
+    assert git(cache, "rev-parse", ref) == result_commit
+    with pytest.raises(PublicationError):
+        ensure_authorized_base(
+            cache, "owner/repo", "https://evil.example/repo.git", base
+        )
+
+
 @pytest.mark.parametrize(
     "change",
     [
