@@ -70,3 +70,15 @@ def test_coding_units_use_the_optional_host_override_wrapper():
         unit = (ROOT / "deploy/systemd" / name).read_text()
         assert "coding-compose.sh" in unit
         assert "/usr/bin/docker compose" not in unit
+
+
+def test_worker_has_private_runtime_and_uv_cache_mounts():
+    worker = _compose()["services"]["coding-worker"]
+    tmpfs = set(worker["tmpfs"])
+    assert any(
+        item.startswith("/run/agentd:") and "mode=0700" in item for item in tmpfs
+    )
+    assert any(
+        item.startswith("/home/bened/.cache/uv:") and "mode=0700" in item
+        for item in tmpfs
+    )

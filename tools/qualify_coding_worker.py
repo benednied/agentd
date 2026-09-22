@@ -20,6 +20,7 @@ from pathlib import Path
 
 from agentd.coding.models import RepositoryProfile
 from agentd.lifecycle import ControllerLock
+from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.coding import CodingHarnessDriver
 from agentd.workers.coding_runtime import create_verified_coding_sdk
 from agentd.workers.journal import OperationJournal
@@ -95,6 +96,20 @@ async def _run_locked(args: argparse.Namespace) -> None:
         raise ValueError("workspace root must use the reviewed deployment lease tree")
     if not args.secret_file.resolve().is_relative_to(protected_state):
         raise ValueError("worker secret must remain inside the protected state tree")
+    # The pinned containment probe checks a protected state file at this exact
+    # path. A dedicated worker volume has no controller DB there; initialize
+    # an empty private probe DB once, never replace an existing file.
+    probe_database = protected_state / "state.sqlite"
+    try:
+        descriptor = os.open(
+            probe_database, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except FileExistsError:
+        pass
+    else:
+        os.close(descriptor)
+        with SQLiteStateStore(probe_database):
+            pass
     secret = load_secret(args.secret_file)
     raw_profiles = json.loads(args.profiles.read_text())
     if not isinstance(raw_profiles, list) or not raw_profiles:

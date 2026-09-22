@@ -22,6 +22,9 @@ For host-specific read-only mounts, place a reviewed Compose override at
 units and release script add this regular non-symlink file automatically when
 it exists. Keep the generic `compose.coding.yaml` portable; use the override
 for machine-specific runtime or dependency virtualenv paths.
+The worker's base Compose service supplies private writable `/run/agentd` and
+UV-cache tmpfs mounts required by its runtime preflight; host overrides should
+preserve those mounts when extending the service.
 
 1. Create the exact state directories as the service account:
 
