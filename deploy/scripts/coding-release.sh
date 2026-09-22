@@ -19,13 +19,17 @@ compose "$release" config --quiet
 previous=''
 if [ -L "$current" ]; then
   previous=$(readlink -f "$current")
-  if systemctl --user is-active --quiet agentd-coding-controller.service; then
-    compose "$previous" exec -T coding-controller agentd github --config /etc/agentd/controller.json drain
-    report=$(compose "$previous" exec -T coding-controller agentd github --config /etc/agentd/controller.json health || true)
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["controller_live"] and d["draining"] and not d["unresolved_runs"] and d["workers"] and all(w["fresh"] and w["active_runs"] == 0 for w in d["workers"]), "still draining or ownership unresolved; let reconciliation finish before retry"' <<EOF
+  if ! systemctl --user is-active --quiet agentd-coding-controller.service; then
+    echo 'existing controller is inactive; restore its ownership and reconcile workers before release activation' >&2
+    exit 1
+  fi
+  # Controller inactivity never proves that a remote worker has stopped.
+  # Only its live, authenticated telemetry can authorize the stop below.
+  compose "$previous" exec -T coding-controller agentd github --config /etc/agentd/controller.json drain
+  report=$(compose "$previous" exec -T coding-controller agentd github --config /etc/agentd/controller.json health || true)
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["controller_live"] and d["draining"] and not d["unresolved_runs"] and d["workers"] and all(w["fresh"] and w["active_runs"] == 0 for w in d["workers"]), "still draining or ownership unresolved; let reconciliation finish before retry"' <<EOF
 $report
 EOF
-  fi
 fi
 # New and upgraded releases start drained; status, collection and publication continue.
 compose "$release" run --rm --no-deps coding-controller github --config /etc/agentd/controller.json drain

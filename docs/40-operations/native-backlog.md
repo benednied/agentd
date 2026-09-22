@@ -144,7 +144,10 @@ with `release.env` containing its `AGENTD_IMAGE`, and install the reviewed
 ./deploy/scripts/coding-release.sh rollback /absolute/previous-release
 ```
 
-This script manages the separate `coding-current` symlink. It drains an active
+This script manages the separate `coding-current` symlink. An existing release
+with an inactive controller is refused before any worker is stopped: restore
+the existing controller and reconcile ownership first. Inactivity is not an
+offline recovery override. It drains an active
 coding controller, refuses unresolved execution ownership, and leaves the new
 release drained. Startup success is not a readiness or qualification result;
 inspect `health` and `status` before explicitly running `undrain`. Rollback
