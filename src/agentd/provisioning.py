@@ -106,6 +106,19 @@ class TrustedUvProvisioner:
             raise RepositoryProvisioningError(
                 f"Workspace does not exist for provisioning: {workspace}"
             )
+        python_version = self.python_version
+        version_file = workspace / ".python-version"
+        if version_file.exists():
+            try:
+                python_version = version_file.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise RepositoryProvisioningError(
+                    "Cannot read repository Python version"
+                ) from error
+            if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", python_version):
+                raise RepositoryProvisioningError(
+                    "Repository .python-version must pin one numeric Python version"
+                )
         if workspace == codex_home or workspace in codex_home.parents:
             raise RepositoryProvisioningError(
                 "The leased worktree cannot contain the service Codex home"
@@ -166,7 +179,7 @@ class TrustedUvProvisioner:
             self.uv_executable,
             "python",
             "install",
-            self.python_version,
+            python_version,
         )
         sync_arguments = [self.uv_executable, "sync", "--frozen"]
         for extra in self.extras:
@@ -183,13 +196,13 @@ class TrustedUvProvisioner:
                 sync_arguments.extend(("--group", "dev"))
             elif "dev" in metadata.get("project", {}).get("optional-dependencies", {}):
                 sync_arguments.extend(("--extra", "dev"))
-        sync_arguments.extend(("--python", self.python_version))
+        sync_arguments.extend(("--python", python_version))
         environment = self._environment(cache, provision_home, python_install)
         await self._run_trusted_step(
             install_arguments,
             workspace,
             environment,
-            description=f"Managed Python {self.python_version} installation",
+            description=f"Managed Python {python_version} installation",
         )
         await self._run_trusted_step(
             (*sandbox_prefix, *sync_arguments),

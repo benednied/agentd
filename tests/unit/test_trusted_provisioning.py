@@ -213,6 +213,47 @@ def test_provisioner_rejects_missing_workspace(tmp_path: Path) -> None:
         asyncio.run(provisioner.prepare(_lease(tmp_path / "missing")))
 
 
+@pytest.mark.parametrize("python_pin", ["3.12", "3.12.12"])
+def test_repository_python_pin_overrides_fallback(
+    tmp_path: Path, python_pin: str
+) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / ".python-version").write_text(python_pin + "\n")
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(arguments, _cwd, _environment):
+        commands.append(tuple(arguments))
+        return 0, b"", b""
+
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+        runner=runner,
+    )
+    asyncio.run(provisioner.prepare(_lease(workspace)))
+    assert commands[0][-3:] == ("python", "install", python_pin)
+    assert commands[1][-2:] == ("--python", python_pin)
+
+
+def test_provisioner_rejects_option_like_repository_python_pin(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / ".python-version").write_text("--system")
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+    )
+    with pytest.raises(RepositoryProvisioningError, match="numeric Python version"):
+        asyncio.run(provisioner.prepare(_lease(workspace)))
+
+
 def test_command_runner_kills_and_reaps_process_group_when_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

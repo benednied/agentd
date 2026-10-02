@@ -162,7 +162,10 @@ Size budgets from the usage ledger and keep the provider quota gate enabled.
 pool preserves its live counters. It does not replenish consumed quota.
 
 Dependency preparation selects the repository's `dev` dependency group or its
-`dev` optional extra before starting Codex. Coding runs write only their leased
+`dev` optional extra and honors a numeric `.python-version` pin before starting
+Codex. Model commands use the prepared environment with synchronization disabled,
+offline mode, and a worktree-local uv cache; the shared interpreter cache stays
+read-only. Coding runs write only their leased
 worktree and finish at the existing review gate. Operators inspect the handoff
 commit and explicitly accept changes; deploying a new release remains an
 operator action. Subsequent releases and rollbacks use the same scripts with

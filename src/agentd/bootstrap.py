@@ -132,7 +132,14 @@ def create_local_runtime(
 
         def client_factory(execution: ExecutionContract) -> OpenAICodexClient:
             return OpenAICodexClient(
-                environment=codex_environment,
+                environment={
+                    **codex_environment,
+                    "UV_CACHE_DIR": str(
+                        Path(execution.working_directory) / ".uv-cache"
+                    ),
+                    "UV_NO_SYNC": "1",
+                    "UV_OFFLINE": "1",
+                },
                 cwd=execution.working_directory,
             )
 

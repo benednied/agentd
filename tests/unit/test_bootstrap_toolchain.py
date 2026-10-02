@@ -96,7 +96,12 @@ def test_runtime_pins_dev_toolchain_and_codex_environment(
         }
         assert client_arguments == [
             {
-                "environment": expected_environment,
+                "environment": {
+                    **expected_environment,
+                    "UV_CACHE_DIR": str(tmp_path / "leased-worktree" / ".uv-cache"),
+                    "UV_NO_SYNC": "1",
+                    "UV_OFFLINE": "1",
+                },
                 "cwd": str(tmp_path / "leased-worktree"),
             },
             {"environment": expected_environment},
