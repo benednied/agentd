@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import signal
+import tomllib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -78,6 +79,7 @@ class TrustedUvProvisioner:
     python_install_directory: Path | None = None
     python_version: str = "3.14"
     extras: tuple[str, ...] = ()
+    development_dependencies: bool = False
     uv_executable: str = "uv"
     bubblewrap_executable: str = "/usr/bin/bwrap"
     timeout_seconds: float = 900
@@ -169,6 +171,18 @@ class TrustedUvProvisioner:
         sync_arguments = [self.uv_executable, "sync", "--frozen"]
         for extra in self.extras:
             sync_arguments.extend(("--extra", extra))
+        if self.development_dependencies:
+            metadata_path = workspace / "pyproject.toml"
+            try:
+                metadata = tomllib.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise RepositoryProvisioningError(
+                    "Cannot read repository development dependency metadata"
+                ) from error
+            if "dev" in metadata.get("dependency-groups", {}):
+                sync_arguments.extend(("--group", "dev"))
+            elif "dev" in metadata.get("project", {}).get("optional-dependencies", {}):
+                sync_arguments.extend(("--extra", "dev"))
         sync_arguments.extend(("--python", self.python_version))
         environment = self._environment(cache, provision_home, python_install)
         await self._run_trusted_step(

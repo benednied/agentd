@@ -24,7 +24,7 @@ owner_home=$(printf '%s\n' "$owner_record" | awk -F: '{print $6}')
 [ -d "$AGENTD_REPOSITORY_ROOT/.git" ] \
     || die "expected Git repository is missing: $AGENTD_REPOSITORY_ROOT"
 [ "$(stat -c '%u:%g' "$AGENTD_REPOSITORY_ROOT")" = "1000:1000" ] \
-    || die "goldenage must be owned by UID/GID 1000"
+    || die "repository must be owned by UID/GID 1000"
 
 install -d -o 1000 -g 1000 -m 0700 \
     "$AGENTD_STATE_ROOT" \
@@ -86,7 +86,7 @@ if [ -f "$target_auth" ]; then
     install -o 1000 -g 1000 -m 0600 "$target_auth" "$auth_backup"
 fi
 auth_tmp=$AGENTD_CODEX_HOME/.auth.json.install-$$
-trap 'case "$auth_tmp" in /home/bened/.local/share/agentd/codex-home/.auth.json.install-*) rm -f -- "$auth_tmp" ;; esac' EXIT HUP INT TERM
+trap 'case "$auth_tmp" in "$AGENTD_CODEX_HOME"/.auth.json.install-*) rm -f -- "$auth_tmp" ;; esac' EXIT HUP INT TERM
 install -o 1000 -g 1000 -m 0600 "$AGENTD_AUTH_SOURCE" "$auth_tmp"
 mv -f "$auth_tmp" "$target_auth"
 chown 1000:1000 "$target_auth"
@@ -96,8 +96,8 @@ trap - EXIT HUP INT TERM
 unit_dir=$AGENTD_HOME/.config/systemd/user
 install -d -o 1000 -g 1000 -m 0700 "$unit_dir"
 install -o 1000 -g 1000 -m 0644 \
-    "$SCRIPT_DIR/../systemd/agentd.service" \
-    "$unit_dir/agentd.service"
+    "$SCRIPT_DIR/../systemd/$AGENTD_SERVICE" \
+    "$unit_dir/$AGENTD_SERVICE"
 
 printf '%s\n' \
     "Provisioned exact agentd paths, $config_status reviewed config.toml, and auth.json." \

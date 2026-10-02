@@ -16,6 +16,29 @@ AGENTD_RELEASE_ROOT=$AGENTD_SHARE_ROOT/releases
 AGENTD_CURRENT_LINK=$AGENTD_SHARE_ROOT/current
 AGENTD_BACKUP_ROOT=$AGENTD_STATE_ROOT/backups
 AGENTD_SERVICE=agentd.service
+AGENTD_COMPOSE_PROJECT=agentd
+AGENTD_MOUNT_POLICY=
+case "${AGENTD_PROFILE:-goldenage}" in
+    goldenage) ;;
+    selfhost)
+        AGENTD_REPOSITORY_ROOT=$AGENTD_HOME/agentd
+        AGENTD_STATE_ROOT=$AGENTD_HOME/.local/state/agentd-selfhost
+        AGENTD_DB=$AGENTD_STATE_ROOT/state.sqlite
+        AGENTD_SHARE_ROOT=$AGENTD_HOME/.local/share/agentd-selfhost
+        AGENTD_SOURCE_ROOT=$AGENTD_REPOSITORY_ROOT
+        AGENTD_WORKSPACE_ROOT=$AGENTD_SHARE_ROOT/workspaces
+        AGENTD_CODEX_HOME=$AGENTD_SHARE_ROOT/codex-home
+        AGENTD_CODEX_CONFIG=$AGENTD_CODEX_HOME/config.toml
+        AGENTD_UV_CACHE=$AGENTD_HOME/.cache/agentd-selfhost/uv
+        AGENTD_RELEASE_ROOT=$AGENTD_SHARE_ROOT/releases
+        AGENTD_CURRENT_LINK=$AGENTD_SHARE_ROOT/current
+        AGENTD_BACKUP_ROOT=$AGENTD_STATE_ROOT/backups
+        AGENTD_SERVICE=agentd-selfhost.service
+        AGENTD_COMPOSE_PROJECT=agentd-selfhost
+        AGENTD_MOUNT_POLICY=$SCRIPT_DIR/../security/selfhost-mount-policy.json
+        ;;
+    *) printf '%s\n' 'AGENTD_PROFILE must be goldenage or selfhost' >&2; exit 1 ;;
+esac
 AGENTD_SQLITE_TOOL=$SCRIPT_DIR/../security/sqlite_snapshot.py
 
 die() {

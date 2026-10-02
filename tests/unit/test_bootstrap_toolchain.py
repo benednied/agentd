@@ -41,7 +41,7 @@ def test_production_policy_is_enforced_at_composition_boundary(
         )
 
 
-def test_runtime_pins_goldenage_dev_toolchain_and_codex_environment(
+def test_runtime_pins_dev_toolchain_and_codex_environment(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -81,7 +81,7 @@ def test_runtime_pins_goldenage_dev_toolchain_and_codex_environment(
             config.uv_cache / "python"
         )
         assert provisioner_arguments["python_version"] == "3.14"
-        assert provisioner_arguments["extras"] == ("dev",)
+        assert provisioner_arguments["development_dependencies"] is True
         assert runtime.supervisor is not None
         runtime.supervisor._client_factory(
             SimpleNamespace(working_directory=str(tmp_path / "leased-worktree"))

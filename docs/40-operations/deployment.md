@@ -106,3 +106,57 @@ of an available network route. The systemd unit runs this check as mandatory
 
 See [security](security.md) for the exact container boundary and [observability](observability.md)
 for log handling.
+
+## Self-hosted development on the HP
+
+The `selfhost` profile runs agentd against its own repository in a separate
+`agentd-selfhost` Compose project and `agentd-selfhost.service`. Its database,
+worktrees, releases, Codex home, and uv cache are separate from the Goldenage
+service. The HP must already satisfy the prerequisites above, with a complete
+agentd Git checkout at `/home/bened/agentd`, owned by UID/GID `1000:1000`.
+
+Run these commands on the HP, as `bened`, from that checkout. Select an existing
+authenticated Codex `auth.json` explicitly; provisioning copies only that file
+into the dedicated service home with mode `0600`.
+
+```bash
+AGENTD_PROFILE=selfhost \
+  AGENTD_AUTH_SOURCE=/home/bened/.local/share/agentd/codex-home/auth.json \
+  ./deploy/scripts/provision-host.sh
+systemctl --user daemon-reload
+systemctl --user enable agentd-selfhost.service
+AGENTD_PROFILE=selfhost ./deploy/scripts/deploy.sh "$(git rev-parse HEAD)"
+```
+
+The exact alternate bind sources are recorded in
+`deploy/security/selfhost-mount-policy.json`. The container retains the reviewed
+internal paths: `/home/bened/goldenage` maps to the host's `/home/bened/agentd`,
+and the internal state, workspace, Codex, and cache paths map to the isolated
+self-hosting directories. No host service socket or deployment directory is
+available to coding jobs. The mandatory runtime sandbox checks still run.
+
+Register bounded capacity and token quota before submitting work:
+
+```bash
+docker exec agentd-selfhost-agentd-1 agentd register-quota codex \
+  --provider openai-codex-chatgpt --remaining 100000 \
+  --interactive-reserve 20000 --unit tokens
+docker exec agentd-selfhost-agentd-1 agentd register-node hp-selfhost \
+  --cpu 6 --ram-gb 12 --harness codex
+docker exec agentd-selfhost-agentd-1 agentd submit \
+  --project agentd --repository /home/bened/goldenage \
+  --objective "Review and improve the self-hosting operator documentation; run validation" \
+  --p50 10000 --p90 20000 --p99 30000 \
+  --quota 20000 --quota-maximum 30000 --quota-pool codex \
+  --harness codex --model-class gpt-5.6-terra \
+  --accept "uv run ruff check . and uv run pytest tests/deployment -q pass"
+docker exec agentd-selfhost-agentd-1 agentd jobs
+```
+
+Dependency preparation selects the repository's `dev` dependency group or its
+`dev` optional extra before starting Codex. Coding runs write only their leased
+worktree and finish at the existing review gate. Operators inspect the handoff
+commit and explicitly accept changes; deploying a new release remains an
+operator action. Subsequent releases and rollbacks use the same scripts with
+`AGENTD_PROFILE=selfhost`. If the HP is intended to run after logout, verify
+`loginctl show-user bened -p Linger` reports `Linger=yes`.

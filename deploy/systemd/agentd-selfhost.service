@@ -1,0 +1,29 @@
+[Unit]
+Description=agentd self-hosted development control plane
+Documentation=file:///home/bened/.local/share/agentd-selfhost/current/docs/40-operations/deployment.md
+After=docker.service
+ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd-selfhost/current
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd-selfhost/current/deploy --env-file /home/bened/.local/share/agentd-selfhost/current/release.env --file /home/bened/.local/share/agentd-selfhost/current/deploy/compose.yaml config --quiet
+ExecStartPre=/home/bened/.local/share/agentd-selfhost/current/deploy/scripts/check-container-security.sh /home/bened/.local/share/agentd-selfhost/current/release.env runtime /home/bened/.local/share/agentd-selfhost/current/deploy/security/selfhost-mount-policy.json
+ExecStart=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd-selfhost/current/deploy --env-file /home/bened/.local/share/agentd-selfhost/current/release.env --file /home/bened/.local/share/agentd-selfhost/current/deploy/compose.yaml up --detach --remove-orphans --wait
+ExecReload=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd-selfhost/current/deploy --env-file /home/bened/.local/share/agentd-selfhost/current/release.env --file /home/bened/.local/share/agentd-selfhost/current/deploy/compose.yaml up --detach --remove-orphans --wait
+ExecStop=/usr/bin/docker compose --project-directory /home/bened/.local/share/agentd-selfhost/current/deploy --env-file /home/bened/.local/share/agentd-selfhost/current/release.env --file /home/bened/.local/share/agentd-selfhost/current/deploy/compose.yaml down --remove-orphans --timeout 45
+TimeoutStartSec=10min
+TimeoutStopSec=2min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/bened/.local/state/agentd-selfhost /home/bened/.local/share/agentd-selfhost
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
