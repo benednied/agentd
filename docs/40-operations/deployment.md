@@ -149,7 +149,7 @@ docker exec agentd-selfhost-agentd-1 agentd submit \
   --p50 60000 --p90 150000 --p99 300000 \
   --quota 150000 --quota-maximum 350000 --quota-pool codex \
   --harness codex --model-class gpt-5.6-terra \
-  --accept "uv run ruff check . and uv run pytest tests/deployment -q pass"
+  --accept ".venv/bin/ruff check . and .venv/bin/pytest tests/deployment -q pass"
 docker exec agentd-selfhost-agentd-1 agentd jobs
 ```
 
@@ -165,7 +165,9 @@ Dependency preparation selects the repository's `dev` dependency group or its
 `dev` optional extra and honors a numeric `.python-version` pin before starting
 Codex. Model commands use the prepared environment with synchronization disabled,
 offline mode, and a worktree-local uv cache; the shared interpreter cache stays
-read-only. Coding runs write only their leased
+read-only. On this nested sandbox, `uv run` may hang after its child finishes;
+invoke `.venv/bin/ruff` and `.venv/bin/pytest` directly for validation using the
+prepared environment. Coding runs write only their leased
 worktree and finish at the existing review gate. Operators inspect the handoff
 commit and explicitly accept changes; deploying a new release remains an
 operator action. Subsequent releases and rollbacks use the same scripts with
