@@ -158,6 +158,8 @@ provider capacity. Metering includes cumulative input and output tokens,
 including cached input across tool calls. Even a short documentation job can
 exceed a small budget; the daemon requests a checkpoint at 90% of the maximum.
 Size budgets from the usage ledger and keep the provider quota gate enabled.
+`register-quota --remaining` initializes a new pool; registering an existing
+pool preserves its live counters. It does not replenish consumed quota.
 
 Dependency preparation selects the repository's `dev` dependency group or its
 `dev` optional extra before starting Codex. Coding runs write only their leased
