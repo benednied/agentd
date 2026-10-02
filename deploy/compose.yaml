@@ -9,6 +9,7 @@
       "read_only": true,
       "privileged": false,
       "init": true,
+      "command": ["serve"],
       "entrypoint": [
         "/bin/sh",
         "-ec",

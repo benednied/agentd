@@ -150,6 +150,7 @@ def validate_service(
     )
     require(service.get("working_dir") == "/home/bened/goldenage", "unexpected workdir")
     require(service.get("init") is True, "container init must be enabled")
+    require(service.get("command") == ["serve"], "container must start the daemon")
     require(
         service.get("entrypoint") in EXPECTED_ENTRYPOINTS,
         "container startup must run the runtime security preflight",

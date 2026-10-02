@@ -94,6 +94,7 @@ def test_compose_runs_runtime_preflight_inside_every_container_start() -> None:
     service = _compose_service()
 
     assert service["restart"] == "unless-stopped"
+    assert service["command"] == ["serve"]
     assert service["entrypoint"] == [
         "/bin/sh",
         "-ec",
@@ -176,7 +177,7 @@ def test_rendered_compose_security_validator_accepts_reviewed_contract(
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("case", ["seccomp", "tmpfs", "entrypoint"])
+@pytest.mark.parametrize("case", ["seccomp", "tmpfs", "entrypoint", "command"])
 def test_rendered_validator_rejects_security_preflight_bypasses(
     tmp_path: Path,
     case: str,
@@ -193,8 +194,10 @@ def test_rendered_validator_rejects_security_preflight_bypasses(
                 "",
             )
         )
-    else:
+    elif case == "entrypoint":
         service["entrypoint"] = ["/opt/agentd/venv/bin/agentd"]
+    else:
+        service.pop("command")
     rendered = tmp_path / f"compose-{case}.json"
     rendered.write_text(
         json.dumps({"services": {"agentd": service}}),
