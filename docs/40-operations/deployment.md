@@ -139,19 +139,25 @@ Register bounded capacity and token quota before submitting work:
 
 ```bash
 docker exec agentd-selfhost-agentd-1 agentd register-quota codex \
-  --provider openai-codex-chatgpt --remaining 100000 \
-  --interactive-reserve 20000 --unit tokens
+  --provider openai-codex-chatgpt --remaining 500000 \
+  --interactive-reserve 50000 --unit tokens
 docker exec agentd-selfhost-agentd-1 agentd register-node hp-selfhost \
   --cpu 6 --ram-gb 12 --harness codex
 docker exec agentd-selfhost-agentd-1 agentd submit \
   --project agentd --repository /home/bened/goldenage \
   --objective "Review and improve the self-hosting operator documentation; run validation" \
-  --p50 10000 --p90 20000 --p99 30000 \
-  --quota 20000 --quota-maximum 30000 --quota-pool codex \
+  --p50 60000 --p90 150000 --p99 300000 \
+  --quota 150000 --quota-maximum 350000 --quota-pool codex \
   --harness codex --model-class gpt-5.6-terra \
   --accept "uv run ruff check . and uv run pytest tests/deployment -q pass"
 docker exec agentd-selfhost-agentd-1 agentd jobs
 ```
+
+These token amounts are local scheduling budgets, not a measurement of remaining
+provider capacity. Metering includes cumulative input and output tokens,
+including cached input across tool calls. Even a short documentation job can
+exceed a small budget; the daemon requests a checkpoint at 90% of the maximum.
+Size budgets from the usage ledger and keep the provider quota gate enabled.
 
 Dependency preparation selects the repository's `dev` dependency group or its
 `dev` optional extra before starting Codex. Coding runs write only their leased
