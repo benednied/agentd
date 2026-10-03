@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentd.coding.attempts import CodingAttemptLimits
 from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.controller import status
 from agentd.coding.models import RepositoryProfile
@@ -139,6 +140,56 @@ def test_preflight_failure_survives_restart_then_retries_the_same_result(
     assert rig.store.get_job(rig.job.id) == original_job
     assert rig.run.result == original_result
     assert len(rig.calls) == 1 and rig.calls[0].run_id == rig.run.id
+
+
+def test_status_reports_preparation_repair_without_a_publication_candidate(rig):
+    failed, event = transition_job(rig.job, JobState.FAILED, "Preparation failed")
+    rig.store.save_job(failed, event, expected=rig.job)
+    rig.run.backend = "remote"
+    rig.run.driver = "remote-coding"
+    rig.run.state = RunState.FAILED
+    rig.run.result = RunResult(
+        RunOutcome.FAILED,
+        usage=TokenUsage(),
+        consumed_quota=0,
+        metadata={
+            "telemetry_valid": True,
+            "provider_started": False,
+            "preparation_failure": True,
+        },
+    )
+    rig.store.list_runs = lambda _job_id: (rig.run,)
+    reason = "Coding repair preparation attempt limit has been reached"
+    rig.ledger.record_repair(rig.job.id, rig.run.id, "exhausted", reason)
+    assert rig.ledger.get(rig.job.id) is None
+    limits = CodingAttemptLimits(maximum_preparation_attempts=1)
+    report = status(rig.store, attempt_limits=limits)[0]
+    assert report["repair"] == {"status": "exhausted", "reason": reason}
+    assert report["attempts"] == 1
+    assert report["attempt_budget"]["preparation_attempts"] == 1
+    assert report["attempt_budget"]["coding_attempts"] == 0
+    reporter = GitHubStatusReporter(rig.store, SimpleNamespace())
+    reporter.enqueue([report])
+    assert reason in rig.store.pending_github_status()[0]["body"]
+
+
+def test_suspended_status_reports_exhausted_coding_attempt_limit(rig):
+    failed, event = transition_job(rig.job, JobState.FAILED, "Stopped execution")
+    rig.store.save_job(failed, event, expected=rig.job)
+    suspended, event = transition_job(failed, JobState.SUSPENDED, "Retained checkpoint")
+    rig.store.save_job(suspended, event, expected=failed)
+    rig.run.backend = "remote"
+    rig.run.driver = "remote-coding"
+    rig.run.state = RunState.SUSPENDED
+    rig.store.list_runs = lambda _job_id: (rig.run,)
+    report = status(
+        rig.store, attempt_limits=CodingAttemptLimits(maximum_coding_attempts=1)
+    )[0]
+    assert report["repair"] == {
+        "status": "exhausted",
+        "reason": "Coding repair provider attempt limit has been reached",
+    }
+    assert report["attempt_budget"]["coding_attempts"] == 1
 
 
 @pytest.mark.parametrize(

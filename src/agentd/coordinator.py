@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from inspect import isawaitable
 from typing import Any
 
+from agentd.coding.attempts import CodingAttemptLimits, is_proven_preparation_failure
 from agentd.domain.enums import (
     ArtifactKind,
     JobState,
@@ -1487,6 +1488,8 @@ class SchedulerCoordinator:
         *,
         diagnostics: tuple[str, ...],
         maximum_attempts: int = 3,
+        maximum_preparation_attempts: int = 3,
+        maximum_total_attempts: int | None = None,
         actor: str = "trusted-validation",
         event_id: str | None = None,
     ) -> Job:
@@ -1530,13 +1533,22 @@ class SchedulerCoordinator:
             or any(not text or "\0" in text or len(text) > 8192 for text in diagnostics)
         ):
             raise LifecycleError("Coding repair requires bounded trusted feedback")
-        if (
-            not isinstance(maximum_attempts, int)
-            or isinstance(maximum_attempts, bool)
-            or not 1 <= maximum_attempts <= 100
-            or len(self._store.list_runs(job.id)) >= maximum_attempts
-        ):
-            raise LifecycleError("Coding repair attempt limit has been reached")
+        try:
+            attempts = CodingAttemptLimits(
+                maximum_attempts,
+                maximum_preparation_attempts,
+                maximum_total_attempts,
+            )
+        except ValueError as error:
+            raise LifecycleError(
+                "Coding repair attempt limits must be bounded"
+            ) from error
+        blocked = attempts.blocked_reason(
+            self._store.list_runs(job.id),
+            preparation_retry=is_proven_preparation_failure(run),
+        )
+        if blocked is not None:
+            raise LifecycleError(blocked)
         if (
             self._store.find_active_run(job.id) is not None
             or self._store.find_active_reservation(job.id) is not None

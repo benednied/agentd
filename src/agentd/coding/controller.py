@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from agentd.coding.attempts import CodingAttemptLimits
 from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.descriptor import RemoteCodingDescriptor
 from agentd.coding.integration import GitHubIntegrationReconciler, integration_status
@@ -94,6 +95,28 @@ def load_config(path: Path) -> dict[str, Any]:
         if config["worker"].get(key):
             config["worker"][key] = resolve(config["worker"][key])
     return config
+
+
+def coding_attempt_limits(config: dict[str, Any]) -> CodingAttemptLimits:
+    """Use the same bounded attempt policy for repairs, resumes and reporting."""
+    return CodingAttemptLimits(
+        maximum_coding_attempts=config.get("maximum_automatic_attempts", 3),
+        maximum_preparation_attempts=config.get("maximum_preparation_attempts", 3),
+        maximum_total_attempts=config.get("maximum_total_attempts"),
+    )
+
+
+def guard_coding_resume(
+    store: SQLiteStateStore, job_id: str, attempt_limits: CodingAttemptLimits
+) -> None:
+    """Keep GitHub resume controls within the same retained attempt limits."""
+    reason = attempt_limits.blocked_reason(store.list_runs(job_id))
+    if reason is None:
+        return
+    run = store.latest_run(job_id)
+    if run is not None:
+        PublicationStore(store.path).record_repair(job_id, run.id, "exhausted", reason)
+    raise LifecycleError(reason)
 
 
 class AdministrativeOracle:
@@ -247,6 +270,7 @@ async def serve_publisher(config: dict[str, Any]) -> None:
     loop = asyncio.get_running_loop()
     owner = ControllerLock(Path(config["database"] + ".publisher").resolve())
     with owner, SQLiteStateStore(config["database"]) as store:
+        attempt_limits = coding_attempt_limits(config)
         intake = create_intake(config, store)
         backlog = create_backlog(config, intake) if config.get("backlog") else None
         publications = create_publications(config, store, intake, backlog)
@@ -285,7 +309,11 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                     last_integration_poll = time.monotonic()
                 if config.get("standing_github_policy"):
                     reporter.enqueue(
-                        status(store, repository=config["profile"]["repository"])
+                        status(
+                            store,
+                            repository=config["profile"]["repository"],
+                            attempt_limits=attempt_limits,
+                        )
                     )
                     await reporter.publish_pending()
                 runtime_health.pulse("publisher")
@@ -301,6 +329,7 @@ async def serve_publisher(config: dict[str, Any]) -> None:
 
 def create_controller(config: dict[str, Any]) -> CodingController:
     """Reuse the existing scheduler, ownership ledger, and trusted publisher."""
+    attempt_limits = coding_attempt_limits(config)
     profile = RepositoryProfile.from_dict(config["profile"])
     endpoint_data = dict(config["worker"])
     for key in ("psk_file", "tls_ca", "tls_client_cert", "tls_client_key"):
@@ -387,7 +416,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             store,
             publications,
             coordinator,
-            maximum_attempts=config.get("maximum_automatic_attempts", 3),
+            maximum_attempts=attempt_limits.maximum_coding_attempts,
+            maximum_preparation_attempts=attempt_limits.maximum_preparation_attempts,
+            maximum_total_attempts=attempt_limits.maximum_total_attempts,
         )
         integrations = (
             GitHubIntegrationReconciler(
@@ -411,6 +442,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 intake.source,
                 StandingGitHubPolicy.from_dict(policy_config),
                 feedback=repairs.request_feedback,
+                resume_guard=lambda job_id: guard_coding_resume(
+                    store, job_id, attempt_limits
+                ),
                 approve_pr=integrations.approve_pr if integrations else None,
                 published_subjects=lambda: _published_subjects(
                     store, profile.repository
@@ -447,9 +481,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                             continue
                         if store.github_job_held(job.id):
                             continue
-                        if len(store.list_runs(job.id)) >= config.get(
-                            "maximum_automatic_attempts", 3
-                        ):
+                        if attempt_limits.blocked_reason(store.list_runs(job.id)):
                             continue
                         if store.latest_checkpoint(job.id) is None:
                             continue
@@ -497,8 +529,16 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 await repairs.reconcile()
             if workflow is not None:
                 await workflow.apply_pending()
-                reporter.enqueue(status(store, repository=profile.repository))
-            for item in status(store, repository=profile.repository):
+                reporter.enqueue(
+                    status(
+                        store,
+                        repository=profile.repository,
+                        attempt_limits=attempt_limits,
+                    )
+                )
+            for item in status(
+                store, repository=profile.repository, attempt_limits=attempt_limits
+            ):
                 item["quota_wait_reason"] = coordinator.quota_wait_reason(
                     item["job_id"]
                 )
@@ -533,7 +573,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             del error
             runtime_health.pulse("controller", state="ownership_blocked")
             if workflow is not None:
-                reports = status(store, repository=profile.repository)
+                reports = status(
+                    store, repository=profile.repository, attempt_limits=attempt_limits
+                )
                 for report in reports:
                     report["blocked_reason"] = "Execution ownership is unresolved"
                 reporter.enqueue(reports)
@@ -541,7 +583,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         def report_error(error: Exception) -> None:
             runtime_health.pulse("controller", state="retrying")
             if workflow is not None:
-                reports = status(store, repository=profile.repository)
+                reports = status(
+                    store, repository=profile.repository, attempt_limits=attempt_limits
+                )
                 for report in reports:
                     report["blocked_reason"] = (
                         "Controller is retrying after " + type(error).__name__
@@ -594,10 +638,14 @@ def create_controller(config: dict[str, Any]) -> CodingController:
 
 
 def status(
-    store: SQLiteStateStore, *, repository: str | None = None
+    store: SQLiteStateStore,
+    *,
+    repository: str | None = None,
+    attempt_limits: CodingAttemptLimits | None = None,
 ) -> list[dict[str, Any]]:
     """Safe identities and outcomes, without raw issue text or credentials."""
     result = []
+    limits = attempt_limits or CodingAttemptLimits()
     publication_store = PublicationStore(store.path)
     with RuntimeHealthStore(store.path) as health_store:
         controller_pulse = health_store.latest("controller")
@@ -620,6 +668,13 @@ def status(
         ):
             continue
         run = store.latest_run(job.id)
+        runs = store.list_runs(job.id)
+        counts = limits.count(runs)
+        repair = publication_store.repair_for(job.id, run.id) if run else None
+        if job.state is JobState.SUSPENDED:
+            attempt_reason = limits.blocked_reason(runs)
+            if attempt_reason:
+                repair = {"status": "exhausted", "reason": attempt_reason}
         publication = publication_store.get(job.id)
         preflight = publication_store.preflight_for(job.id, run.id) if run else None
         gate = store.backlog_gate(job.id)
@@ -650,7 +705,15 @@ def status(
                 )
                 if job.state not in {JobState.COMPLETED, JobState.CANCELLED}
                 else None,
-                "attempts": len(store.list_runs(job.id)),
+                "attempts": counts.total,
+                "attempt_budget": {
+                    "coding_attempts": counts.coding,
+                    "preparation_attempts": counts.preparation,
+                    "total_attempts": counts.total,
+                    "maximum_coding_attempts": limits.maximum_coding_attempts,
+                    "maximum_preparation_attempts": limits.maximum_preparation_attempts,
+                    "maximum_total_attempts": limits.maximum_total_attempts,
+                },
                 "backlog_wait_reason": gate["reason"]
                 if gate and not gate["ready"]
                 else None,
@@ -689,7 +752,7 @@ def status(
                 "merge_commit": integration.get("merge_commit")
                 if integration
                 else None,
-                "repair": publication.get("repair") if publication else None,
+                "repair": repair,
                 "delivery": publication.get("delivery") if publication else None,
             }
         )

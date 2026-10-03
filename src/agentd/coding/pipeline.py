@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from agentd.coding.attempts import CodingAttemptLimits, is_proven_preparation_failure
 from agentd.coding.models import RepositoryProfile
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.domain.enums import JobState, RunOutcome, RunState
@@ -218,19 +219,20 @@ class CodingRepairReconciler:
         coordinator: SchedulerCoordinator,
         *,
         maximum_attempts: int = 3,
+        maximum_preparation_attempts: int = 3,
+        maximum_total_attempts: int | None = None,
     ) -> None:
-        if (
-            not isinstance(maximum_attempts, int)
-            or isinstance(maximum_attempts, bool)
-            or not 1 <= maximum_attempts <= 100
-        ):
-            raise ValueError("Automatic coding attempts must be bounded")
+        limits = CodingAttemptLimits(
+            maximum_attempts, maximum_preparation_attempts, maximum_total_attempts
+        )
         self.store, self.publications, self.coordinator = (
             store,
             publications,
             coordinator,
         )
         self.maximum_attempts = maximum_attempts
+        self.maximum_preparation_attempts = limits.maximum_preparation_attempts
+        self.maximum_total_attempts = limits.maximum_total_attempts
         self.ledger = publications.publisher.store
 
     async def reconcile(self) -> tuple[dict[str, Any], ...]:
@@ -243,15 +245,7 @@ class CodingRepairReconciler:
             ):
                 continue
             run = self.store.latest_run(job.id)
-            if (
-                not isinstance(job.operation, CodingOperation)
-                or run is None
-                or run.result is None
-                or run.result.metadata.get("provider_started") is not False
-                or run.result.metadata.get("telemetry_valid") is not True
-                or run.result.usage is None
-                or run.result.usage.total_tokens != 0
-            ):
+            if run is None or not is_proven_preparation_failure(run):
                 continue
             try:
                 result = await self._request(
@@ -394,6 +388,8 @@ class CodingRepairReconciler:
                 job_id,
                 diagnostics=diagnostics,
                 maximum_attempts=self.maximum_attempts,
+                maximum_preparation_attempts=self.maximum_preparation_attempts,
+                maximum_total_attempts=self.maximum_total_attempts,
                 actor=actor,
                 event_id=event_id,
             )

@@ -17,6 +17,7 @@ from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.publication import DraftPublisher, PublicationStore, TrustedFinalizer
 from agentd.workers import OperationJournal, RemoteWorkerBackend, WorkerServer
 from agentd.workers.coding import CodingHarnessDriver
+from agentd.workers.coding_runtime import CodingPreparationError
 
 
 class CompletingProvider(ControlledProvider):
@@ -83,7 +84,13 @@ class GitHubFixture:
         return self.pr
 
 
-def pipeline(rig, *, maximum_attempts=3):
+def pipeline(
+    rig,
+    *,
+    maximum_attempts=3,
+    maximum_preparation_attempts=3,
+    maximum_total_attempts=None,
+):
     github = GitHubFixture()
     publications = CodingPublicationReconciler(
         rig.store,
@@ -97,7 +104,12 @@ def pipeline(rig, *, maximum_attempts=3):
         {rig.profile.repository: "master"},
     )
     repairs = CodingRepairReconciler(
-        rig.store, publications, rig.coordinator, maximum_attempts=maximum_attempts
+        rig.store,
+        publications,
+        rig.coordinator,
+        maximum_attempts=maximum_attempts,
+        maximum_preparation_attempts=maximum_preparation_attempts,
+        maximum_total_attempts=maximum_total_attempts,
     )
     return github, publications, repairs
 
@@ -121,6 +133,106 @@ VALIDATION = (
         "from pathlib import Path; assert Path('change.txt').read_text() == 'verified'",
     ),
 )
+
+
+class PreparationThenCompletingProvider(CompletingProvider):
+    def __init__(self, preparation_failures):
+        super().__init__()
+        self.preparation_failures = preparation_failures
+
+    async def start_managed(self, run_id, execution):
+        if self.preparation_failures:
+            self.preparation_failures -= 1
+            raise CodingPreparationError("Immutable dependency fixture is unavailable")
+        return await super().start_managed(run_id, execution)
+
+
+def test_four_preparation_failures_leave_validation_repair_budget(tmp_path):
+    async def scenario():
+        provider = PreparationThenCompletingProvider(4)
+        async with coding_rig(
+            tmp_path, provider=provider, validation_commands=VALIDATION
+        ) as rig:
+            rig.quota()
+            _, _, preparation_repairs = pipeline(
+                rig,
+                maximum_attempts=3,
+                maximum_preparation_attempts=5,
+                maximum_total_attempts=8,
+            )
+            preparation_runs = []
+            for _ in range(4):
+                stopped = await complete_attempt(rig, JobState.FAILED)
+                preparation_runs.append(stopped)
+                assert stopped.result.metadata["provider_started"] is False
+                assert stopped.result.usage == TokenUsage()
+                assert (await preparation_repairs.reconcile())[0][
+                    "repair_status"
+                ] == "queued"
+                assert provider.starts == 0
+                assert rig.store.get_quota_pool("account").remaining == 1000
+            original = await complete_attempt(rig)
+            github, publications, repairs = pipeline(
+                rig,
+                maximum_attempts=3,
+                maximum_preparation_attempts=4,
+                maximum_total_attempts=7,
+            )
+            await publications.reconcile()
+            assert publications.publisher.store.get(rig.job.id)["stage"] == (
+                "validation_failed"
+            )
+            assert (await repairs.reconcile())[0]["repair_status"] == "queued"
+            assert rig.store.get_run(original.id) == original
+            assert provider.starts == 1
+            assert rig.store.get_quota_pool("account").remaining == 988
+            repaired = await complete_attempt(rig)
+            assert (
+                repaired.contract.operation.work_order.resume_from_run_id == original.id
+            )
+            assert repaired.contract.operation.work_order.prior_consumed_quota == 12
+            assert "AssertionError" in provider.executions[-1].completion_protocol
+            assert len(rig.store.list_runs(rig.job.id)) == 6
+            assert [rig.store.get_run(run.id) for run in preparation_runs] == (
+                preparation_runs
+            )
+            assert rig.store.get_job(rig.job.id).quota_budget.maximum == 200
+            assert (
+                sum(item.consumed for item in rig.store.list_reservations(rig.job.id))
+                == 24
+            )
+            assert rig.store.get_quota_pool("account").remaining == 976
+            await publications.reconcile()
+            assert github.pushes == github.creates == 1
+            assert provider.starts == 2
+            assert await repairs.reconcile() == ()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("limit", ["preparation", "total"])
+def test_preparation_retry_stops_at_its_own_or_total_cap(tmp_path, limit):
+    async def scenario():
+        provider = PreparationThenCompletingProvider(2)
+        async with coding_rig(tmp_path, provider=provider) as rig:
+            rig.quota()
+            stopped = await complete_attempt(rig, JobState.FAILED)
+            _, _, repairs = pipeline(
+                rig,
+                maximum_attempts=3,
+                maximum_preparation_attempts=1 if limit == "preparation" else 3,
+                maximum_total_attempts=1 if limit == "total" else 4,
+            )
+            result = (await repairs.reconcile())[0]
+            assert result["repair"]["status"] == "exhausted"
+            assert f"{limit} attempt limit" in result["repair"]["reason"]
+            assert rig.store.get_run(stopped.id) == stopped
+            assert rig.store.get_job(rig.job.id).state is JobState.FAILED
+            assert rig.store.get_quota_pool("account").remaining == 1000
+            assert provider.starts == 0
+            assert await rig.plane.dispatch_next() is None
+
+    asyncio.run(scenario())
 
 
 def test_validation_failure_repairs_new_candidate_under_one_cumulative_budget(tmp_path):

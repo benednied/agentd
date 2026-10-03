@@ -84,6 +84,8 @@ def configure(home: Path, base_commit: str) -> None:
             "checkpoint_fraction": 0.9,
         },
         "maximum_automatic_attempts": 4,
+        "maximum_preparation_attempts": 3,
+        "maximum_total_attempts": None,
         "maximum_validation_attempts": 3,
         "automatic_validation_repair": True,
         "auto_resume_checkpoints": True,
@@ -136,6 +138,8 @@ def configure(home: Path, base_commit: str) -> None:
         "local_allowance",
         "automatic_resume_budget",
         "maximum_automatic_attempts",
+        "maximum_preparation_attempts",
+        "maximum_total_attempts",
         "maximum_validation_attempts",
         "background_block_used_percent",
         "urgent_only_used_percent",
@@ -143,6 +147,11 @@ def configure(home: Path, base_commit: str) -> None:
     ):
         if key in prior:
             config[key] = prior[key]
+    if config["maximum_total_attempts"] is None:
+        config["maximum_total_attempts"] = (
+            config["maximum_automatic_attempts"]
+            + config["maximum_preparation_attempts"]
+        )
     for name in (
         "controller",
         "worker",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import subprocess
 from pathlib import Path
 
@@ -58,3 +59,36 @@ def test_selfhost_policy_passes_validator_without_broadening_mounts(
     )
     assert mounts["/home/bened/goldenage"] == "/home/bened/agentd"
     assert len(mounts) == 6
+
+
+def test_selfhost_generation_retains_configured_attempt_and_spending_limits(tmp_path):
+    configure = runpy.run_path(str(DEPLOY.parent / "tools/configure_selfhost.py"))[
+        "configure"
+    ]
+    share = tmp_path / ".local/share/agentd-selfhost"
+    configure(tmp_path, "a" * 40)
+    controller = share / "controller.json"
+    initial = json.loads(controller.read_text())
+    assert initial["maximum_total_attempts"] == (
+        initial["maximum_automatic_attempts"] + initial["maximum_preparation_attempts"]
+    )
+    policy = {
+        "maximum_automatic_attempts": 3,
+        "maximum_preparation_attempts": 4,
+        "maximum_total_attempts": 6,
+        "maximum_tokens": 123456,
+        "local_allowance": {
+            "policy_id": "retained",
+            "tokens_per_window": 234567,
+            "window_seconds": 86400,
+        },
+    }
+    initial.update(policy)
+    controller.write_text(json.dumps(initial))
+    configure(tmp_path, "b" * 40)
+    for name in ("controller.json", "publisher.json"):
+        regenerated = json.loads((share / name).read_text())
+        assert {key: regenerated[key] for key in policy} == policy
+        assert (
+            regenerated["standing_github_policy"] == initial["standing_github_policy"]
+        )

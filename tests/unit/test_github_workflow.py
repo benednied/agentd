@@ -388,6 +388,72 @@ def test_pause_is_durable_resume_clears_hold_and_edited_comment_does_not_reexecu
         assert len(store.github_controls("applied")) == 2
 
 
+@pytest.mark.parametrize("prior_attempts, blocked", [(1, False), (2, True)])
+def test_authenticated_resume_obeys_attempt_limits_and_preserves_hold_on_failure(
+    prior_attempts, blocked
+):
+    from types import SimpleNamespace
+
+    from agentd.coding.attempts import CodingAttemptLimits
+    from agentd.coding.controller import guard_coding_resume
+    from agentd.publication import PublicationStore
+
+    source = Source(source_issue())
+    with SQLiteStateStore() as store:
+        limits = CodingAttemptLimits(maximum_coding_attempts=2)
+        intake, workflow = compose(
+            store,
+            source,
+            resume_guard=lambda job_id: guard_coding_resume(store, job_id, limits),
+        )
+        asyncio.run(intake.poll())
+        job = store.get_job(source.issue.job_id)
+        for state in (JobState.ADMITTED, JobState.RUNNING, JobState.SUSPENDED):
+            updated, event = transition_job(job, state, "Retained execution")
+            store.save_job(updated, event, expected=job)
+            job = updated
+        store.set_github_job_hold(job.id, held=True, event_id="pause")
+        runs = tuple(
+            SimpleNamespace(
+                id=f"prior-{index}",
+                result=None,
+                contract=SimpleNamespace(operation=None),
+            )
+            for index in range(prior_attempts)
+        )
+        store.list_runs = lambda _job_id: runs
+        store.latest_run = lambda _job_id: runs[-1]
+        resumed = []
+
+        async def resume(job_id):
+            resumed.append(job_id)
+            original = store.get_job(job_id)
+            updated, event = transition_job(original, JobState.READY, "Trusted resume")
+            store.save_job(updated, event, expected=original)
+            return updated
+
+        intake.control_plane.resume = resume
+        source.controls = [source_comment("/agentd resume", identity=2)]
+        asyncio.run(workflow.poll_controls())
+        if blocked:
+            assert resumed == []
+            assert store.get_job(job.id) == job
+            assert store.github_job_held(job.id)
+            assert (
+                "provider attempt limit"
+                in store.github_controls("blocked")[0]["reason"]
+            )
+            assert (
+                PublicationStore(store.path).repair_for(job.id, runs[-1].id)["status"]
+                == "exhausted"
+            )
+        else:
+            assert resumed == [job.id]
+            assert store.get_job(job.id).state is JobState.READY
+            assert not store.github_job_held(job.id)
+            assert len(store.github_controls("applied")) == 1
+
+
 def test_cancel_replay_does_not_create_another_job_or_revive_it():
     source = Source(source_issue())
     source.controls = [source_comment("/agentd cancel")]
@@ -802,3 +868,46 @@ def test_reporter_explains_quota_repair_ownership_and_hold_without_false_revocat
         assert "ownership is unresolved" in body
         assert "Paused by your GitHub control" in body
         assert "Source approval was revoked" not in body
+
+
+def test_reporter_distinguishes_attempt_budgets_and_explains_exhausted_retry():
+    source = Source(source_issue())
+    adapter = StatusAdapter()
+    with SQLiteStateStore() as store:
+        intake, _ = compose(store, source)
+        asyncio.run(intake.poll())
+        reporter = GitHubStatusReporter(store, adapter)
+        reporter.enqueue(
+            [
+                {
+                    "job_id": source.issue.job_id,
+                    "state": "REVIEW",
+                    "attempts": 7,
+                    "attempt_budget": {
+                        "coding_attempts": 3,
+                        "preparation_attempts": 4,
+                        "total_attempts": 7,
+                        "maximum_coding_attempts": 3,
+                        "maximum_preparation_attempts": 4,
+                        "maximum_total_attempts": 7,
+                    },
+                    "repair": {
+                        "status": "exhausted",
+                        "reason": (
+                            "Coding repair provider attempt limit has been reached"
+                        ),
+                    },
+                }
+            ]
+        )
+        asyncio.run(reporter.publish_pending())
+        body = adapter.existing["body"]
+        assert "3 coding of 3 allowed" in body
+        assert "4 preparation failures of 4 allowed" in body
+        assert "Total limit: 7" in body
+        assert "Stopped: Coding repair provider attempt limit has been reached" in body
+        assert "Automatic repair has stopped" in body
+        assert "`/agentd retry` does not raise attempt or spending limits" in body
+        assert "Post a new issue to authorize a separate job" in body
+        assert "A new job shares the account's existing spending allowance" in body
+        assert "`/agentd resume`, `/agentd retry`" not in body

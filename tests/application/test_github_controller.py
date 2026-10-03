@@ -120,7 +120,97 @@ def test_approve_status_and_restart_preserve_one_job_and_accounting(
     assert output[0]["job_id"] == approved["job_id"]
     assert output[0]["state"] == "READY"
     assert output[0]["authorized"]
+    assert output[0]["attempt_budget"] == {
+        "coding_attempts": 0,
+        "preparation_attempts": 0,
+        "total_attempts": 0,
+        "maximum_coding_attempts": 3,
+        "maximum_preparation_attempts": 3,
+        "maximum_total_attempts": 6,
+    }
     assert "Intent" not in json.dumps(output)
+
+
+def test_status_cli_reports_configured_separate_attempt_limits(
+    controller_config, capsys
+):
+    path, _ = controller_config
+    config = json.loads(path.read_text())
+    config.update(
+        {
+            "maximum_automatic_attempts": 5,
+            "maximum_preparation_attempts": 2,
+            "maximum_total_attempts": 6,
+        }
+    )
+    path.write_text(json.dumps(config))
+    arguments = ["github", "--config", str(path)]
+    assert main([*arguments, "approve", "1", "--actor", "operator"]) == 0
+    capsys.readouterr()
+    assert main([*arguments, "status"]) == 0
+    budget = json.loads(capsys.readouterr().out)[0]["attempt_budget"]
+    assert budget["maximum_coding_attempts"] == 5
+    assert budget["maximum_preparation_attempts"] == 2
+    assert budget["maximum_total_attempts"] == 6
+
+
+@pytest.mark.parametrize("prior_attempts, blocked", [(1, False), (2, True)])
+def test_configured_github_resume_cli_enforces_attempt_limits(
+    controller_config, monkeypatch, capsys, prior_attempts, blocked
+):
+    from types import SimpleNamespace
+
+    from agentd.coordinator import LifecycleError
+    from agentd.domain.enums import JobState
+    from agentd.domain.transitions import transition_job
+
+    path, _source = controller_config
+    config = json.loads(path.read_text())
+    config["maximum_automatic_attempts"] = 2
+    path.write_text(json.dumps(config))
+    arguments = ["github", "--config", str(path)]
+    assert main([*arguments, "approve", "1", "--actor", "operator"]) == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    config = load_config(path)
+    with SQLiteStateStore(config["database"]) as store:
+        job = store.get_job(job_id)
+        for state in (JobState.ADMITTED, JobState.RUNNING, JobState.SUSPENDED):
+            updated, event = transition_job(job, state, "Retained execution")
+            store.save_job(updated, event, expected=job)
+            job = updated
+        runs = tuple(
+            SimpleNamespace(
+                id=f"prior-{index}",
+                result=None,
+                contract=SimpleNamespace(operation=None),
+            )
+            for index in range(prior_attempts)
+        )
+        store.list_runs = lambda _job_id: runs
+        store.latest_run = lambda _job_id: runs[-1]
+        resumed = []
+
+        async def resume(job_id, **_kwargs):
+            resumed.append(job_id)
+            return job
+
+        async def close():
+            pass
+
+        runtime = SimpleNamespace(
+            store=store, coordinator=SimpleNamespace(resume=resume), aclose=close
+        )
+        monkeypatch.setattr(
+            "agentd.coding.controller.create_controller", lambda _config: runtime
+        )
+        command = [*arguments, "resume", job_id, "--actor", "operator"]
+        if blocked:
+            with pytest.raises(LifecycleError, match="provider attempt limit"):
+                main(command)
+            assert resumed == []
+        else:
+            assert main(command) == 0
+            assert resumed == [job_id]
 
 
 def test_controller_discovers_but_never_approves_issues(controller_config):

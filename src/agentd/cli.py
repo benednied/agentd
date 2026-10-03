@@ -293,9 +293,11 @@ def _run_process_command(
 
 async def _github_command(args: argparse.Namespace) -> int:
     from agentd.coding.controller import (
+        coding_attempt_limits,
         create_backlog,
         create_controller,
         create_intake,
+        guard_coding_resume,
         health,
         load_config,
         status,
@@ -368,6 +370,9 @@ async def _github_command(args: argparse.Namespace) -> int:
                     actor=args.actor,
                 )
             else:
+                guard_coding_resume(
+                    runtime.store, args.job_id, coding_attempt_limits(config)
+                )
                 job = await coordinator.resume(
                     args.job_id, maximum_tokens=args.maximum_tokens, actor=args.actor
                 )
@@ -387,16 +392,17 @@ async def _github_command(args: argparse.Namespace) -> int:
                 )
                 return 0 if ready else 1
             if args.github_command == "status":
+                reports = status(store, attempt_limits=coding_attempt_limits(config))
                 if config.get("backlog"):
                     backlog = create_backlog(config, create_intake(config, store))
                     print(
                         json.dumps(
-                            {"jobs": status(store), "backlog": backlog.ledger.status()},
+                            {"jobs": reports, "backlog": backlog.ledger.status()},
                             indent=2,
                         )
                     )
                 else:
-                    print(json.dumps(status(store), indent=2))
+                    print(json.dumps(reports, indent=2))
             elif args.github_command in {"plan", "approve-graph"}:
                 if not config.get("backlog"):
                     raise ValueError("configure a backlog epic or explicit issue set")

@@ -314,6 +314,7 @@ class GitHubWorkflow:
         policy: StandingGitHubPolicy,
         *,
         feedback: Callable[..., Awaitable[object]] | None = None,
+        resume_guard: Callable[[str], None] | None = None,
         approve_pr: Callable[..., Awaitable[object]] | None = None,
         published_subjects: Callable[[], Mapping[int, str]] | None = None,
     ) -> None:
@@ -324,6 +325,7 @@ class GitHubWorkflow:
             raise ValueError("standing policy repository does not match intake")
         self.intake, self.source, self.policy = intake, source, policy
         self.feedback = feedback
+        self.resume_guard = resume_guard
         self.approve_pr = approve_pr
         self.published_subjects = published_subjects or (lambda: {})
 
@@ -533,6 +535,8 @@ class GitHubWorkflow:
                         await asyncio.to_thread(
                             self.intake.refresh_authorization, issue
                         )
+                        if job.state is JobState.SUSPENDED and self.resume_guard:
+                            self.resume_guard(job_id)
                         store.set_github_job_hold(
                             job_id, held=False, event_id=event["event_id"]
                         )
@@ -741,8 +745,19 @@ class GitHubStatusReporter:
             lines = [
                 marker,
                 f"agentd: **{state}**",
-                f"Attempts: {report.get('attempts', 0)}.",
             ]
+            attempts = report.get("attempt_budget")
+            if attempts:
+                lines.append(
+                    f"Attempts: {attempts['total_attempts']} total; "
+                    f"{attempts['coding_attempts']} coding of "
+                    f"{attempts['maximum_coding_attempts']} allowed; "
+                    f"{attempts['preparation_attempts']} preparation failures of "
+                    f"{attempts['maximum_preparation_attempts']} allowed. "
+                    f"Total limit: {attempts['maximum_total_attempts']}."
+                )
+            else:
+                lines.append(f"Attempts: {report.get('attempts', 0)}.")
             if self.store.github_job_held(job_id):
                 lines.append(
                     "Paused by your GitHub control. "
@@ -769,8 +784,13 @@ class GitHubStatusReporter:
             ):
                 reasons.append("local spending allowance is waiting for renewal")
             repair = report.get("repair") or {}
-            if repair.get("status") in {"blocked", "exhausted"}:
+            exhausted = repair.get("status") == "exhausted"
+            if repair.get("status") == "blocked":
                 reasons.append(repair.get("reason"))
+            elif exhausted:
+                lines.append(
+                    f"Stopped: {repair.get('reason') or 'Repair limit reached'}"
+                )
             reasons.extend(
                 event["reason"]
                 for event in self.store.github_controls("blocked")
@@ -789,10 +809,22 @@ class GitHubStatusReporter:
                     "Source approval was revoked. "
                     "Post a new issue for revised executed intent."
                 )
-            lines.append(
-                "Comment with instructions, or use `/agentd pause`, "
-                "`/agentd resume`, `/agentd retry`, or `/agentd cancel`."
-            )
+            if exhausted:
+                lines.append(
+                    "Automatic repair has stopped. `/agentd retry` does not raise "
+                    "attempt or spending limits. Post a new issue to authorize "
+                    "a separate job, or ask the operator to revise the limits "
+                    "before retrying this job. A new job shares the account's "
+                    "existing spending allowance."
+                )
+                lines.append(
+                    "Use `/agentd pause` or `/agentd cancel` to stop this job."
+                )
+            else:
+                lines.append(
+                    "Comment with instructions, or use `/agentd pause`, "
+                    "`/agentd resume`, `/agentd retry`, or `/agentd cancel`."
+                )
             self.store.queue_github_status(
                 job_id,
                 issue.repository,
