@@ -222,6 +222,9 @@ def validate(
         scratch = Path(temp)
         env = {
             "PATH": str(Path(python).parent) + ":/usr/bin:/bin",
+            # The container's Python links libpython in this immutable runtime.
+            # Keep its loader path when replacing the sandbox environment.
+            "LD_LIBRARY_PATH": "/usr/local/lib",
             "HOME": str(scratch),
             "TMPDIR": str(scratch),
             "PYTHONPATH": str(checkout / "src"),

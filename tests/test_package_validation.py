@@ -92,6 +92,7 @@ def test_orchestration_is_offline_and_does_not_inherit_credentials(
     assert all("GH_TOKEN" not in env for _argv, _cwd, env, _timeout in calls)
     assert all(env["PYTHONPATH"] == str(root / "src") for _, _, env, _ in calls)
     assert all(env["PIP_NO_INDEX"] == "1" for _, _, env, _ in calls)
+    assert all(env["LD_LIBRARY_PATH"] == "/usr/local/lib" for _, _, env, _ in calls)
     build = next(argv for argv, *_ in calls if "build" in argv)
     assert "--no-isolation" in build and "--sdist" in build and "--wheel" in build
     install = next(argv for argv, *_ in calls if "pip" in argv)
