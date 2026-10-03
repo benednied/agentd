@@ -13,7 +13,11 @@ from threading import RLock
 from typing import Any
 
 from agentd.workers.errors import WorkerJournalConflictError, WorkerProtocolError
-from agentd.workers.remote_protocol import MAX_STRING_SIZE, canonical_json
+from agentd.workers.remote_protocol import (
+    MAX_STRING_SIZE,
+    canonical_json,
+    validate_retirement_certificate,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +119,14 @@ class OperationJournal:
                     created_at REAL NOT NULL,
                     PRIMARY KEY(node_id, session_epoch, run_id)
                 );
+                CREATE TABLE IF NOT EXISTS worker_run_retirements (
+                    node_id TEXT NOT NULL,
+                    session_epoch TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    start_hash TEXT NOT NULL,
+                    certificate TEXT NOT NULL,
+                    PRIMARY KEY(node_id, session_epoch, run_id)
+                );
                 """
             )
             columns = {
@@ -192,6 +204,8 @@ class OperationJournal:
                 raise WorkerProtocolError("operation journal is closed")
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                if self.run_retired(run_id=run_id):
+                    raise WorkerJournalConflictError("retired worker run cannot start")
                 row = self._connection.execute(
                     "SELECT start_hash FROM worker_run_claims WHERE node_id = ? "
                     "AND session_epoch = ? AND run_id = ?",
@@ -240,6 +254,101 @@ class OperationJournal:
             raise WorkerProtocolError("worker run claim state is invalid")
         return state
 
+    def run_claim_hash(self, *, run_id: str) -> str | None:
+        """Read the original START identity without modifying its claim."""
+        self._validate_identifier(run_id, "run_id")
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            row = self._connection.execute(
+                "SELECT start_hash FROM worker_run_claims WHERE node_id = ? "
+                "AND session_epoch = ? AND run_id = ?",
+                (self.node_id, self.session_epoch, run_id),
+            ).fetchone()
+        return str(row["start_hash"]) if row is not None else None
+
+    def run_retired(self, *, run_id: str) -> bool:
+        """Retirement blocks reuse even after an administrative epoch change."""
+        self._validate_identifier(run_id, "run_id")
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            return (
+                self._connection.execute(
+                    "SELECT 1 FROM worker_run_retirements WHERE run_id = ? LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                is not None
+            )
+
+    def load_run_retirement(self, *, run_id: str) -> dict[str, Any] | None:
+        self._validate_identifier(run_id, "run_id")
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            row = self._connection.execute(
+                "SELECT certificate FROM worker_run_retirements WHERE node_id = ? "
+                "AND session_epoch = ? AND run_id = ?",
+                (self.node_id, self.session_epoch, run_id),
+            ).fetchone()
+        return json.loads(row["certificate"]) if row is not None else None
+
+    def retire_run(
+        self, *, run_id: str, start_hash: str, certificate: dict[str, Any]
+    ) -> None:
+        """Record immutable physical retirement without a result or quota refund."""
+        self._validate_identifier(run_id, "run_id")
+        self._validate_payload_hash(start_hash, "start_hash")
+        if not isinstance(certificate, dict):
+            raise WorkerProtocolError("worker retirement certificate is malformed")
+        stop_proof = {
+            key: certificate.get(key)
+            for key in (
+                "proof_version",
+                "job_id",
+                "node_id",
+                "session_epoch",
+                "run_id",
+                "start_hash",
+                "actor",
+                "event_id",
+                "container_id",
+                "stopped_at",
+            )
+        } | {"running": False, "pid": 0}
+        validate_retirement_certificate(
+            certificate,
+            node_id=self.node_id,
+            session_epoch=self.session_epoch,
+            run_id=run_id,
+            start_hash=start_hash,
+            actor=certificate.get("actor"),
+            event_id=certificate.get("event_id"),
+            stop_proof=stop_proof,
+        )
+        encoded = canonical_json(certificate).decode()
+        with self._lock:
+            if self._connection is None:
+                raise WorkerProtocolError("operation journal is closed")
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                if self.run_claim_hash(run_id=run_id) != start_hash:
+                    raise WorkerJournalConflictError(
+                        "retirement START identity mismatch"
+                    )
+                prior = self.load_run_retirement(run_id=run_id)
+                if prior is not None and canonical_json(prior).decode() != encoded:
+                    raise WorkerJournalConflictError("worker retirement changed")
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO worker_run_retirements VALUES "
+                    "(?, ?, ?, ?, ?)",
+                    (self.node_id, self.session_epoch, run_id, start_hash, encoded),
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
     def unresolved_run_ids(self) -> tuple[str, ...]:
         """Claims remain capacity owners until terminal evidence is durable."""
         with self._lock:
@@ -249,7 +358,11 @@ class OperationJournal:
                 "SELECT c.run_id FROM worker_run_claims c "
                 "LEFT JOIN worker_run_results r ON c.node_id = r.node_id "
                 "AND c.session_epoch = r.session_epoch AND c.run_id = r.run_id "
-                "WHERE c.node_id = ? AND c.session_epoch = ? AND r.run_id IS NULL",
+                "LEFT JOIN worker_run_retirements q ON c.node_id = q.node_id "
+                "AND c.session_epoch = q.session_epoch AND c.run_id = q.run_id "
+                "AND c.start_hash = q.start_hash "
+                "WHERE c.node_id = ? AND c.session_epoch = ? AND r.run_id IS NULL "
+                "AND q.run_id IS NULL",
                 (self.node_id, self.session_epoch),
             ).fetchall()
         return tuple(str(row["run_id"]) for row in rows)
@@ -299,6 +412,8 @@ class OperationJournal:
         with self._lock:
             if self._connection is None:
                 raise WorkerProtocolError("operation journal is closed")
+            if self.run_retired(run_id=run_id):
+                raise WorkerJournalConflictError("retired worker claim cannot change")
             row = self._connection.execute(
                 "SELECT start_hash FROM worker_run_claims WHERE node_id = ? "
                 "AND session_epoch = ? AND run_id = ?",

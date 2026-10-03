@@ -127,6 +127,8 @@ class RunState(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    # Physical ownership was fenced and retired; terminal usage is unresolved.
+    QUARANTINED = "QUARANTINED"
 
 
 class TailAction(StrEnum):

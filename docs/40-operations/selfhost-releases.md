@@ -126,3 +126,49 @@ keep the new release drained and repair forward rather than reverting its ledger
 Package gates, Docker builds and host restart behavior still require real HP
 qualification. The supervisor's unit tests establish policy and ordering;
 they do not establish successful deployment or a completed unattended soak.
+
+## Explicit abandonment of an unknown attempt
+
+A new, unedited `/agentd abandon` comment on the source issue or an agentd PR
+selects that job's latest attempt. On the operations issue, use
+`/agentd abandon <run_id>` with the exact run ID. Only the configured trusted
+login and numeric GitHub identity can authorize it after activation. The host
+verifies the immutable repository, source and publication mappings, retained
+reservation, worker epoch, and original START hash through read only ledgers.
+Another active or unretired run on that worker blocks the stop.
+
+Enable this capability with the optional trusted `abandon_controls` object in
+the release supervisor configuration. Its fields are `activated_at`,
+`controller_database`, `worker_journal`, `worker_proof_directory`, `node_id`,
+`session_epoch`, and optional `maximum_attempts` (default three, maximum five).
+For the HP profile, the controller database is
+`/home/bened/.local/state/agentd-selfhost/coding/controller/state.sqlite` and the
+worker journal is
+`/home/bened/.local/state/agentd-selfhost/coding/worker/worker/worker.sqlite`.
+The proof directory must be the journal parent's `quarantine-stops` directory,
+mode 0700 and owned by the worker UID. Protected proof files use mode 0600.
+
+The host saves a stop intent with exact container identities before stopping
+the controller and publisher supervisors. It rechecks the selected attempt,
+stops the exact worker container, and verifies that it is no longer running
+and its PID is zero. It writes an attestation bound to the run, job, original
+START hash, worker identity and epoch, human actor and event, container ID, and
+observed stop time. The same worker then starts a diagnostic server. A one off
+controller command receives only that proof as a read only bind mount and
+performs the authenticated quarantine RPC before normal services restart.
+Proof files retain their original contents and timestamps across retries.
+
+Quarantine releases physical capacity while retaining unknown usage, the
+reservation, debt, and audit history. It does not refund usage or declare the
+job complete. The source issue and operations issue show the result. Lost RPC
+responses reconcile the exact durable quarantine record. Lost report creation
+responses wait for the same machine comment; they never create another one
+while the first creation remains uncertain.
+
+Failed actions retry within the configured bound. When that bound is exhausted,
+a fresh operations issue `/agentd abandon <run_id>` comment authorizes another
+bounded retry of the original intent. Its original proof and worker RPC event
+remain unchanged; the new retry authorization has its own durable audit event.
+A changed release or container blocks further stops. A command that becomes
+invalid before the worker stop restores the original controller and publisher
+supervisors when their identities can still be proved.

@@ -276,20 +276,21 @@ def parse_control(body: str) -> tuple[str, str]:
         not body
         or "<!-- agentd-status:" in body
         or "<!-- agentd:selfhost-release-status:v1 -->" in body
+        or "<!-- agentd:host-abandon:" in body
         or len(body) > 20000
     ):
         return "ignore", ""
     if not body.startswith("/agentd"):
         return "steer", body
     match = re.fullmatch(
-        r"/agentd (approve|pause|cancel|resume|retry|steer)(?:\s+(.+))?",
+        r"/agentd (approve|pause|cancel|resume|retry|steer|abandon)(?:\s+(.+))?",
         body,
         flags=re.DOTALL,
     )
     if not match:
         raise ValueError(
             "unknown /agentd control; use approve, pause, cancel, "
-            "resume, retry, or steer"
+            "resume, retry, steer, or abandon"
         )
     action, argument = match.group(1), (match.group(2) or "").strip()
     if action in {"pause", "cancel", "resume"} and argument:
@@ -465,9 +466,14 @@ class GitHubWorkflow:
                 if not all(self.policy.trusts(*actor) for actor in actors):
                     raise ValueError("control editor is no longer trusted")
                 action, instruction = parse_control(event["payload"]["body"])
-                if action == "ignore":
+                if action in {"ignore", "abandon"}:
                     store.finish_github_control(
-                        event["event_id"], job_id=None, state="ignored"
+                        event["event_id"],
+                        job_id=None,
+                        state="ignored",
+                        reason="handled by the trusted HP supervisor"
+                        if action == "abandon"
+                        else None,
                     )
                     continue
                 issue = await asyncio.to_thread(

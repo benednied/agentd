@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import agentd.cli as cli
 from agentd.cli import build_parser, main
@@ -9,6 +10,62 @@ from agentd.config import ServiceConfig
 from agentd.domain.enums import QuotaUnit
 from agentd.domain.models import UsageSample
 from agentd.state.sqlite import SQLiteStateStore
+
+
+def test_github_quarantine_calls_retirement_without_starting_daemon(
+    tmp_path, monkeypatch, capsys
+):
+    from agentd.coding import controller
+
+    observed = []
+    proof = tmp_path / "stop.json"
+    proof.write_text(json.dumps({"run_id": "run-1", "running": False, "pid": 0}))
+
+    async def quarantine(run_id, **kwargs):
+        observed.append((run_id, kwargs))
+        return SimpleNamespace(
+            id="job-1", state=SimpleNamespace(value="METERING_PENDING")
+        )
+
+    async def close():
+        observed.append("closed")
+
+    monkeypatch.setattr(controller, "load_config", lambda _: {})
+    monkeypatch.setattr(
+        controller,
+        "create_controller",
+        lambda _: SimpleNamespace(
+            coordinator=SimpleNamespace(quarantine_run=quarantine), aclose=close
+        ),
+    )
+    args = build_parser().parse_args(
+        [
+            "github",
+            "--config",
+            str(tmp_path / "config.json"),
+            "quarantine",
+            "run-1",
+            "--actor",
+            "owner",
+            "--event-id",
+            "comment:42",
+            "--stop-proof",
+            str(proof),
+        ]
+    )
+    assert asyncio.run(cli._github_command(args)) == 0
+    assert observed == [
+        (
+            "run-1",
+            {
+                "actor": "owner",
+                "event_id": "comment:42",
+                "stop_proof": {"run_id": "run-1", "running": False, "pid": 0},
+            },
+        ),
+        "closed",
+    ]
+    assert json.loads(capsys.readouterr().out)["state"] == "METERING_PENDING"
 
 
 def test_submit_persists_codex_cumulative_maximum(

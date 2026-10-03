@@ -21,7 +21,7 @@ from agentd.coding.models import RepositoryProfile
 from agentd.coding.pipeline import CodingPublicationReconciler, CodingRepairReconciler
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.daemon import AgentDaemon
-from agentd.domain.enums import JobState, QuotaUnit
+from agentd.domain.enums import JobState, QuotaUnit, RunState
 from agentd.domain.models import (
     EffortEstimate,
     ProviderQuotaSnapshot,
@@ -616,7 +616,13 @@ def status(store: SQLiteStateStore) -> list[dict[str, Any]]:
                     f"/issues/{json.loads(source['payload'])['number']}"
                 ),
                 "last_progress_at": job.updated_at.isoformat(),
-                "blocked_reason": runtime_reason
+                "blocked_reason": (
+                    "Physical ownership retired through GitHub; final usage "
+                    "remains unknown and its reservation is retained. "
+                    "New issues can proceed within the remaining allowance."
+                    if run and run.state is RunState.QUARANTINED
+                    else runtime_reason
+                )
                 if job.state not in {JobState.COMPLETED, JobState.CANCELLED}
                 else None,
                 "attempts": len(store.list_runs(job.id)),

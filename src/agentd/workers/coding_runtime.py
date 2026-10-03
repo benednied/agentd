@@ -8,8 +8,13 @@ successfully under the same environment used to start the SDK.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 
@@ -48,6 +53,7 @@ from agentd.workers.dependency_prep import (
     PreparationMount,
 )
 from agentd.workers.operations import OperationError, SubprocessCommandRunner
+from agentd.workers.remote_protocol import canonical_json, payload_hash
 
 _RUNTIME_PYTHON = "/opt/agentd/venv/bin/python"
 _RUNTIME_PROBE = "/opt/agentd/security/runtime_sandbox_probe.py"
@@ -116,6 +122,138 @@ class _ContainedCodexDriver(CodexSdkDriver):
         return await self._supervisor.recover_terminal_readonly(
             run_id, terminal_usage_reader=reader
         )
+
+    def prove_physical_quarantine(
+        self,
+        run_id: str,
+        order: CodingWorkOrder | None,
+        lease: WorkspaceLease | None,
+        *,
+        actor: str,
+        event_id: str,
+        stop_proof: dict,
+        start_hash: str,
+    ) -> dict:
+        """Verify a protected host attestation after the old container stopped.
+
+        Kernel ownership alone cannot prove orphaned descendants stopped. The
+        trusted host must first inspect the exact stopped Docker container and
+        install this attestation before the replacement worker acquires its
+        startup fence. This method never invokes the SDK or provider.
+        """
+        self._require_worker_owner()
+        acquired = self._worker_owner.acquired_at
+        if acquired is None or run_id in self._supervisor._live:
+            raise OperationError("quarantine cannot retire a live SDK owner")
+        keys = {
+            "proof_version",
+            "node_id",
+            "session_epoch",
+            "run_id",
+            "job_id",
+            "start_hash",
+            "actor",
+            "event_id",
+            "container_id",
+            "stopped_at",
+            "running",
+            "pid",
+        }
+        if (
+            set(stop_proof) != keys
+            or stop_proof.get("proof_version") != 1
+            or isinstance(stop_proof.get("proof_version"), bool)
+            or stop_proof.get("running") is not False
+            or stop_proof.get("pid") != 0
+            or isinstance(stop_proof.get("pid"), bool)
+            or any(
+                not isinstance(stop_proof.get(key), str)
+                or not stop_proof[key]
+                or len(stop_proof[key]) > 256
+                or "\0" in stop_proof[key]
+                for key in keys - {"proof_version", "running", "pid"}
+            )
+            or stop_proof["run_id"] != run_id
+            or stop_proof["actor"] != actor
+            or stop_proof["event_id"] != event_id
+            or stop_proof["start_hash"] != start_hash
+            or (order is not None and stop_proof["job_id"] != order.job_id)
+            or len(stop_proof["container_id"]) != 64
+            or any(c not in "0123456789abcdef" for c in stop_proof["container_id"])
+        ):
+            raise OperationError("quarantine stop attestation identity mismatch")
+        try:
+            stopped = datetime.fromisoformat(stop_proof["stopped_at"])
+        except ValueError as error:
+            raise OperationError("quarantine stop time is malformed") from error
+        if stopped.utcoffset() != timedelta(0) or stopped > acquired:
+            raise OperationError(
+                "host stop must precede this exact worker startup fence"
+            )
+        try:
+            run = self._worker_store.get_run(run_id)
+        except EntityNotFoundError:
+            run = None
+        if run is not None and (
+            order is None
+            or lease is None
+            or run.job_id != f"worker-envelope:{run_id}"
+            or not isinstance(run.contract.operation, CodingOperation)
+            or run.contract.operation.work_order != order
+            or run.contract.working_directory != lease.working_directory
+            or run.started_at > stopped
+        ):
+            raise OperationError("quarantine execution envelope identity mismatch")
+        if any(
+            sample.final for sample in self._worker_store.list_usage_samples(run_id)
+        ):
+            raise OperationError("final SDK usage exists; use terminal recovery")
+        directory = Path(self._worker_store.path).resolve().parent / "quarantine-stops"
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise OperationError("quarantine proof directory is not protected")
+        name = hashlib.sha256(
+            canonical_json({"run_id": run_id, "event_id": event_id})
+        ).hexdigest()
+        fd = os.open(directory / f"{name}.json", os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > 16_384
+                or metadata.st_mtime > acquired.timestamp()
+            ):
+                raise OperationError(
+                    "quarantine stop proof is not a protected regular file"
+                )
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                protected = json.loads(stream.read(16_385))
+        finally:
+            os.close(fd)
+        if canonical_json(protected) != canonical_json(stop_proof):
+            raise OperationError("quarantine payload lacks the actual host stop proof")
+        return {
+            "proof_version": 1,
+            "run_id": run_id,
+            "job_id": stop_proof["job_id"],
+            "node_id": stop_proof["node_id"],
+            "session_epoch": stop_proof["session_epoch"],
+            "start_hash": start_hash,
+            "actor": actor,
+            "event_id": event_id,
+            "physical_retired": True,
+            "metering_unknown": True,
+            "stop_proof_sha256": payload_hash(stop_proof),
+            "container_id": stop_proof["container_id"],
+            "stopped_at": stop_proof["stopped_at"],
+            "fenced_at": acquired.isoformat(),
+        }
 
     def capabilities(self) -> HarnessCapabilities:
         capabilities = super().capabilities()

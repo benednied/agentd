@@ -13,6 +13,7 @@ import fcntl
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -32,6 +33,7 @@ class ControllerLock:
         self.path = database.with_name(f".{database.name}.controller.lock")
         self._handle: TextIO | None = None
         self._owner_pid: int | None = None
+        self._acquired_at: datetime | None = None
 
     def acquire(self) -> None:
         if self._handle is not None:
@@ -51,6 +53,12 @@ class ControllerLock:
         handle.flush()
         self._handle = handle
         self._owner_pid = os.getpid()
+        self._acquired_at = datetime.now(UTC)
+
+    @property
+    def acquired_at(self) -> datetime | None:
+        """Acquisition time only while this process holds the actual fence."""
+        return self._acquired_at if self.owned else None
 
     @property
     def owned(self) -> bool:
@@ -64,6 +72,7 @@ class ControllerLock:
     def release(self) -> None:
         handle, self._handle = self._handle, None
         self._owner_pid = None
+        self._acquired_at = None
         if handle is None:
             return
         try:

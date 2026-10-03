@@ -33,6 +33,7 @@ from agentd.workers.remote_protocol import (
     make_request,
     operation_hash,
     read_frame,
+    validate_retirement_certificate,
     write_frame,
 )
 
@@ -264,6 +265,50 @@ class RemoteWorkerClient:
             {},
             run_id=run_id,
             request_id=request_id,
+            response_parser=parse,
+        )
+
+    async def quarantine_run(
+        self,
+        run: RunHandle | str,
+        *,
+        actor: str,
+        event_id: str,
+        stop_proof: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Request physical retirement; unknown metering remains unresolved."""
+        run_id = self._run_id(run)
+        if not isinstance(stop_proof, dict) or not isinstance(
+            stop_proof.get("start_hash"), str
+        ):
+            raise WorkerProtocolError("quarantine requires a host stop proof")
+        start_hash = stop_proof["start_hash"]
+
+        def parse(value: dict[str, Any]) -> dict[str, Any]:
+            if set(value) != {"retirement"}:
+                raise WorkerProtocolError("worker quarantine response is malformed")
+            return validate_retirement_certificate(
+                value["retirement"],
+                node_id=self.node_id,
+                session_epoch=self.session_epoch,
+                run_id=run_id,
+                start_hash=start_hash,
+                actor=actor,
+                event_id=event_id,
+                stop_proof=stop_proof,
+            )
+
+        return await self._call(
+            RemoteAction.QUARANTINE_RUN,
+            {
+                "actor": actor,
+                "event_id": event_id,
+                "stop_proof": stop_proof,
+                "start_hash": start_hash,
+            },
+            run_id=run_id,
+            request_id=request_id or "quarantine:" + event_id,
             response_parser=parse,
         )
 

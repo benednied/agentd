@@ -36,6 +36,7 @@ _REQUIRED = frozenset(
         "src/agentd/runtime/health.py",
         "tools/validate_python_package.py",
         "tools/watch_selfhost_release.py",
+        "tools/host_abandon.py",
         "deploy/scripts/coding-compose.sh",
         "deploy/scripts/coding-release.sh",
         "deploy/systemd/agentd-selfhost-controller.service",
@@ -363,6 +364,11 @@ class ReleaseWatcher:
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
         }
+        self.abandon = None
+        if config.get("abandon_controls") is not None:
+            from host_abandon import HostAbandon
+
+            self.abandon = HostAbandon(self, config["abandon_controls"])
 
     def record(self, stage: str, **values: Any) -> None:
         if stage != "blocked" and "error" not in values:
@@ -460,6 +466,8 @@ class ReleaseWatcher:
         }
         if self.status.get("bootstrap_head"):
             summary["bootstrap_head"] = self.status["bootstrap_head"]
+        if self.status.get("abandon"):
+            summary["abandon"] = self.status["abandon"]
         runtime = self.status.get("runtime_health", {})
         if runtime:
             summary["runtime_health"] = {
@@ -1006,6 +1014,16 @@ class ReleaseWatcher:
 
     def tick(self) -> None:
         self.inspect_health()
+        if self.abandon is not None:
+            from host_abandon import AbandonBlocked
+
+            try:
+                pending = self.abandon.tick()
+            except AbandonBlocked as error:
+                raise ReleaseBlocked(str(error)) from None
+            if pending:
+                self.record(str(self.status.get("stage", "abandon_pending")))
+                return
         if self.reconcile_bootstrap():
             return
         origin = self.git("remote", "get-url", "origin")

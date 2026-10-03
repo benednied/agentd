@@ -22,7 +22,13 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         {JobState.ADMITTED, JobState.BACKLOG, JobState.CANCELLED}
     ),
     JobState.ADMITTED: frozenset(
-        {JobState.RUNNING, JobState.READY, JobState.FAILED, JobState.CANCELLED}
+        {
+            JobState.RUNNING,
+            JobState.READY,
+            JobState.METERING_PENDING,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }
     ),
     JobState.RUNNING: frozenset(
         {

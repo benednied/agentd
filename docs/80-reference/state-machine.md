@@ -9,7 +9,7 @@ transaction.
 | `BACKLOG` | `PLANNING`, `READY`, `CANCELLED` |
 | `PLANNING` | `READY`, `BACKLOG`, `FAILED`, `CANCELLED` |
 | `READY` | `ADMITTED`, `BACKLOG`, `CANCELLED` |
-| `ADMITTED` | `RUNNING`, `READY`, `FAILED`, `CANCELLED` |
+| `ADMITTED` | `RUNNING`, `READY`, `METERING_PENDING`, `FAILED`, `CANCELLED` |
 | `RUNNING` | `DRAINING`, `CHECKPOINTED`, `METERING_PENDING`, `SUSPENDED`, `REVIEW`, `COMPLETED`, `FAILED`, `CANCELLED` |
 | `DRAINING` | `RUNNING`, `CHECKPOINTED`, `METERING_PENDING`, `FAILED`, `CANCELLED` |
 | `CHECKPOINTED` | `RUNNING`, `METERING_PENDING`, `SUSPENDED`, `FAILED`, `CANCELLED` |
@@ -34,3 +34,12 @@ A bounded remote coding repair uses `REVIEW -> READY -> ADMITTED -> RUNNING`
 after terminal ownership, usage, and checkpoint provenance are proven. A trusted
 GitHub retry can apply the same proof checks to stopped `FAILED` or `CANCELLED`
 jobs, restoring them through `SUSPENDED` without changing the original run.
+
+After an authenticated GitHub abandonment, a host-fenced unknown attempt uses
+job state `METERING_PENDING` and run state `QUARANTINED`. This run state records
+physical retirement only: its result and final usage remain unresolved. The
+allocation is released atomically with an immutable retirement audit, while
+the outstanding quota reservation, usage samples, pool balance, and retained
+workspace remain. The same attempt cannot restart, retry, publish, or obtain a
+refund through issue closure; fresh independent jobs may use physical capacity
+and the remaining unreserved account allowance.

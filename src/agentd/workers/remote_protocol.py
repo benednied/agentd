@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import struct
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol
@@ -46,6 +48,7 @@ class RemoteAction(StrEnum):
     CANCEL = "cancel"
     COLLECT = "collect"
     CODING_CHECKPOINT = "coding-checkpoint"
+    QUARANTINE_RUN = "quarantine-run"
     HEARTBEAT = "heartbeat"
 
 
@@ -116,6 +119,110 @@ def payload_hash(payload: Mapping[str, Any]) -> str:
     """Hash a payload without exposing its contents in journal keys or logs."""
 
     return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def validate_retirement_certificate(
+    value: object,
+    *,
+    node_id: str,
+    session_epoch: str,
+    run_id: str,
+    start_hash: str,
+    actor: str,
+    event_id: str,
+    stop_proof: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a physical retirement to its immutable START and host stop proof.
+
+    This wire check does not establish physical containment. The worker driver
+    must separately verify the protected host proof and its startup fence.
+    """
+    fields = {
+        "proof_version",
+        "run_id",
+        "job_id",
+        "node_id",
+        "session_epoch",
+        "start_hash",
+        "actor",
+        "event_id",
+        "physical_retired",
+        "metering_unknown",
+        "stop_proof_sha256",
+        "fenced_at",
+        "container_id",
+        "stopped_at",
+    }
+    proof_fields = {
+        "proof_version",
+        "job_id",
+        "node_id",
+        "session_epoch",
+        "run_id",
+        "start_hash",
+        "actor",
+        "event_id",
+        "container_id",
+        "stopped_at",
+        "running",
+        "pid",
+    }
+    expected = {
+        "node_id": node_id,
+        "session_epoch": session_epoch,
+        "run_id": run_id,
+        "start_hash": start_hash,
+        "actor": actor,
+        "event_id": event_id,
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or not isinstance(stop_proof, dict)
+        or set(stop_proof) != proof_fields
+        or type(value["proof_version"]) is not int
+        or value["proof_version"] != 1
+        or type(stop_proof["proof_version"]) is not int
+        or stop_proof["proof_version"] != 1
+        or value["physical_retired"] is not True
+        or value["metering_unknown"] is not True
+        or stop_proof["running"] is not False
+        or type(stop_proof["pid"]) is not int
+        or stop_proof["pid"] != 0
+        or any(
+            value[key] != item or stop_proof[key] != item
+            for key, item in expected.items()
+        )
+        or any(
+            not isinstance(value[key], str) or not value[key]
+            for key in fields
+            - {"proof_version", "physical_retired", "metering_unknown"}
+        )
+        or re.fullmatch(r"[0-9a-f]{64}", start_hash) is None
+        or re.fullmatch(r"[0-9a-f]{64}", value["container_id"]) is None
+        or value["container_id"] != stop_proof["container_id"]
+        or value["job_id"] != stop_proof["job_id"]
+        or value["stopped_at"] != stop_proof["stopped_at"]
+        or value["stop_proof_sha256"] != payload_hash(stop_proof)
+    ):
+        raise WorkerProtocolError("worker retirement certificate is malformed")
+    try:
+        stopped = datetime.fromisoformat(value["stopped_at"].replace("Z", "+00:00"))
+        fenced = datetime.fromisoformat(value["fenced_at"].replace("Z", "+00:00"))
+        if (
+            stopped.tzinfo is None
+            or fenced.tzinfo is None
+            or stopped.utcoffset().total_seconds() != 0
+            or fenced.utcoffset().total_seconds() != 0
+            or stopped >= fenced
+        ):
+            raise ValueError("invalid physical fence timestamps")
+    except (ValueError, TypeError, AttributeError) as error:
+        raise WorkerProtocolError(
+            "worker retirement certificate is malformed"
+        ) from error
+    canonical_json(value)
+    return dict(value)
 
 
 def operation_hash(
@@ -624,6 +731,7 @@ __all__ = [
     "payload_hash",
     "read_frame",
     "sign_envelope",
+    "validate_retirement_certificate",
     "verify_signature",
     "write_frame",
 ]

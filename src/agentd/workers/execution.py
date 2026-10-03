@@ -18,7 +18,11 @@ from agentd.harness.registry import DriverRegistry
 from agentd.workers.errors import WorkerOperationError, WorkerProtocolError
 from agentd.workers.journal import JournalEntry, OperationJournal
 from agentd.workers.protocol import validate_status_payload
-from agentd.workers.remote_protocol import Envelope, payload_hash
+from agentd.workers.remote_protocol import (
+    Envelope,
+    payload_hash,
+    validate_retirement_certificate,
+)
 
 
 @dataclass(slots=True)
@@ -108,6 +112,12 @@ class ExecutionService:
             sequence = self._journal.next_sequence()
             return OperationResponse(payload, ok, error, sequence)
 
+        if request.action == "start" and self._journal.run_retired(
+            run_id=request.run_id
+        ):
+            # Never replay even an old completed START response after retirement.
+            raise WorkerOperationError("retired worker run cannot start")
+
         request_key = (request.request_id, request.action)
         # Keep the journal primary key schema-compatible while making the
         # complete operation identity run-scoped. Without this, reusing an
@@ -139,7 +149,7 @@ class ExecutionService:
                 )
                 if existing.status == "completed":
                     return self._replay(existing)
-                if not existing.reserved_here:
+                if not existing.reserved_here and request.action != "quarantine-run":
                     # The timestamp comparison is intentionally not used for
                     # ownership; it only documents that a pending row can
                     # come from a prior process. ``begin`` cannot identify
@@ -147,6 +157,10 @@ class ExecutionService:
                     # lookup is safe to treat as unknown rather than execute
                     # twice.
                     raise WorkerOperationError("operation outcome is unknown")
+                # Quarantine has a separately proven, immutable retirement
+                # certificate and cannot create a provider side effect. Its
+                # exact pending request can reconcile after a crash, under the
+                # START lock and the driver's protected physical stop proof.
                 if request.action == "start":
                     self._pending_starts[request.run_id] = (
                         self._pending_starts.get(request.run_id, 0) + 1
@@ -234,6 +248,9 @@ class ExecutionService:
             # prevents two distinct request ids from racing the same run.
             async with self._start_lock:
                 return await self._start(request)
+        if action == "quarantine-run":
+            async with self._start_lock:
+                return await self._quarantine(request)
         if action == "collect":
             self._expect_fields(request.payload, set())
             persisted = await self._terminal_result(request.run_id)
@@ -295,6 +312,8 @@ class ExecutionService:
         persisted = self._journal.load_run_result(run_id=run_id)
         if persisted is not None:
             return persisted
+        if self._journal.load_run_retirement(run_id=run_id) is not None:
+            return None
         # A typed adapter may have finished while the controller disconnected.
         # Only a prior durable claim permits importing its immutable evidence.
         if self._journal.run_claim_state(run_id=run_id) is None:
@@ -304,11 +323,16 @@ class ExecutionService:
             reader = getattr(driver, "load_terminal_result", None)
             if reader is None:
                 continue
-            result = reader(run_id)
-            if result is None:
-                reconcile = getattr(driver, "recover_terminal", None)
-                if reconcile is not None:
-                    result = await reconcile(run_id)
+            try:
+                result = reader(run_id)
+                if result is None:
+                    reconcile = getattr(driver, "recover_terminal", None)
+                    if reconcile is not None:
+                        result = await reconcile(run_id)
+            except Exception:
+                # Unknown recovered ownership keeps its capacity claim, while
+                # authenticated diagnostics and quarantine remain available.
+                continue
             if result is not None:
                 self._journal.save_run_result(run_id=run_id, result=result.to_dict())
                 return result.to_dict()
@@ -401,6 +425,8 @@ class ExecutionService:
             raise WorkerProtocolError("managed must be a boolean")
         if not request.run_id:
             raise WorkerProtocolError("start requires a run_id")
+        if self._journal.run_retired(run_id=request.run_id):
+            raise WorkerOperationError("retired worker run cannot start")
         fingerprint = payload_hash(request.payload)
         existing = self._runs.get(request.run_id)
         if existing is not None:
@@ -437,6 +463,14 @@ class ExecutionService:
             raise WorkerOperationError(
                 f"driver {driver_name!r} does not support managed starts"
             )
+        for claimed in self._journal.unresolved_run_ids():
+            if (
+                claimed not in self._runs
+                and await self._terminal_result(claimed) is None
+            ):
+                raise WorkerOperationError(
+                    "unresolved worker ownership holds admission"
+                )
         if not self._journal.claim_run(
             run_id=request.run_id,
             start_hash=fingerprint,
@@ -476,6 +510,49 @@ class ExecutionService:
         )
         self._start_attempts.pop(request.run_id, None)
         return {"handle": handle.to_dict(), "managed": managed}
+
+    async def _quarantine(self, request: Envelope) -> dict[str, Any]:
+        payload = self._expect_fields(
+            request.payload, {"actor", "event_id", "stop_proof", "start_hash"}
+        )
+        if (
+            not request.run_id
+            or any(
+                not isinstance(payload[key], str) or not payload[key].strip()
+                for key in ("actor", "event_id", "start_hash")
+            )
+            or not isinstance(payload["stop_proof"], dict)
+        ):
+            raise WorkerProtocolError(
+                "quarantine requires exact trusted proof identity"
+            )
+        if self._journal.run_claim_hash(run_id=request.run_id) != payload["start_hash"]:
+            raise WorkerOperationError("quarantine START identity mismatch")
+        if self._runs or self._pending_starts or self._start_attempts:
+            raise WorkerOperationError("quarantine requires no local or pending runs")
+        certificate = self._journal.load_run_retirement(run_id=request.run_id)
+        if certificate is None:
+            delegates = [
+                getattr(self._drivers.get(capability.name), "quarantine_run", None)
+                for capability in self._drivers.capabilities()
+            ]
+            delegates = [delegate for delegate in delegates if delegate is not None]
+            if len(delegates) != 1:
+                raise WorkerOperationError("worker cannot quarantine this run")
+            certificate = await delegates[0](request.run_id, **payload)
+        certificate = validate_retirement_certificate(
+            certificate,
+            node_id=request.node_id,
+            session_epoch=request.session_epoch,
+            run_id=request.run_id,
+            **payload,
+        )
+        self._journal.retire_run(
+            run_id=request.run_id,
+            start_hash=payload["start_hash"],
+            certificate=certificate,
+        )
+        return {"retirement": certificate}
 
     async def _observe(
         self,

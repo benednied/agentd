@@ -441,6 +441,85 @@ class CodingHarnessDriver:
         self._write(root / "result.json", result.to_dict())
         return result
 
+    async def quarantine_run(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+        event_id: str,
+        stop_proof: dict[str, Any],
+        start_hash: str,
+    ) -> dict[str, Any]:
+        """Retain an unknown attempt after trusted physical container fencing."""
+        if run_id in self._runs:
+            raise CodingOwnershipUnresolved(
+                "quarantine requires a replacement worker owner"
+            )
+        root = self._lease(run_id)
+        terminal = self.load_terminal_result(run_id)
+        if (
+            terminal is not None
+            and terminal.metadata.get("telemetry_valid") is True
+            and terminal.usage is not None
+        ):
+            raise OperationError(
+                "metered terminal result exists; use ordinary recovery"
+            )
+        claim_path = root / "claim.json"
+        order = lease = None
+        if claim_path.is_file():
+            claim = json.loads(claim_path.read_text())
+            order = CodingWorkOrder.from_dict(claim["work_order"])
+            if (
+                claim["run_id"] != run_id
+                or claim["fingerprint"] != fingerprint(order.to_dict())
+                or order.job_id != stop_proof.get("job_id")
+            ):
+                raise OperationError("quarantine coding claim identity mismatch")
+            order.validate_profile(self.profiles[order.profile_id])
+            driver = self.harnesses[order.harness]
+            workspace_path = root / "workspace.json"
+            if workspace_path.is_file():
+                lease = WorkspaceLease.from_dict(json.loads(workspace_path.read_text()))
+                if lease.job_id != order.job_id:
+                    raise OperationError("quarantine workspace identity mismatch")
+        else:
+            # START can be claimed immediately before the coding lease is
+            # created. An exact protected host attestation may retire this
+            # ghost too, while its unknown reservation remains outstanding.
+            if len(self.harnesses) != 1:
+                raise OperationError("quarantine cannot identify the contained harness")
+            driver = next(iter(self.harnesses.values()))
+        prove = getattr(driver, "prove_physical_quarantine", None)
+        if prove is None:
+            raise OperationError("coding harness lacks physical quarantine proof")
+        evidence = prove(
+            run_id,
+            order,
+            lease,
+            actor=actor,
+            event_id=event_id,
+            stop_proof=stop_proof,
+            start_hash=start_hash,
+        )
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = root / "quarantine.json"
+        if marker.exists():
+            existing = json.loads(marker.read_text())
+            if (
+                existing.get("actor") != actor
+                or existing.get("event_id") != event_id
+                or existing.get("start_hash") != start_hash
+                or existing.get("stop_proof_sha256") != evidence["stop_proof_sha256"]
+            ):
+                raise OperationError(
+                    "quarantine already belongs to another trusted event"
+                )
+            return existing
+        else:
+            self._write(marker, evidence)
+        return evidence
+
     async def recover_terminal(self, run_id: str) -> RunResult | None:
         """Finalize a proven durable SDK terminal result without starting a turn."""
         lock = self._recovery_locks.setdefault(run_id, asyncio.Lock())

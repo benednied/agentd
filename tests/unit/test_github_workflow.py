@@ -581,6 +581,7 @@ def test_pr_approval_uses_exact_head_injected_callback_not_issue_approval():
     [
         "<!-- agentd-status:abc -->\n\nagentd: READY",
         "<!-- agentd:selfhost-release-status:v1 -->\nAgentd release supervisor",
+        "<!-- agentd:host-abandon:abc -->\nAttempt physically retired",
     ],
 )
 def test_same_account_machine_status_is_ignored_as_feedback(body):
@@ -595,6 +596,20 @@ def test_same_account_machine_status_is_ignored_as_feedback(body):
         )
         assert len(store.github_controls("ignored")) == 1
         assert store.github_controls("pending") == []
+
+
+@pytest.mark.parametrize("body", ["/agentd abandon", "/agentd abandon run-1"])
+def test_host_retirement_control_does_not_submit_operations_issue_or_feedback(body):
+    source = Source(source_issue(created_at="2026-10-03T09:00:00Z"))
+    source.controls = [source_comment(body, number=86)]
+    with SQLiteStateStore() as store:
+        intake, _ = compose(store, source)
+        asyncio.run(intake.poll())
+        assert store.list_jobs() == []
+        controls = store.github_controls("ignored")
+        assert len(controls) == 1
+        assert controls[0]["reason"] == "handled by the trusted HP supervisor"
+        assert parse_control(body)[0] == "abandon"
 
 
 def test_unchanged_approval_reuses_provenance_and_actor_revocation_fences_it():

@@ -51,3 +51,29 @@ worker keeps the same configured durable session epoch. Deliberately rotating th
 epoch creates a new idempotency namespace. The journal does not make that external
 side effect SQLite-atomic. Cleanup after a terminal transaction is idempotent
 where practical; cleanup errors do not roll back the accepted lifecycle result.
+
+Remote coding first attempts bounded read-only terminal recovery. A saved SDK
+final usage marker plus the exact terminal `thread/read` history is sufficient;
+otherwise the protected native record must prove the exact latest completed
+turn and complete monotonic counters. Recovery verifies the pinned SDK/runtime,
+the original workspace and turn identity, and the current worker startup fence.
+It starts no new provider turn and never treats missing usage as zero.
+
+A genuinely interrupted attempt without final counters can be abandoned through
+an authenticated GitHub control event. The trusted host stops the exact worker
+container, checks that it is stopped with PID zero, and writes a protected
+attestation bound to the original job/run/START hash, node/session epoch,
+actor/event and container identity. The replacement worker checks the actual
+attestation file and holds the exact startup fence before recording an immutable
+retirement certificate. Retired claims remain in the journal and reject all
+duplicate STARTs; they cease to consume physical execution slots. Pending
+retirement replies recover through the same exact durable certificate.
+
+The controller atomically records `QUARANTINED` physical ownership and keeps the
+job and quota reservation in `METERING_PENDING`. Unknown counters, pool balances,
+usage history, original results, workspaces and delivered PR mappings are
+preserved. Cancellation or issue closure cannot settle this reservation or
+manufacture a result. Fresh issues can run using returned physical capacity and
+available unreserved quota. Missing, changed, malformed, symlinked or unfenced
+host proof blocks retirement; diagnostic worker status remains available while
+unknown claims prevent new starts.
