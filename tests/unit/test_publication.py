@@ -510,8 +510,13 @@ def test_bubblewrap_constructs_private_credential_free_boundary(tmp_path, monkey
         "/workspace",
     ]
     assert command.count("--bind") == 1
-    assert not any(path in command for path in ("/home", "/root", "/Users", "/etc"))
-    assert "/etc/ld.so.cache" in command
+    assert not any(path in command for path in ("/home", "/root", "/Users"))
+    loader = command.index("/opt/agentd/validation-loader")
+    assert command[loader - 1 : loader + 2] == [
+        "--ro-bind-try",
+        "/opt/agentd/validation-loader",
+        "/etc",
+    ]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")

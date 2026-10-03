@@ -101,6 +101,9 @@ COPY --chmod=0555 \
     tools/qualify_publication_sandbox.py \
     /opt/agentd/tools/
 COPY --chmod=0444 deploy/container/config.toml /opt/agentd/security/config.toml
+RUN install -d -m 0555 /opt/agentd/validation-loader \
+    && cp /etc/ld.so.cache /opt/agentd/validation-loader/ld.so.cache \
+    && chmod 0444 /opt/agentd/validation-loader/ld.so.cache
 
 ENV PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:/usr/local/bin:/usr/bin:/bin" \
     HOME="/home/bened" \

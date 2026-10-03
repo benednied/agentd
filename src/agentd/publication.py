@@ -658,7 +658,7 @@ class BubblewrapValidationRunner:
                 arguments.extend(("--ro-bind", str(mount), str(mount)))
         # Immutable loader metadata is needed by children that deliberately
         # replace their environment and cannot inherit LD_LIBRARY_PATH.
-        arguments.extend(("--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache"))
+        arguments.extend(("--ro-bind-try", "/opt/agentd/validation-loader", "/etc"))
         arguments.extend(
             (
                 "--bind",
