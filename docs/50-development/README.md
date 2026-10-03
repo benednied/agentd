@@ -9,3 +9,4 @@ standards, and the operational preservation contract.
 - [Pull-request writing](pull-request-writing.md)
 - [Pull-request review](pull-request-review.md)
 - [Review remediation](review-remediation.md)
+- [HP unattended self hosting plan](unattended-self-hosting-plan.md)
