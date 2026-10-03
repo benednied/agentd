@@ -41,6 +41,51 @@ def test_daemon_contains_one_tick_failure_and_keeps_serving() -> None:
     asyncio.run(scenario())
 
 
+def test_source_refresh_cadence_caches_failure_but_reconciles_runs() -> None:
+    async def scenario() -> None:
+        now = [datetime(2026, 8, 9, 12, tzinfo=UTC)]
+        source_calls = 0
+
+        class Plane:
+            reconciliations = 0
+            dispatches = 0
+
+            async def reconcile_managed_runs(self, _snapshot, *, at) -> tuple[()]:
+                del at
+                self.reconciliations += 1
+                return ()
+
+            async def dispatch_next(self):
+                self.dispatches += 1
+                return None
+
+        plane = Plane()
+
+        async def source() -> None:
+            nonlocal source_calls
+            source_calls += 1
+            if source_calls == 1:
+                raise RuntimeError("source unavailable")
+
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            clock=lambda: now[0],
+            source_reconciler=source,
+            source_poll_seconds=60,
+        )
+        assert await daemon.tick() is None
+        now[0] += timedelta(seconds=1)
+        assert await daemon.tick() is None
+        assert (
+            source_calls == 1 and plane.reconciliations == 2 and plane.dispatches == 0
+        )
+        now[0] += timedelta(seconds=60)
+        await daemon.tick()
+        assert source_calls == 2 and plane.dispatches == 1
+
+    asyncio.run(scenario())
+
+
 class RetryRecordingControlPlane:
     def __init__(self) -> None:
         self.dispatches = 0
@@ -186,3 +231,37 @@ def test_daemon_rejects_nonpositive_worker_heartbeat_interval() -> None:
         assert "worker_heartbeat_seconds" in str(error)
     else:
         raise AssertionError("nonpositive heartbeat interval was accepted")
+
+
+def test_drain_preserves_collection_and_publication_until_admission_resumes() -> None:
+    async def scenario() -> None:
+        class Plane:
+            dispatches = 0
+            collections = 0
+
+            async def reconcile_managed_runs(self, _snapshot, *, at):
+                self.collections += 1
+                return ()
+
+            async def dispatch_next(self):
+                self.dispatches += 1
+
+        plane = Plane()
+        enabled = False
+        publications = []
+
+        async def publish():
+            publications.append(True)
+
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            admission_enabled=lambda: enabled,
+            result_reconciler=publish,
+        )
+        await daemon.tick()
+        assert (plane.dispatches, plane.collections, len(publications)) == (0, 1, 1)
+        enabled = True
+        await daemon.tick()
+        assert (plane.dispatches, plane.collections, len(publications)) == (1, 2, 2)
+
+    asyncio.run(scenario())

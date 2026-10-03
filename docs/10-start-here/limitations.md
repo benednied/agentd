@@ -35,6 +35,11 @@ the limitations below are not commitments to future capabilities.
   automatic provider-side settlement.
 - The trusted deployment currently fixes Python 3.14, the `dev` extra, model
   `gpt-5.6-terra`, and reasoning effort `medium` at the production boundary.
-- SQLite schema version 4 bootstraps version 0 as version 1 and applies the
-  explicit `v1 -> v2 -> v3 -> v4` migration chain. Future schema changes still
+- SQLite schema version 5 bootstraps version 0 as version 1 and applies the
+  explicit `v1 -> v2 -> v3 -> v4 -> v5` migration chain. Version 5 adds GitHub
+  source observations and approval events. Future schema changes still
   require an idempotent migration before the version is increased.
+- A quota maximum is an observed-usage stop threshold, not a strict provider
+  spend cap. Batched token reports, cancellation latency, and in-flight work can
+  overshoot it. Final trusted usage is accounted in full; see
+  [quota behavior](../20-using-agentd/quotas.md).

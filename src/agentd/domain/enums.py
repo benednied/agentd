@@ -88,6 +88,7 @@ class ArtifactKind(StrEnum):
 class OperationKind(StrEnum):
     """Typed, non-shell operations a worker may execute."""
 
+    CODE = "code"
     BUILD_IMAGE = "build_image"
     DEPLOY_IMAGE = "deploy_image"
 

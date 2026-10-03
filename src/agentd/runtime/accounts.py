@@ -116,6 +116,38 @@ def snapshot_is_stale(
     return now - snapshot.observed_at > policy.snapshot_stale_after
 
 
+def unattended_provider_wait_reason(
+    snapshot: ProviderQuotaSnapshot | None,
+    *,
+    at: datetime | None = None,
+    policy: AccountPolicyThresholds = DEFAULT_ACCOUNT_POLICY,
+) -> str | None:
+    """Fail closed for unattended work without inventing token balances.
+
+    A reset timestamp passing is not evidence that the provider reset. Only a
+    fresh observation for the new window may authorize another admission.
+    """
+
+    if snapshot is None or snapshot.confidence <= 0:
+        return "quota_unknown"
+    now = at or utc_now()
+    if snapshot.observed_at > now or snapshot_is_stale(snapshot, at=now, policy=policy):
+        return "quota_stale"
+    if (
+        snapshot.reset_at is not None
+        and snapshot.observed_at < snapshot.reset_at <= now
+    ):
+        return "quota_stale"
+    if provider_quota_reached(snapshot):
+        return "quota_provider_pressure"
+    used = provider_used_percent(snapshot)
+    if used is None:
+        return "quota_unknown"
+    if used >= policy.background_block_used_percent:
+        return "quota_provider_pressure"
+    return None
+
+
 def provider_allows_qos(
     snapshot: ProviderQuotaSnapshot,
     qos: QoSClass,
@@ -125,6 +157,8 @@ def provider_allows_qos(
 ) -> bool:
     """Apply the provider account gate without converting credits to quota."""
 
+    if qos is QoSClass.SCAVENGER:
+        return unattended_provider_wait_reason(snapshot, at=at, policy=policy) is None
     if provider_quota_reached(snapshot):
         return False
     if snapshot_is_stale(snapshot, at=at, policy=policy):

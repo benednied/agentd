@@ -32,5 +32,6 @@ schema through `PRAGMA user_version`.
 
 The system has a small deployment footprint and strong local transaction semantics.
 Only one active scheduler is supported per database; there is no leader election.
-The current schema is version 4. Version 0 bootstraps the base schema as version 1;
-the explicit idempotent upgrade chain is `v1 -> v2 -> v3 -> v4`.
+The current schema is version 5. Version 0 bootstraps the base schema as version 1;
+the explicit idempotent upgrade chain is `v1 -> v2 -> v3 -> v4 -> v5`. Version 5 adds durable GitHub source
+observations and approval events.

@@ -8,6 +8,7 @@ requiring knowledge of the internal implementation.
 - [Quotas and resources](quotas.md)
 - [Workspaces](workspaces.md)
 - [Review and repair](review-and-repair.md)
+- [GitHub issues to draft pull requests](../40-operations/github-coding.md)
 
 For exact command syntax, see the [CLI reference](../80-reference/cli.md). For
 implementation ownership, see [architecture](../30-architecture/).

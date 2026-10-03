@@ -316,7 +316,8 @@ def test_v3_migration_drops_digest_unique_and_preserves_artifacts(tmp_path) -> N
         connection.execute("PRAGMA user_version = 3")
 
     store = SQLiteStateStore(path)
-    assert store.schema_version == SCHEMA_VERSION == 4
+    assert store.schema_version == SCHEMA_VERSION
+    assert SCHEMA_VERSION >= 4
     assert (
         store._connection.execute(
             "SELECT COUNT(*) FROM artifacts WHERE id = 'legacy-artifact'"

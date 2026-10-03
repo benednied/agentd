@@ -22,6 +22,11 @@ from agentd.domain.models import (
 )
 from agentd.domain.transitions import transition_job
 from agentd.observability import event_logger
+from agentd.runtime.accounts import (
+    DEFAULT_ACCOUNT_POLICY,
+    AccountPolicyThresholds,
+    unattended_provider_wait_reason,
+)
 from agentd.state.base import ConcurrentStateError, StateStore
 
 _MAX_OPTIMISTIC_ATTEMPTS = 8
@@ -30,7 +35,9 @@ _MAX_OPTIMISTIC_ATTEMPTS = 8
 class QuotaAdmissionError(RuntimeError):
     """Raised when a job cannot reserve its required schedulable quota."""
 
-    pass
+    def __init__(self, message: str, *, reason: str = "quota_insufficient") -> None:
+        self.reason = reason
+        super().__init__(message)
 
 
 class QuotaMaximumExceeded(RuntimeError):
@@ -47,8 +54,42 @@ class QuotaMaximumExceeded(RuntimeError):
 class QuotaManager:
     """Treat provider or subscription quota as a schedulable resource."""
 
-    def __init__(self, store: StateStore) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        account_policy: AccountPolicyThresholds = DEFAULT_ACCOUNT_POLICY,
+    ) -> None:
         self._store = store
+        self._account_policy = account_policy
+
+    def wait_reason(self, job: Job) -> str | None:
+        """Current machine-readable admission gate, reconstructed from durable state."""
+
+        if job.qos is QoSClass.SCAVENGER:
+            if job.quota_budget.maximum is None:
+                return "quota_unbounded"
+            reason = unattended_provider_wait_reason(
+                self._store.latest_provider_quota_snapshot(job.quota_budget.pool_id),
+                policy=self._account_policy,
+            )
+            if reason is not None:
+                return reason
+        try:
+            pool = self._store.get_quota_pool(job.quota_budget.pool_id)
+        except LookupError:
+            return "quota_unknown"
+        if pool.mode is QuotaMode.EMERGENCY_CONSERVE and job.qos not in {
+            QoSClass.INTERACTIVE,
+            QoSClass.BLOCKER,
+        }:
+            return "quota_provider_pressure"
+        existing = self._store.find_active_reservation(job.id)
+        if existing is None and job.quota_budget.expected_path > self.available_for(
+            job, pool
+        ):
+            return "quota_insufficient"
+        return None
 
     def reserve(self, job: Job) -> QuotaReservation:
         required = job.quota_budget.expected_path
@@ -62,6 +103,12 @@ class QuotaManager:
                 self._validate_existing(job, required, existing)
                 return existing
 
+            if job.qos is QoSClass.SCAVENGER:
+                reason = self.wait_reason(job)
+                if reason is not None:
+                    raise QuotaAdmissionError(
+                        f"Unattended job {job.id} must wait: {reason}", reason=reason
+                    )
             pool = self._store.get_quota_pool(job.quota_budget.pool_id)
             if job.quota_budget.unit is not pool.unit:
                 raise QuotaAdmissionError(
@@ -222,6 +269,15 @@ class QuotaManager:
         reservation = self._store.get_reservation(reservation_id)
         job = self._store.get_job(reservation.job_id)
         pool = self._store.get_quota_pool(reservation.pool_id)
+        if job.qos is QoSClass.SCAVENGER:
+            reason = unattended_provider_wait_reason(
+                self._store.latest_provider_quota_snapshot(reservation.pool_id),
+                policy=self._account_policy,
+            )
+            if reason is not None:
+                raise QuotaAdmissionError(
+                    f"Unattended job {job.id} cannot top up: {reason}", reason=reason
+                )
         minimum_dispatchable = (
             0
             if job.qos in {QoSClass.INTERACTIVE, QoSClass.BLOCKER}

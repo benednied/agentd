@@ -10,3 +10,6 @@ or the exact contracts in [Reference](../80-reference/).
 - [Worker backends](worker-backends.md)
 - [Harnesses](harnesses.md)
 - [Recovery](recovery.md)
+- [Unattended quota admission](unattended-quota.md)
+- [Trusted draft publication](draft-publication.md)
+- [GitHub coding qualification evidence](issue-66-qualification.md)

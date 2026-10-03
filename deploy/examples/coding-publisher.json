@@ -1,0 +1,59 @@
+{
+  "profile": {
+    "id": "repository",
+    "version": "1",
+    "repository": "example/repository",
+    "clone_url": "https://github.com/example/repository.git",
+    "harnesses": [
+      "codex"
+    ],
+    "required_capabilities": [
+      "remote-coding"
+    ],
+    "validation_commands": [
+      [
+        "git",
+        "diff",
+        "--check"
+      ]
+    ],
+    "max_runtime_seconds": 3600,
+    "validation_timeout_seconds": 900,
+    "network_policy": "disabled",
+    "preparation_strategy": "git-worktree",
+    "filesystem_policy": "workspace-write"
+  },
+  "repository_id": 123456789,
+  "base_commit": "0000000000000000000000000000000000000000",
+  "base_branch": "main",
+  "account_pool": "codex",
+  "expected_tokens": 50000,
+  "maximum_tokens": 100000,
+  "database": "/home/bened/.local/state/agentd/controller/state.sqlite",
+  "object_cache": "/home/bened/.local/state/agentd/publication-cache/repo.git",
+  "unused_workspace_root": "/home/bened/.local/state/agentd/controller/unused-workspaces",
+  "quota_command": [
+    "/opt/agentd/venv/bin/agentd",
+    "--db",
+    "/home/bened/.local/state/agentd/controller/state.sqlite",
+    "codex-status",
+    "--pool",
+    "codex"
+  ],
+  "poll_interval_seconds": 5,
+  "publication_enabled": true,
+  "worker": {
+    "name": "coding-worker",
+    "host": "coding-worker",
+    "port": 38101,
+    "node_id": "coding-worker",
+    "session_epoch": "production",
+    "psk_file": "/home/bened/.local/state/agentd/transport/worker.psk",
+    "tls_ca": "/home/bened/.local/state/agentd/transport/worker.crt",
+    "server_hostname": "coding-worker",
+    "features": [
+      "coding-checkpoints"
+    ]
+  },
+  "source_poll_seconds": 60
+}

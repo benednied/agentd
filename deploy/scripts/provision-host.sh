@@ -98,6 +98,12 @@ install -d -o 1000 -g 1000 -m 0700 "$unit_dir"
 install -o 1000 -g 1000 -m 0644 \
     "$SCRIPT_DIR/../systemd/$AGENTD_SERVICE" \
     "$unit_dir/$AGENTD_SERVICE"
+if [ "${AGENTD_PROFILE:-goldenage}" = goldenage ]; then
+    for coding_unit in agentd-worker.service agentd-publisher.service agentd-coding-controller.service; do
+        install -o 1000 -g 1000 -m 0644 \
+            "$SCRIPT_DIR/../systemd/$coding_unit" "$unit_dir/$coding_unit"
+    done
+fi
 
 printf '%s\n' \
     "Provisioned exact agentd paths, $config_status reviewed config.toml, and auth.json." \

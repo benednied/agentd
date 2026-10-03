@@ -1,13 +1,19 @@
 """Minimal asynchronous scheduler loop for embedding in a local daemon process."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Protocol, runtime_checkable
 
 from agentd.domain.enums import JobState
-from agentd.domain.models import Job, ProviderQuotaSnapshot, RunRecord, utc_now
+from agentd.domain.models import (
+    CodingOperation,
+    Job,
+    ProviderQuotaSnapshot,
+    RunRecord,
+    utc_now,
+)
 from agentd.observability import event_logger
 from agentd.runtime.codex_oracle import AccountOracle
 from agentd.runtime.reset import detect_provider_reset, reset_event_for_decision
@@ -59,6 +65,10 @@ class AgentDaemon:
         provider_reset_remaining: float | None = None,
         clock: Callable[[], datetime] = utc_now,
         on_error: Callable[[Exception], None] | None = None,
+        source_reconciler: Callable[[], Awaitable[object]] | None = None,
+        source_poll_seconds: float | None = None,
+        result_reconciler: Callable[[], Awaitable[object]] | None = None,
+        admission_enabled: Callable[[], bool] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -72,11 +82,23 @@ class AgentDaemon:
             raise ValueError("account_poll_seconds must be positive")
         if worker_heartbeat_seconds <= 0:
             raise ValueError("worker_heartbeat_seconds must be positive")
+        if source_poll_seconds is not None and (
+            not isfinite(source_poll_seconds) or source_poll_seconds <= 0
+        ):
+            raise ValueError("source_poll_seconds must be positive")
         if provider_reset_remaining is not None and (
             not isfinite(provider_reset_remaining) or provider_reset_remaining < 0
         ):
             raise ValueError("provider_reset_remaining must be finite and non-negative")
         self._control_plane = control_plane
+        self._source_reconciler = source_reconciler
+        self._source_poll = (
+            timedelta(seconds=source_poll_seconds)
+            if source_poll_seconds is not None
+            else None
+        )
+        self._result_reconciler = result_reconciler
+        self._admission_enabled = admission_enabled
         self._poll_interval = poll_interval
         self._dispatch_retry_base_seconds = dispatch_retry_base_seconds
         self._dispatch_retry_max_seconds = dispatch_retry_max_seconds
@@ -91,6 +113,8 @@ class AgentDaemon:
         self._last_error: Exception | None = None
         self._last_account_refresh: datetime | None = None
         self._last_worker_heartbeat: datetime | None = None
+        self._last_source_refresh: datetime | None = None
+        self._source_refresh_failed = False
         self._account_snapshot: ProviderQuotaSnapshot | None = None
         self._refreshed_admissions: set[str] = set()
 
@@ -103,6 +127,25 @@ class AgentDaemon:
     async def tick(self) -> RunRecord | None:
         now = self._clock()
         await self._refresh_worker_heartbeats(now)
+        source_failed = self._source_refresh_failed
+        should_refresh_source = self._source_reconciler is not None and (
+            self._source_poll is None
+            or self._last_source_refresh is None
+            or now - self._last_source_refresh >= self._source_poll
+        )
+        if should_refresh_source and self._source_reconciler is not None:
+            try:
+                await self._source_reconciler()
+                self._source_refresh_failed = False
+                source_failed = False
+            except Exception as error:
+                self._record_error(error, operation="source_refresh")
+                self._source_refresh_failed = True
+                source_failed = True
+            finally:
+                self._last_source_refresh = now
+        # Intake may create READY work in this tick. Include it in the
+        # pre-admission refresh instead of using the previous poll's balance.
         admission_keys = self._codex_admission_keys()
         self._refreshed_admissions.intersection_update(admission_keys)
         has_new_admission = not admission_keys.issubset(self._refreshed_admissions)
@@ -159,7 +202,18 @@ class AgentDaemon:
             await self._control_plane.reconcile_managed_runs(
                 self._account_snapshot, at=now
             )
+        if source_failed:
+            # Still collect and meter existing runs, but never launch or publish
+            # against authority that could not be refreshed.
+            return None
+        if self._result_reconciler is not None:
+            try:
+                await self._result_reconciler()
+            except Exception as error:
+                self._record_error(error, operation="result_publication")
         if self._dispatch_retry_at is not None and now < self._dispatch_retry_at:
+            return None
+        if self._admission_enabled is not None and not self._admission_enabled():
             return None
         try:
             dispatched = await self._control_plane.dispatch_next()
@@ -312,6 +366,10 @@ class AgentDaemon:
             f"ready:{job.id}"
             for job in self._control_plane.list_jobs(frozenset({JobState.READY}))
             if "codex" in job.allowed_harnesses
+            or (
+                isinstance(job.operation, CodingOperation)
+                and job.operation.work_order.harness == "codex"
+            )
         }
         for command in self._control_plane.store.list_pending_run_commands():
             if command.action != "repair":

@@ -143,8 +143,8 @@ class RemoteWorkerBackend:
             self._healthy = False
             raise
 
-    async def observe(self, run: RunHandle | str) -> RunObservation | None:
-        return await self._client.observe(self._remote_run_id(run))
+    async def observe(self, run_id: RunHandle | str) -> RunObservation | None:
+        return await self._client.observe(self._remote_run_id(run_id))
 
     async def steer(self, run: RunHandle | str, instruction: str) -> None:
         await self._client.steer(

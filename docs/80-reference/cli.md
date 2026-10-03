@@ -42,6 +42,22 @@ uv run agentd --db PATH usage --run RUN_ID
 | `quota` | `pool_id` | none |
 | `usage` | none | exactly one of `--job JOB_ID`, `--run RUN_ID` |
 
+### Authorized GitHub coding
+
+```bash
+uv run agentd github --config PATH approve 123 --actor operator
+uv run agentd github --config PATH serve
+uv run agentd github --config PATH status
+```
+
+`github --config` selects the trusted controller JSON, including its database;
+global `--db` and `--workspace-root` do not override that configuration. Approval
+records the exact currently eligible issue revision and queues one logical job.
+Serving continuously discovers and reconciles work through the existing scheduler.
+Status inspects local job/run/publication outcomes without worker access.
+See [Authorized GitHub coding](../40-operations/github-coding.md) for configuration,
+containment prerequisites, quota waits, and restart semantics.
+
 ### Register a quota pool
 
 ```bash

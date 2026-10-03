@@ -1,0 +1,171 @@
+{
+  "scope": "real-remote-issue-to-draft-with-controlled-response-loss",
+  "issue": "https://github.com/benednied/agentd/issues/74",
+  "source_revision": "ac67ac634f0c818030c233cb5d79a0384388005468a23780452d7af348321ee5",
+  "approved_revision": "ac67ac634f0c818030c233cb5d79a0384388005468a23780452d7af348321ee5",
+  "job_id": "github-052911929abebf566a669d7c5d4946ce",
+  "run_id": "46d57b32-3f41-4947-a9d8-aeb90b5f3326",
+  "job_count_for_issue": 1,
+  "run_count_for_issue": 1,
+  "controller_total_jobs": 3,
+  "controller_total_runs": 3,
+  "work_order_fingerprint": "0be17d8863e30b863e7bfdd0080a49b99d52c1bee9d746f119ba2a8894c61b84",
+  "profile_digest": "883800cc8f248cd7e91a8f83ce3113ebf99f93005c96d137012b590bf21036c5",
+  "base_commit": "f7d4f08f280080e14c434293c99034ba06216b6f",
+  "result_commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af",
+  "job_state": "REVIEW",
+  "run_state": "COMPLETED",
+  "provider_outcome": "completed",
+  "run_started_at": "2026-09-18T16:03:01.852840+00:00",
+  "run_ended_at": "2026-09-18T16:03:31.791165+00:00",
+  "run_elapsed_seconds": 29.938,
+  "runtime_limit_seconds": 180,
+  "maximum_tokens": 140000.0,
+  "actual_tokens": 62439,
+  "usage": {
+    "input_tokens": 61546,
+    "cached_input_tokens": 44288,
+    "output_tokens": 893,
+    "reasoning_output_tokens": 124
+  },
+  "reservation": {
+    "job_id": "github-052911929abebf566a669d7c5d4946ce",
+    "pool_id": "qualification-account",
+    "amount": 60000.0,
+    "id": "4b8438aa-1817-4ec5-9cdf-2c466dc7711b",
+    "state": "RELEASED",
+    "consumed": 62439.0,
+    "debt": 0.0,
+    "unit": "tokens",
+    "created_at": "2026-09-18T16:03:01.848577+00:00",
+    "released_at": "2026-09-18T16:03:31.793294+00:00"
+  },
+  "admission": {
+    "provider_used_percent": 77.0,
+    "observed_at": "2026-09-18T16:03:00.906135+00:00",
+    "confidence": 1.0,
+    "provider_reached": false,
+    "credits_exhausted": false,
+    "configured_background_block_used_percent": 85,
+    "normal_default_background_block_used_percent": 75,
+    "configuration_authority": "User explicitly authorized available token spending for supervised remote qualification; no issue-text authority",
+    "previous_default_policy_wait_observed": true
+  },
+  "publication": {
+    "stage": "published",
+    "validation": [
+      {
+        "command": [
+          "/usr/bin/git",
+          "diff",
+          "--check",
+          "f7d4f08f280080e14c434293c99034ba06216b6f",
+          "HEAD"
+        ],
+        "commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af",
+        "returncode": 0,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "from pathlib import Path; import subprocess; assert subprocess.check_output(['/usr/bin/git','diff','--name-only','f7d4f08f280080e14c434293c99034ba06216b6f','HEAD'],text=True).splitlines()==['docs/20-using-agentd/README.md']; assert 'Generated draft pull requests require human review before merge. Draft publication does not authorize agentd to merge a change.' in Path('docs/20-using-agentd/README.md').read_text()"
+        ],
+        "commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af",
+        "returncode": 0,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "github_lookup": [
+      {
+        "baseRefName": "master",
+        "headRefOid": "6bda19b061b33c2eb6ec383f7a1058ebab8585af",
+        "isDraft": true,
+        "number": 75,
+        "url": "https://github.com/benednied/agentd/pull/75"
+      }
+    ],
+    "injected_lost_response_after_real_effect": [
+      {
+        "action": "create-draft",
+        "job_id": "github-052911929abebf566a669d7c5d4946ce",
+        "result_commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af"
+      },
+      {
+        "action": "push",
+        "job_id": "github-052911929abebf566a669d7c5d4946ce",
+        "result_commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af"
+      }
+    ]
+  },
+  "controller_replay": {
+    "issue": "https://github.com/benednied/agentd/issues/74",
+    "source_revision": "ac67ac634f0c818030c233cb5d79a0384388005468a23780452d7af348321ee5",
+    "job_id": "github-052911929abebf566a669d7c5d4946ce",
+    "job_count": 1,
+    "run_count": 1,
+    "controller_job_count": 3,
+    "controller_run_count": 3,
+    "job_state": "REVIEW",
+    "run_id": "46d57b32-3f41-4947-a9d8-aeb90b5f3326",
+    "worker_id": "qualification-worker",
+    "base_commit": "f7d4f08f280080e14c434293c99034ba06216b6f",
+    "result_commit": "6bda19b061b33c2eb6ec383f7a1058ebab8585af",
+    "consumed_tokens": 62439,
+    "maximum_tokens": 140000,
+    "quota_ceiling_exceeded": false,
+    "profile_digest": "883800cc8f248cd7e91a8f83ce3113ebf99f93005c96d137012b590bf21036c5",
+    "pr": "https://github.com/benednied/agentd/pull/75",
+    "draft": true,
+    "runtime_seconds": 3.62,
+    "source_commit": "ea2ae99f9bbe72c365a502dcb9363af991873c16",
+    "worker_source_commit": "40b74fd1ea4a6d84f095ed96986f69e424795930",
+    "error_type": null
+  },
+  "worker_after_replay": {
+    "sdk_run_ids": [
+      "d0ee6516-7b88-406a-a168-01f21776759d",
+      "46d57b32-3f41-4947-a9d8-aeb90b5f3326"
+    ],
+    "sdk_sessions": [
+      {
+        "run_id": "d0ee6516-7b88-406a-a168-01f21776759d",
+        "active": false
+      },
+      {
+        "run_id": "46d57b32-3f41-4947-a9d8-aeb90b5f3326",
+        "active": false
+      }
+    ]
+  },
+  "account": {
+    "remaining": 82571.0,
+    "reserved": 0.0,
+    "retained_debt": 5010.0,
+    "prior_cancelled_run_tokens": 65010,
+    "success_run_tokens": 62439,
+    "reset_credit_consumed": false,
+    "total_tokens_for_three_issue_fixtures": 127449
+  },
+  "controller_commit": "ea2ae99f9bbe72c365a502dcb9363af991873c16",
+  "worker_commit": "40b74fd1ea4a6d84f095ed96986f69e424795930",
+  "first_controller_invocation_seconds": 46.78,
+  "cleanup": {
+    "dedicated_worker_stop_count": 1,
+    "durable_state_retained": true,
+    "dedicated_tunnel_stopped": true
+  },
+  "retention": {
+    "run_id": "46d57b32-3f41-4947-a9d8-aeb90b5f3326",
+    "release_called_twice": true,
+    "workspaces_removed": true,
+    "bundle_removed": true,
+    "claim_retained": true,
+    "immutable_result_retained": true,
+    "worker_journal_retained": true,
+    "provider_calls": 0
+  }
+}

@@ -106,11 +106,36 @@ class OpenAICodexClient:
         environment: Mapping[str, str] | None = None,
         codex_bin: str | None = None,
         cwd: str | None = None,
+        isolated_environment: bool = False,
     ) -> None:
         if installed_sdk_version != PINNED_OPENAI_CODEX_VERSION:
             raise RuntimeError(
                 "Unsupported openai-codex SDK version "
                 f"{installed_sdk_version!r}; expected {PINNED_OPENAI_CODEX_VERSION!r}"
+            )
+        launch_args: tuple[str, ...] | None = None
+        if isolated_environment:
+            from codex_cli_bin import bundled_codex_path
+
+            explicit_environment = dict(environment or {})
+            if any(
+                "=" in key or "\0" in key or "\0" in value
+                for key, value in explicit_environment.items()
+            ):
+                raise ValueError("isolated SDK environment is invalid")
+            # SDK 0.144.4 normally overlays env on os.environ. Start through env
+            # -i so model subprocesses cannot inherit controller/worker secrets.
+            launch_args = (
+                "/usr/bin/env",
+                "-i",
+                *(
+                    f"{key}={value}"
+                    for key, value in sorted(explicit_environment.items())
+                ),
+                str(codex_bin or bundled_codex_path()),
+                "app-server",
+                "--listen",
+                "stdio://",
             )
         self._client = AsyncCodexClient(
             CodexConfig(
@@ -120,6 +145,7 @@ class OpenAICodexClient:
                 client_name="agentd",
                 client_title="agentd control plane",
                 experimental_api=True,
+                launch_args_override=launch_args,
             )
         )
         self._metadata: AppServerMetadata | None = None
