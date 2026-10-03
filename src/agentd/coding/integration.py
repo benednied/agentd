@@ -444,6 +444,8 @@ class GitHubIntegrationReconciler:
             publication = self.ledger.get(job.id)
             if publication is None or publication["stage"] != "published":
                 continue
+            if publication["intent"]["repository"] != self.repository:
+                continue
             old = self.get(job.id)
             if old and old["stage"] == "merged":
                 continue

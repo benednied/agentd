@@ -27,12 +27,16 @@ TARGETS = {
         "/home/bened/.local/state/agentd/publication-cache": False,
     },
 }
+REPOSITORY_RUNTIME = "/opt/agentd/repository-runtime"
+TOOLCHAIN_ROOT = "/home/bened/.local/share/agentd-selfhost/toolchains/"
 
 
 def validate(config: dict) -> None:
     assert config["name"] == "agentd-selfhost-coding", "Unexpected deployment identity"
     assert set(config["services"]) == set(TARGETS), "Unexpected service"
-    for name, expected in TARGETS.items():
+    toolchains = {}
+    for name, required in TARGETS.items():
+        expected = dict(required)
         service = config["services"][name]
         assert service["user"] == "1000:1000" and service["read_only"]
         assert not service.get("privileged") and not service.get("ports")
@@ -59,9 +63,20 @@ def validate(config: dict) -> None:
                 )
             )
             assert volume["target"] not in actual, "Duplicate mount target"
+            if volume["target"] == REPOSITORY_RUNTIME:
+                assert name in {"coding-worker", "coding-publisher"}
+                assert source.startswith(TOOLCHAIN_ROOT) and ".." not in source.split(
+                    "/"
+                ), "Repository runtime must come from protected toolchains"
+                assert volume.get("read_only") is True, "Writable repository runtime"
+                expected[REPOSITORY_RUNTIME] = True
+                toolchains[name] = source
             actual[volume["target"]] = volume.get("read_only", False)
         assert actual == expected, "Unexpected mount or mount authority"
         assert service["healthcheck"].get("test"), "Missing liveness check"
+    if toolchains:
+        assert set(toolchains) == {"coding-worker", "coding-publisher"}
+        assert len(set(toolchains.values())) == 1, "Repository runtimes differ"
 
 
 if __name__ == "__main__":

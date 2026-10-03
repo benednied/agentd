@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
+from agentd.domain.enums import JobState
 from agentd.domain.models import Job
 from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.service import ControlPlane
@@ -55,7 +56,12 @@ class GitHubIntake:
             old = SourceIssue.from_dict(json.loads(record["payload"]))
             policy = self.policies.get(old.repository)
             if policy is None:
-                await self.control_plane.cancel(job.id)
+                # A repository switch retains historical jobs and delivery.
+                # Global run reconciliation still owns any outstanding attempt.
+                if job.state in {JobState.READY, JobState.ADMITTED} or (
+                    self.store.find_active_run(job.id) is not None
+                ):
+                    await self.control_plane.cancel(job.id)
                 continue
             current = await asyncio.to_thread(
                 self.source.get, old.repository, old.number

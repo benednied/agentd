@@ -23,6 +23,7 @@ from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.daemon import AgentDaemon
 from agentd.domain.enums import JobState, QuotaUnit, RunState
 from agentd.domain.models import (
+    CodingOperation,
     EffortEstimate,
     ProviderQuotaSnapshot,
     QuotaBudget,
@@ -223,7 +224,7 @@ def create_publications(
     )
 
 
-def _published_subjects(store: SQLiteStateStore) -> dict[int, str]:
+def _published_subjects(store: SQLiteStateStore, repository: str) -> dict[int, str]:
     """Map only recorded publication URLs back to their logical source job."""
     ledger = PublicationStore(store.path)
     result = {}
@@ -232,7 +233,8 @@ def _published_subjects(store: SQLiteStateStore) -> dict[int, str]:
         if row is None or row.get("delivery") is None:
             continue
         url = row["delivery"]["pr_url"]
-        repository = row["intent"]["repository"]
+        if row["intent"]["repository"] != repository:
+            continue
         prefix = f"https://github.com/{repository}/pull/"
         if url.startswith(prefix) and url[len(prefix) :].isdecimal():
             result[int(url[len(prefix) :])] = job.id
@@ -248,7 +250,9 @@ async def serve_publisher(config: dict[str, Any]) -> None:
         intake = create_intake(config, store)
         backlog = create_backlog(config, intake) if config.get("backlog") else None
         publications = create_publications(config, store, intake, backlog)
-        reporter = GitHubStatusReporter(store, GitHubStatusAdapter())
+        reporter = GitHubStatusReporter(
+            store, GitHubStatusAdapter(), repository=config["profile"]["repository"]
+        )
         integrations = (
             GitHubIntegrationReconciler(
                 store,
@@ -280,7 +284,9 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                         print(json.dumps(result, sort_keys=True), flush=True)
                     last_integration_poll = time.monotonic()
                 if config.get("standing_github_policy"):
-                    reporter.enqueue(status(store))
+                    reporter.enqueue(
+                        status(store, repository=config["profile"]["repository"])
+                    )
                     await reporter.publish_pending()
                 runtime_health.pulse("publisher")
                 with suppress(TimeoutError):
@@ -374,7 +380,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         )
         publications = create_publications(config, store, intake, backlog)
         runtime_health = RuntimeHealthStore(config["database"])
-        reporter = GitHubStatusReporter(store, GitHubStatusAdapter())
+        reporter = GitHubStatusReporter(
+            store, GitHubStatusAdapter(), repository=profile.repository
+        )
         repairs = CodingRepairReconciler(
             store,
             publications,
@@ -404,7 +412,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 StandingGitHubPolicy.from_dict(policy_config),
                 feedback=repairs.request_feedback,
                 approve_pr=integrations.approve_pr if integrations else None,
-                published_subjects=lambda: _published_subjects(store),
+                published_subjects=lambda: _published_subjects(
+                    store, profile.repository
+                ),
             )
             intake.workflow = workflow
         budget_policy = (
@@ -430,6 +440,11 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 )
                 if unattended_provider_wait_reason(snapshot, policy=policy) is None:
                     for job in store.list_jobs(frozenset({JobState.SUSPENDED})):
+                        if (
+                            not isinstance(job.operation, CodingOperation)
+                            or job.operation.work_order.repository != profile.repository
+                        ):
+                            continue
                         if store.github_job_held(job.id):
                             continue
                         if len(store.list_runs(job.id)) >= config.get(
@@ -482,8 +497,8 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 await repairs.reconcile()
             if workflow is not None:
                 await workflow.apply_pending()
-                reporter.enqueue(status(store))
-            for item in status(store):
+                reporter.enqueue(status(store, repository=profile.repository))
+            for item in status(store, repository=profile.repository):
                 item["quota_wait_reason"] = coordinator.quota_wait_reason(
                     item["job_id"]
                 )
@@ -518,7 +533,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             del error
             runtime_health.pulse("controller", state="ownership_blocked")
             if workflow is not None:
-                reports = status(store)
+                reports = status(store, repository=profile.repository)
                 for report in reports:
                     report["blocked_reason"] = "Execution ownership is unresolved"
                 reporter.enqueue(reports)
@@ -526,7 +541,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         def report_error(error: Exception) -> None:
             runtime_health.pulse("controller", state="retrying")
             if workflow is not None:
-                reports = status(store)
+                reports = status(store, repository=profile.repository)
                 for report in reports:
                     report["blocked_reason"] = (
                         "Controller is retrying after " + type(error).__name__
@@ -578,7 +593,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         raise
 
 
-def status(store: SQLiteStateStore) -> list[dict[str, Any]]:
+def status(
+    store: SQLiteStateStore, *, repository: str | None = None
+) -> list[dict[str, Any]]:
     """Safe identities and outcomes, without raw issue text or credentials."""
     result = []
     publication_store = PublicationStore(store.path)
@@ -596,6 +613,11 @@ def status(store: SQLiteStateStore) -> list[dict[str, Any]]:
     for job in store.list_jobs():
         source = store.github_source_for_job(job.id)
         if source is None:
+            continue
+        if (
+            repository is not None
+            and json.loads(source["payload"])["repository"] != repository
+        ):
             continue
         run = store.latest_run(job.id)
         publication = publication_store.get(job.id)

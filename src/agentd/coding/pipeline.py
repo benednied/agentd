@@ -48,6 +48,8 @@ class CodingPublicationReconciler:
         for job in self.store.list_jobs(frozenset({JobState.REVIEW})):
             if not isinstance(job.operation, CodingOperation):
                 continue
+            if job.operation.work_order.repository not in self.repositories:
+                continue
             # A published ledger row is terminal.  It may outlive the profile
             # that produced it (for example after a Mac-to-Linux deployment
             # change), so do not reconstruct the old intent or revalidate it.
@@ -234,6 +236,12 @@ class CodingRepairReconciler:
     async def reconcile(self) -> tuple[dict[str, Any], ...]:
         results = []
         for job in self.store.list_jobs(frozenset({JobState.FAILED})):
+            if (
+                not isinstance(job.operation, CodingOperation)
+                or job.operation.work_order.repository
+                not in self.publications.repositories
+            ):
+                continue
             run = self.store.latest_run(job.id)
             if (
                 not isinstance(job.operation, CodingOperation)
@@ -259,6 +267,12 @@ class CodingRepairReconciler:
                 }
             results.append(result)
         for job in self.store.list_jobs(frozenset({JobState.REVIEW})):
+            if (
+                not isinstance(job.operation, CodingOperation)
+                or job.operation.work_order.repository
+                not in self.publications.repositories
+            ):
+                continue
             publication = self.ledger.get(job.id)
             run = self.store.latest_run(job.id)
             if (
@@ -329,6 +343,14 @@ class CodingRepairReconciler:
         event_id: str,
     ) -> dict[str, Any]:
         reason = f"Bounded coding repair requested by {actor}; event {event_id}"
+        job = self.store.get_job(job_id)
+        if (
+            not isinstance(job.operation, CodingOperation)
+            or job.operation.work_order.repository not in self.publications.repositories
+        ):
+            raise LifecycleError(
+                "Coding feedback repository is outside the current policy"
+            )
         if any(
             transition.to_state is JobState.READY and transition.reason == reason
             for transition in self.store.list_transitions(job_id)

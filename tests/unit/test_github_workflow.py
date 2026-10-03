@@ -1,7 +1,7 @@
 """Standing approval, durable controls, and publication response ambiguity."""
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -127,6 +127,139 @@ def compose(store, source, **workflow_options):
     )
     intake.workflow = workflow
     return intake, workflow
+
+
+def test_repository_switch_preserves_history_and_scopes_pr_numbers_and_controls(
+    tmp_path,
+):
+    from agentd.coding.controller import _published_subjects, status
+    from agentd.domain.models import QuotaPool
+    from agentd.publication import PublicationIntent, PublicationStore
+
+    class CurrentSource(Source):
+        def __init__(self, issue):
+            super().__init__(issue)
+            self.review_subjects = []
+
+        def reviews(self, repository, number):
+            # The old repository's PR 99 is absent in the current repository.
+            assert (repository, number) == ("owner/repo", 8)
+            self.review_subjects.append((repository, number))
+            return ()
+
+    def delivered(store, issue, number):
+        policy = IntakePolicy(issue.repository, issue.repository_id, None)
+        store.observe_github_issue(issue, policy)
+        store.approve_github_issue(issue, policy, actor="trusted-fixture")
+        job = store.create_github_job(issue, compile_job(issue))
+        for state in (JobState.ADMITTED, JobState.RUNNING, JobState.REVIEW):
+            updated, event = transition_job(job, state, "fixture delivery")
+            store.save_job(updated, event, expected=job)
+            job = updated
+        ledger = PublicationStore(store.path)
+        intent = PublicationIntent(
+            job.id,
+            issue.repository,
+            issue.number,
+            issue.revision,
+            "master",
+            "a" * 40,
+            "b" * 40,
+            "worker",
+            "run-" + job.id,
+            "v1",
+            (("true",),),
+        )
+        ledger.bind(intent)
+        ledger.save(
+            intent,
+            "published",
+            evidence=[{"returncode": 0}],
+            pr={"url": f"https://github.com/{issue.repository}/pull/{number}"},
+        )
+        return job
+
+    with SQLiteStateStore(tmp_path / "state.sqlite") as store:
+        old = delivered(
+            store,
+            source_issue(repository="owner/old", repository_id=41, node_id="I_old"),
+            8,
+        )
+        absent = delivered(
+            store,
+            source_issue(
+                repository="owner/old", repository_id=41, number=9, node_id="I_9"
+            ),
+            99,
+        )
+        current = delivered(store, source_issue(), 8)
+        pool = store.register_quota_pool(QuotaPool("codex", "codex", 77, debt=4))
+        old_transitions = store.list_transitions(old.id)
+        old_control = source_comment("/agentd cancel", identity=17, number=8)
+        store.record_github_control("github:41:comment:17", 8, asdict(old_control))
+        source = CurrentSource(source_issue())
+        source.controls = [source_comment("/agentd pause", number=8)]
+        intake, _ = compose(
+            store,
+            source,
+            published_subjects=lambda: _published_subjects(store, "owner/repo"),
+        )
+        asyncio.run(intake.poll())
+        assert source.review_subjects == [("owner/repo", 8)]
+        assert _published_subjects(store, "owner/repo") == {8: current.id}
+        assert _published_subjects(store, "owner/old") == {8: old.id, 99: absent.id}
+        assert store.github_job_held(current.id)
+        assert not store.github_job_held(old.id)
+        assert store.get_job(old.id) == old
+        assert store.get_job(absent.id) == absent
+        assert store.list_transitions(old.id) == old_transitions
+        assert store.github_control("github:41:comment:17")["state"] == "pending"
+        assert store.get_quota_pool("codex") == pool
+        assert len(status(store)) == 3
+        assert [item["job_id"] for item in status(store, repository="owner/repo")] == [
+            current.id
+        ]
+
+
+def test_repository_switch_does_not_publish_old_status_outbox_entries():
+    with SQLiteStateStore() as store:
+        store.queue_github_status("old-job", "owner/old", 41, 7, "old status")
+        adapter = object()  # Any API call for the inactive repository would fail.
+        reporter = GitHubStatusReporter(store, adapter, repository="owner/repo")
+        assert asyncio.run(reporter.publish_pending()) == ()
+        assert store.pending_github_status()[0]["body"] == "old status"
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_removed_repository_policy_cancels_queued_or_active_work(active):
+    foreign = source_issue(repository="owner/old", repository_id=41, node_id="I_old")
+    with SQLiteStateStore() as store:
+        policy = IntakePolicy(foreign.repository, foreign.repository_id, None)
+        store.observe_github_issue(foreign, policy)
+        store.approve_github_issue(foreign, policy, actor="trusted-fixture")
+        old = store.create_github_job(foreign, compile_job(foreign))
+        intake, _ = compose(store, Source(source_issue()))
+        store.find_active_run = lambda job_id: (
+            object() if active and job_id == old.id else None
+        )
+        asyncio.run(intake.poll())
+        assert store.get_job(old.id).state is JobState.CANCELLED
+
+
+def test_current_repository_revoked_source_still_cancels_executed_work():
+    source = Source(source_issue())
+    with SQLiteStateStore() as store:
+        intake, _ = compose(store, source)
+        asyncio.run(intake.poll())
+        job = store.get_job(source.issue.job_id)
+        for state in (JobState.ADMITTED, JobState.RUNNING, JobState.REVIEW):
+            updated, event = transition_job(job, state, "fixture execution")
+            store.save_job(updated, event, expected=job)
+            job = updated
+        source.issue = replace(source.issue, state="closed")
+        store.list_runs = lambda job_id=None: [object()] if job_id == job.id else []
+        asyncio.run(intake.poll())
+        assert store.get_job(job.id).state is JobState.CANCELLED
 
 
 def test_new_trusted_issue_is_approved_without_label_or_local_cli_and_replays(tmp_path):

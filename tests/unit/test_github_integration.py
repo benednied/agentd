@@ -215,6 +215,14 @@ def approve(rig, **kwargs):
     )
 
 
+def test_repository_switch_preserves_old_integration_without_github_calls(rig):
+    rig.integration.repository = "owner/current"
+    assert asyncio.run(rig.integration.reconcile()) == ()
+    assert rig.integration.get(rig.job.id) is None
+    assert rig.store.get_job(rig.job.id) == rig.job
+    assert rig.adapter.merges == rig.adapter.readies == 0
+
+
 def test_comment_approval_is_db_only_and_publisher_integrates_one_exact_checked_head(
     rig,
 ):

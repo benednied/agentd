@@ -453,6 +453,8 @@ class GitHubWorkflow:
     async def apply_pending(self) -> None:
         store = self.intake.store
         for event in store.github_controls("pending"):
+            if not event["event_id"].startswith(f"github:{self.policy.repository_id}:"):
+                continue
             job_id = None
             try:
                 payload = event["payload"]
@@ -711,8 +713,15 @@ class GitHubStatusAdapter(GitHubIssueSource):
 
 
 class GitHubStatusReporter:
-    def __init__(self, store: SQLiteStateStore, adapter: GitHubStatusAdapter) -> None:
+    def __init__(
+        self,
+        store: SQLiteStateStore,
+        adapter: GitHubStatusAdapter,
+        *,
+        repository: str | None = None,
+    ) -> None:
         self.store, self.adapter = store, adapter
+        self.repository = repository
 
     def enqueue(self, reports: list[dict[str, Any]]) -> None:
         for report in reports:
@@ -721,6 +730,8 @@ class GitHubStatusReporter:
             if row is None:
                 continue
             issue = SourceIssue.from_dict(json.loads(row["payload"]))
+            if self.repository is not None and issue.repository != self.repository:
+                continue
             marker = f"<!-- agentd-status:{fingerprint(job_id)} -->"
             state = report["state"]
             if report.get("publication_stage") == "published":
@@ -793,6 +804,8 @@ class GitHubStatusReporter:
     async def publish_pending(self) -> tuple[dict[str, Any], ...]:
         results = []
         for report in self.store.pending_github_status():
+            if self.repository is not None and report["repository"] != self.repository:
+                continue
             try:
                 result = await asyncio.to_thread(self._publish, report)
                 results.append(result)
