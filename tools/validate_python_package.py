@@ -347,6 +347,10 @@ def validate(
             scratch,
         ).returncode:
             return result
+        if execute(
+            "final_diff", ("/usr/bin/git", "diff", "--quiet", "HEAD", "--")
+        ).returncode:
+            return result
         result["artifacts"] = [
             {
                 "name": path.name,

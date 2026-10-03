@@ -87,9 +87,9 @@ RUN ln -s \
         /usr/libexec/agentd/applypatch
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
-COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=codex-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN chmod -R a+rX /usr/local/lib/node_modules
+RUN chmod -R a+rX /usr/local/lib/node_modules \
+    && ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 COPY --chmod=0555 \
     deploy/security/runtime_sandbox_probe.py \
     deploy/security/sandbox_payload.py \

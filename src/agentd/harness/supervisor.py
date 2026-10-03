@@ -510,14 +510,14 @@ class RunSupervisor:
             )
             usage = final.tokens if final is not None else None
             native_proof = None
-            if terminal_usage_reader is not None:
+            # A final SDK marker was persisted only after the definitive
+            # terminal event. It is already sufficient for failed/interrupted
+            # turns, whose native history need not have a task_complete row.
+            if final is None and terminal_usage_reader is not None:
                 native_proof = terminal_usage_reader(
                     thread, session.thread_id, session.turn_id
                 )
-                native_usage = _subtract_usage(native_proof.total, baseline)
-                if usage is not None and native_usage != usage:
-                    raise ValueError("Final Codex usage proofs disagree")
-                usage = native_usage
+                usage = _subtract_usage(native_proof.total, baseline)
             if usage is None:
                 return None
             sequence = (

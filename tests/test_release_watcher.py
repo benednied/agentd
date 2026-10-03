@@ -356,3 +356,85 @@ def test_host_health_reports_persistent_failure_and_baseline_does_not_erase_it(
     assert "source_polling_stale" in problems
     watcher.record("current", candidate_commit=BASELINE)
     assert watcher.status["runtime_health"]["reported_problems"] == problems
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        None,
+        "tag",
+        "package",
+        "digest",
+        "label",
+        "running_image",
+        "stopped",
+        "missing_service",
+    ],
+)
+def test_bootstrap_evidence_binds_qualified_source_to_every_running_service(
+    tmp_path, broken
+):
+    watcher = ReleaseWatcher(config(tmp_path))
+    sha, digest = "a" * 40, "sha256:" + "b" * 64
+    current = tmp_path / "coding-current"
+    current.mkdir()
+    (current / "release.env").write_text(
+        "AGENTD_IMAGE=agentd-selfhost:" + ("c" * 40 if broken == "tag" else sha) + "\n"
+    )
+    (current / "package-qualified.json").write_text(
+        json.dumps(
+            {
+                "commit": sha,
+                "image_digest": "sha256:" + "d" * 64 if broken == "digest" else digest,
+                "package": {"commit": sha, "passed": broken != "package"},
+            }
+        )
+    )
+    watcher.git = lambda *_args: sha
+    container_ids = [str(number) * 64 for number in (1, 2, 3)]
+
+    def command(argv, **_kwargs):
+        if argv[:3] == ("/usr/bin/docker", "image", "inspect"):
+            return json.dumps(
+                [
+                    {
+                        "Id": digest,
+                        "Config": {
+                            "Labels": {
+                                "org.opencontainers.image.revision": "c" * 40
+                                if broken == "label"
+                                else sha
+                            }
+                        },
+                    }
+                ]
+            )
+        if argv[:2] == ("/usr/bin/docker", "inspect"):
+            return json.dumps(
+                [
+                    {
+                        "Image": "sha256:" + "c" * 64
+                        if broken == "running_image" and index == 1
+                        else digest,
+                        "State": {"Running": not (broken == "stopped" and index == 2)},
+                    }
+                    for index in range(3)
+                ]
+            )
+        assert argv[1:] == (
+            "ps",
+            "--quiet",
+            "coding-controller",
+            "coding-worker",
+            "coding-publisher",
+        )
+        return "\n".join(
+            container_ids[:2] if broken == "missing_service" else container_ids
+        )
+
+    watcher.command = command
+    if broken is None:
+        watcher.require_bootstrap_evidence(sha)
+    else:
+        with pytest.raises(ReleaseBlocked):
+            watcher.require_bootstrap_evidence(sha)

@@ -791,9 +791,17 @@ def test_supervisor_rejects_workspace_or_read_root_overlapping_codex_state(
     assert not client.started
 
 
-@pytest.mark.parametrize("saved_final", [False, True])
+@pytest.mark.parametrize(
+    "saved_final,terminal_status",
+    [
+        (False, "completed"),
+        (True, "completed"),
+        (True, "failed"),
+        (True, "interrupted"),
+    ],
+)
 def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
-    execution_contract, saved_final
+    execution_contract, saved_final, terminal_status
 ):
     execution = replace(
         execution_contract,
@@ -812,7 +820,7 @@ def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
                 "turns": [
                     {
                         "id": "turn-1",
-                        "status": "completed",
+                        "status": terminal_status,
                         "items": [
                             {
                                 "type": "agentMessage",
@@ -861,14 +869,25 @@ def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
     supervisor = RunSupervisor(store, client_factory=lambda _execution: client)
 
     async def scenario():
-        proof = (
-            None if saved_final else lambda *_args: NativeTerminalUsage(final, "a" * 64)
-        )
+        def proof(*_args):
+            if saved_final:
+                raise AssertionError(
+                    "Persisted final SDK usage must not require native proof"
+                )
+            return NativeTerminalUsage(final, "a" * 64)
+
         result = await supervisor.recover_terminal_readonly(
             "run-1", terminal_usage_reader=proof
         )
         assert result is not None and result.terminal and result.telemetry_valid
-        assert result.result.outcome is RunOutcome.COMPLETED
+        assert (
+            result.result.outcome
+            is {
+                "completed": RunOutcome.COMPLETED,
+                "failed": RunOutcome.FAILED,
+                "interrupted": RunOutcome.CANCELLED,
+            }[terminal_status]
+        )
         assert result.result.usage == final
         assert result.result.summary == "implementation ready for review"
         assert result.thread_id == "thread-1" and result.turn_id == "turn-1"

@@ -142,6 +142,103 @@ def pages(output: str) -> list[dict[str, Any]]:
     return flattened
 
 
+def _utc(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Bootstrap timestamps require UTC")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 0:
+        raise ValueError("Bootstrap timestamps require UTC")
+    return parsed
+
+
+def bootstrap_approval(
+    pr: dict[str, Any],
+    reviews: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    *,
+    sha: str,
+    activated_at: str,
+    actors: frozenset[str],
+    actor_ids: Mapping[str, int],
+) -> bool:
+    """Require an explicit immutable maintainer decision for this bootstrap head."""
+    if (pr.get("head") or {}).get("sha") != sha or not actor_ids:
+        return False
+
+    def trusted(actor: dict[str, Any]) -> bool:
+        login = actor.get("login")
+        identity = actor.get("id")
+        return (
+            login in actors
+            and isinstance(identity, int)
+            and not isinstance(identity, bool)
+            and actor_ids.get(login) == identity
+        )
+
+    decisions = {}
+    for review in sorted(
+        reviews, key=lambda row: (row.get("submitted_at") or "", row.get("id", 0))
+    ):
+        if trusted(review.get("user") or {}) and review.get("state") in {
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "DISMISSED",
+        }:
+            decisions[review["user"]["login"]] = review
+    # An issue comment cannot bypass an unresolved native changes request.
+    if any(row.get("state") == "CHANGES_REQUESTED" for row in decisions.values()):
+        return False
+    activated = _utc(activated_at)
+    for row in decisions.values():
+        if row.get("state") == "APPROVED" and row.get("commit_id") == sha:
+            try:
+                if _utc(row["submitted_at"]) > activated:
+                    return True
+            except (ValueError, TypeError, KeyError):
+                continue
+    for comment in comments:
+        body = comment.get("body")
+        if not trusted(comment.get("user") or {}) or not isinstance(body, str):
+            continue
+        if (
+            "<!--" in body
+            or re.fullmatch(
+                r"/agentd approve(?: " + re.escape(sha) + r")?", body.strip()
+            )
+            is None
+        ):
+            continue
+        try:
+            if (
+                comment["created_at"] == comment["updated_at"]
+                and _utc(comment["created_at"]) > activated
+            ):
+                return True
+        except (ValueError, TypeError, KeyError):
+            continue
+    return False
+
+
+def bootstrap_checks(
+    checks: list[dict[str, Any]], required_checks: list[str], sha: str
+) -> bool:
+    """Require the latest GitHub Actions result for every configured exact-head job."""
+    if not required_checks:
+        return False
+    latest = {}
+    for check in sorted(checks, key=lambda row: row.get("id", 0)):
+        if (check.get("app") or {}).get("slug") == "github-actions" and check.get(
+            "name"
+        ) in required_checks:
+            latest[check["name"]] = check
+    return all(
+        latest.get(name, {}).get("status") == "completed"
+        and latest.get(name, {}).get("conclusion") == "success"
+        and latest.get(name, {}).get("head_sha") == sha
+        for name in required_checks
+    )
+
+
 def approved_merge(
     pr: dict[str, Any],
     reviews: list[dict[str, Any]],
@@ -222,6 +319,29 @@ class ReleaseWatcher:
             raise ValueError(
                 "Release watcher requires valid baseline, actors, and image"
             )
+        self.bootstrap = config.get("bootstrap_pr")
+        if self.bootstrap is not None:
+            bootstrap = self.bootstrap
+            if (
+                not isinstance(bootstrap, dict)
+                or not isinstance(bootstrap.get("number"), int)
+                or isinstance(bootstrap.get("number"), bool)
+                or bootstrap["number"] <= 0
+                or not isinstance(bootstrap.get("head_commit"), str)
+                or _SHA.fullmatch(bootstrap["head_commit"]) is None
+                or not isinstance(bootstrap.get("activated_at"), str)
+                or not isinstance(bootstrap.get("required_checks"), list)
+                or not bootstrap["required_checks"]
+                or any(
+                    not isinstance(name, str) or not name.strip()
+                    for name in bootstrap["required_checks"]
+                )
+                or self.actor_ids is None
+            ):
+                raise ValueError(
+                    "Bootstrap requires exact head, checks, UTC and actor IDs"
+                )
+            _utc(bootstrap["activated_at"])
         self.status: dict[str, Any] = (
             json.loads(self.status_file.read_text())
             if self.status_file.is_file()
@@ -338,6 +458,8 @@ class ReleaseWatcher:
             key: self.status.get(key)
             for key in ("stage", "deployed_commit", "candidate_commit", "error")
         }
+        if self.status.get("bootstrap_head"):
+            summary["bootstrap_head"] = self.status["bootstrap_head"]
         runtime = self.status.get("runtime_health", {})
         if runtime:
             summary["runtime_health"] = {
@@ -421,6 +543,216 @@ class ReleaseWatcher:
                 pr, reviews, actors=self.actors, sha=sha, actor_ids=self.actor_ids
             ):
                 return True
+        return False
+
+    def require_bootstrap_evidence(self, sha: str) -> None:
+        """Bind approval to qualified source and the three deployed service images."""
+        current = self.root.parent / "coding-current"
+        image = self.image_repository + ":" + sha
+        try:
+            configured_images = [
+                line
+                for line in (current / "release.env").read_text().splitlines()
+                if line.startswith("AGENTD_IMAGE=")
+            ]
+            evidence = json.loads((current / "package-qualified.json").read_text())
+        except (OSError, ValueError):
+            raise ReleaseBlocked("bootstrap_source_qualification_missing") from None
+        if configured_images != ["AGENTD_IMAGE=" + image]:
+            raise ReleaseBlocked("bootstrap_deployed_image_mismatch")
+        if not isinstance(evidence, dict) or not isinstance(
+            evidence.get("package"), dict
+        ):
+            raise ReleaseBlocked("bootstrap_source_qualification_missing")
+        package = evidence["package"]
+        if (
+            evidence.get("commit") != sha
+            or package.get("commit") != sha
+            or package.get("passed") is not True
+            or self.git("rev-parse", sha + "^{commit}") != sha
+        ):
+            raise ReleaseBlocked("bootstrap_source_qualification_missing")
+        inspected = json.loads(
+            self.command(("/usr/bin/docker", "image", "inspect", image), timeout=30)
+        )
+        if (
+            not isinstance(inspected, list)
+            or len(inspected) != 1
+            or not isinstance(inspected[0], dict)
+        ):
+            raise ReleaseBlocked("bootstrap_image_inspection_invalid")
+        image_info = inspected[0]
+        digest = image_info.get("Id")
+        labels = (image_info.get("Config") or {}).get("Labels") or {}
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+            or evidence.get("image_digest") != digest
+            or labels.get("org.opencontainers.image.revision") != sha
+        ):
+            raise ReleaseBlocked("bootstrap_image_qualification_mismatch")
+        containers = self.command(
+            (
+                str(current / "deploy/scripts/coding-compose.sh"),
+                "ps",
+                "--quiet",
+                "coding-controller",
+                "coding-worker",
+                "coding-publisher",
+            ),
+            timeout=30,
+        ).splitlines()
+        if len(set(containers)) != 3 or any(
+            re.fullmatch(r"[0-9a-f]{12,64}", container) is None
+            for container in containers
+        ):
+            raise ReleaseBlocked("bootstrap_services_not_deployed")
+        running = json.loads(
+            self.command(("/usr/bin/docker", "inspect", *containers), timeout=30)
+        )
+        if (
+            not isinstance(running, list)
+            or len(running) != 3
+            or any(
+                not isinstance(row, dict)
+                or row.get("Image") != digest
+                or (row.get("State") or {}).get("Running") is not True
+                for row in running
+            )
+        ):
+            raise ReleaseBlocked("bootstrap_running_image_mismatch")
+
+    def bootstrap_check_runs(self, sha: str) -> list[dict[str, Any]]:
+        gh = str(self.config.get("gh_executable", "/usr/bin/gh"))
+        return pages(
+            self.command(
+                (
+                    gh,
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "--paginate",
+                    "--jq",
+                    ".check_runs",
+                    f"repos/benednied/agentd/commits/{sha}/check-runs?filter=all&per_page=100",
+                )
+            )
+        )
+
+    def _bootstrap_pull(self) -> dict[str, Any]:
+        bootstrap = self.bootstrap
+        assert bootstrap is not None
+        pr = self.github(f"repos/benednied/agentd/pulls/{bootstrap['number']}")
+        base = pr.get("base") or {}
+        repo = base.get("repo") or {}
+        if (
+            pr.get("number") != bootstrap["number"]
+            or base.get("ref") != "master"
+            or repo.get("full_name") != "benednied/agentd"
+            or repo.get("id") != 1328873039
+            or (pr.get("head") or {}).get("sha") != bootstrap["head_commit"]
+        ):
+            raise ReleaseBlocked("bootstrap_pull_identity_or_head_changed")
+        return pr
+
+    def _bootstrap_ready(self, pr: dict[str, Any]) -> bool:
+        bootstrap = self.bootstrap
+        assert bootstrap is not None and self.actor_ids is not None
+        sha, number = bootstrap["head_commit"], bootstrap["number"]
+        self.require_bootstrap_evidence(sha)
+        reviews = self.github(
+            f"repos/benednied/agentd/pulls/{number}/reviews", paginated=True
+        )
+        comments = self.github(
+            f"repos/benednied/agentd/issues/{number}/comments", paginated=True
+        )
+        if not bootstrap_approval(
+            pr,
+            reviews,
+            comments,
+            sha=sha,
+            activated_at=bootstrap["activated_at"],
+            actors=self.actors,
+            actor_ids=self.actor_ids,
+        ):
+            self.record(
+                "bootstrap_waiting_approval", bootstrap_head=sha, candidate_commit=sha
+            )
+            return False
+        if not bootstrap_checks(
+            self.bootstrap_check_runs(sha), bootstrap["required_checks"], sha
+        ):
+            self.record(
+                "bootstrap_waiting_checks", bootstrap_head=sha, candidate_commit=sha
+            )
+            return False
+        return True
+
+    def reconcile_bootstrap(self) -> bool:
+        """Merge the bootstrap after fresh approval, checks and deployment proof."""
+        if self.bootstrap is None:
+            return False
+        bootstrap = self.bootstrap
+        sha, number = bootstrap["head_commit"], bootstrap["number"]
+        pr = self._bootstrap_pull()
+        if pr.get("merged_at") is not None:
+            merge_sha = pr.get("merge_commit_sha")
+            if not isinstance(merge_sha, str) or _SHA.fullmatch(merge_sha) is None:
+                raise ReleaseBlocked("bootstrap_merged_commit_invalid")
+            self.status.update(bootstrap_head=sha, bootstrap_merge_commit=merge_sha)
+            write_json(self.status_file, self.status)
+            return False
+        if pr.get("state") != "open":
+            raise ReleaseBlocked("bootstrap_pull_closed_without_merge")
+        if not self._bootstrap_ready(pr):
+            return True
+        if pr.get("draft") is True:
+            node = pr.get("node_id")
+            if not isinstance(node, str) or not node:
+                raise ReleaseBlocked("bootstrap_pull_node_invalid")
+            # A successful mutation with a lost response is proved by GET.
+            with suppress(
+                OSError, ValueError, ReleaseBlocked, subprocess.TimeoutExpired
+            ):
+                self.status_api(
+                    "graphql",
+                    data={
+                        "query": (
+                            "mutation($id:ID!){markPullRequestReadyForReview("
+                            "input:{pullRequestId:$id}){pullRequest{isDraft}}}"
+                        ),
+                        "variables": {"id": node},
+                    },
+                    method="POST",
+                )
+            pr = self._bootstrap_pull()
+            if pr.get("draft") is not False:
+                raise ReleaseBlocked("bootstrap_ready_response_unconfirmed")
+            if not self._bootstrap_ready(pr):
+                return True
+        # Re-read the exact head before the CAS write. GitHub enforces sha atomically.
+        pr = self._bootstrap_pull()
+        if not self._bootstrap_ready(pr):
+            return True
+        self.record("bootstrap_merging", bootstrap_head=sha, candidate_commit=sha)
+        with suppress(OSError, ValueError, ReleaseBlocked, subprocess.TimeoutExpired):
+            self.status_api(
+                f"repos/benednied/agentd/pulls/{number}/merge",
+                data={"sha": sha, "merge_method": "merge"},
+                method="PUT",
+            )
+        # GET is authoritative after success, timeout, or lost merge response.
+        merged = self._bootstrap_pull()
+        merge_sha = merged.get("merge_commit_sha")
+        if (
+            merged.get("merged_at") is None
+            or not isinstance(merge_sha, str)
+            or _SHA.fullmatch(merge_sha) is None
+        ):
+            raise ReleaseBlocked("bootstrap_merge_response_unconfirmed")
+        self.record(
+            "bootstrap_merged", bootstrap_head=sha, bootstrap_merge_commit=merge_sha
+        )
         return False
 
     def require_profile(self, sha: str) -> None:
@@ -674,6 +1006,8 @@ class ReleaseWatcher:
 
     def tick(self) -> None:
         self.inspect_health()
+        if self.reconcile_bootstrap():
+            return
         origin = self.git("remote", "get-url", "origin")
         if origin != "https://github.com/benednied/agentd.git":
             raise ReleaseBlocked("source_origin_changed")

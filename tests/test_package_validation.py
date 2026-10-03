@@ -96,7 +96,37 @@ def test_orchestration_is_offline_and_does_not_inherit_credentials(
     assert "--no-isolation" in build and "--sdist" in build and "--wheel" in build
     install = next(argv for argv, *_ in calls if "pip" in argv)
     assert "--no-index" in install and "--no-deps" in install and "--python" in install
-    assert calls[-1][0][1:4] == ("-I", "-c", _SMOKE)
+    assert calls[-2][0][1:4] == ("-I", "-c", _SMOKE)
+    assert calls[-1][0] == ("/usr/bin/git", "diff", "--quiet", "HEAD", "--")
+
+
+def test_post_smoke_source_mutation_cannot_qualify_package(tmp_path):
+    root = checkout(tmp_path / "checkout")
+    diff_calls = []
+    smoke_ran = []
+
+    def runner(argv, cwd, env, timeout):
+        if argv[-2:] == ("rev-parse", "HEAD"):
+            return CommandResult(0, "a" * 40)
+        if argv == ("/usr/bin/git", "diff", "--quiet", "HEAD", "--"):
+            diff_calls.append(argv)
+            return CommandResult(1 if smoke_ran else 0)
+        if "build" in argv:
+            artifacts = Path(argv[-1])
+            wheel(artifacts / "agentd-0.1.0-py3-none-any.whl")
+            (artifacts / "agentd-0.1.0.tar.gz").write_bytes(b"test sdist")
+        if "import json,sysconfig" in argv[-1]:
+            return CommandResult(0, json.dumps(["/opt/validation/site-packages"]))
+        if _SMOKE in argv:
+            smoke_ran.append(True)
+        return CommandResult(0)
+
+    result = validate(root, runner=runner)
+    assert smoke_ran and len(diff_calls) == 2
+    assert not result["passed"]
+    assert result["steps"][-1]["name"] == "final_diff"
+    assert result["steps"][-1]["returncode"] == 1
+    assert "artifacts" not in result
 
 
 def test_commit_mismatch_and_failed_validation_stop_before_build(tmp_path):

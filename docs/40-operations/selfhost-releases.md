@@ -24,7 +24,8 @@ checkout, runs lint, formatting, documentation and tests against `checkout/src`,
 builds wheel and source distribution offline, and installs the wheel into a
 fresh environment. The smoke test checks wheel import location, version,
 declared dependency compatibility, and the installed CLI. Artifact digests and
-command results are retained in qualification evidence.
+command results are retained in qualification evidence. A final clean tracked
+diff check rejects source mutations made during tests, builds or smoke checks.
 
 There is no nested `uv run` in validation. Newly declared dependencies must be
 prepared in a trusted runtime before candidate validation; the sandbox cannot
@@ -38,7 +39,9 @@ Save mode 0600 configuration at
 The two protected GitHub executables can be Docker wrappers. The review wrapper
 needs repository read access; the status wrapper additionally needs permission
 to create and edit its own comments on the configured operations issue. Their
-credentials must remain outside model mounts.
+credentials must remain outside model mounts. When bootstrap integration is
+configured, the status wrapper also needs permission to mark that PR ready and
+merge it.
 
 ```json
 {
@@ -68,6 +71,27 @@ A release requires either an explicit merge by an approved actor or that actor's
 latest approval of the exact PR head. Direct pushes and rewritten history stop
 activation. Configure the actor ID mapping so approvals require both login and
 immutable identity, and bind the PR base to repository ID `1328873039`.
+
+The optional trusted `bootstrap_pr` configuration contains `number`,
+`head_commit`, `activated_at` in UTC, and `required_checks` such as `["quality"]`.
+Use the bootstrap PR number and the full SHA of the qualified deployed release.
+This one PR can be approved through GitHub even when the publication account
+cannot review its own PR: post `/agentd approve` or `/agentd approve <full SHA>`
+as a new, unedited PR issue comment after the configured activation time. Edited
+commands are ignored; post a new comment instead. A native approval submitted
+after activation for that exact head also qualifies. Both paths require the configured
+trusted login and immutable numeric user ID. PR descriptions, quoted commands,
+machine marked comments, older comments, and other heads do not authorize it.
+An unresolved latest changes request from any trusted reviewer vetoes merging.
+
+Before making a draft ready or merging, the supervisor verifies the PR's exact
+head and immutable base repository, latest successful GitHub Actions result for
+each required job, qualification evidence, image source label and digest, and
+all three running service images. It reads approval and checks again before the
+merge and passes the expected head SHA to GitHub's atomic merge gate. Lost ready
+or merge responses reconcile through a fresh PR read. Pending approval or checks
+appear on the operations issue. Omitting `bootstrap_pr` preserves ordinary
+reviewed master observation.
 
 Install `deploy/systemd/agentd-selfhost-release.service` in the user's systemd
 directory and enable it after the coding release is healthy. The HP requires
