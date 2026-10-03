@@ -51,7 +51,19 @@ def test_preparation_rejects_malicious_nested_symlink(tmp_path: Path):
         ).prepare(worktree)
 
 
-def test_read_only_dependencies_are_writable_only_in_private_copy(tmp_path):
+def test_read_only_dependencies_are_writable_only_in_private_copy(
+    tmp_path, monkeypatch
+):
+    import os
+
+    original_chmod = os.chmod
+
+    def chmod_without_nofollow(path, mode, *, dir_fd=None, follow_symlinks=True):
+        if not follow_symlinks:
+            raise NotImplementedError("chmod: follow_symlinks unavailable")
+        return original_chmod(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "chmod", chmod_without_nofollow)
     source = tmp_path / "prepared" / "venv"
     launcher = source / "bin" / "probe"
     launcher.parent.mkdir(parents=True)

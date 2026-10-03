@@ -106,13 +106,27 @@ class DependencyRuntimePreparation:
             metadata = path.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 return
-            if metadata.st_uid != os.geteuid():
-                raise DependencyPreparationError(
-                    "dependency copy must belong to the worker"
-                )
-            path.chmod(
-                stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR, follow_symlinks=False
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
             )
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) or not (stat.S_ISREG(opened.st_mode) or stat.S_ISDIR(opened.st_mode)):
+                    raise DependencyPreparationError(
+                        "dependency copy changed during preparation"
+                    )
+                if opened.st_uid != os.geteuid():
+                    raise DependencyPreparationError(
+                        "dependency copy must belong to the worker"
+                    )
+                # fchmod works on older Linux runtimes without fchmodat2 support.
+                # The descriptor pins the checked copy and never follows a link.
+                os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) | stat.S_IWUSR)
+            finally:
+                os.close(descriptor)
 
         writable(destination)
         if destination.is_dir():
