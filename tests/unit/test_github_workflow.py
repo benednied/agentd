@@ -390,7 +390,7 @@ def test_pause_is_durable_resume_clears_hold_and_edited_comment_does_not_reexecu
 
 @pytest.mark.parametrize("prior_attempts, blocked", [(1, False), (2, True)])
 def test_authenticated_resume_obeys_attempt_limits_and_preserves_hold_on_failure(
-    prior_attempts, blocked
+    tmp_path, prior_attempts, blocked
 ):
     from types import SimpleNamespace
 
@@ -399,7 +399,7 @@ def test_authenticated_resume_obeys_attempt_limits_and_preserves_hold_on_failure
     from agentd.publication import PublicationStore
 
     source = Source(source_issue())
-    with SQLiteStateStore() as store:
+    with SQLiteStateStore(tmp_path / "resume.sqlite") as store:
         limits = CodingAttemptLimits(maximum_coding_attempts=2)
         intake, workflow = compose(
             store,
