@@ -494,19 +494,22 @@ class CodingHarnessDriver:
                 .is_relative_to(root / "coding-worktrees")
             ):
                 raise OperationError("coding recovery workspace identity mismatch")
-            if observation is not None and (
-                not observation.terminal or observation.result is None
+            if (
+                observation is None
+                or not observation.terminal
+                or observation.result is None
             ):
                 recover = getattr(driver, "recover_terminal_readonly", None)
-                if recover is None:
+                if recover is not None:
+                    with suppress(
+                        OperationError, LookupError, TimeoutError, ValueError
+                    ):
+                        observation = await recover(run_id, order, lease)
+                if observation is not None and not observation.terminal:
                     return None
-                try:
-                    observation = await recover(run_id, order, lease)
-                except (OperationError, LookupError, TimeoutError, ValueError):
-                    return None
-                if observation is None or not observation.terminal:
-                    return None
-                if observation.run_id != run_id or observation.result is None:
+                if observation is not None and (
+                    observation.run_id != run_id or observation.result is None
+                ):
                     raise OperationError("read-only recovery observation mismatch")
             mirror = (
                 root
