@@ -511,6 +511,7 @@ def test_bubblewrap_constructs_private_credential_free_boundary(tmp_path, monkey
     ]
     assert command.count("--bind") == 1
     assert not any(path in command for path in ("/home", "/root", "/Users", "/etc"))
+    assert "/etc/ld.so.cache" in command
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
