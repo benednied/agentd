@@ -201,7 +201,7 @@ def test_validation_failure_persisted_and_never_published(result, tmp_path, code
     intent = replace(
         intent,
         validation_commands=((sys.executable, "-c", code),),
-        validation_timeout_seconds=0.1,
+        validation_timeout_seconds=0.1 if "time.sleep" in code else 5,
     )
     adapter = Adapter()
     publisher = DraftPublisher(

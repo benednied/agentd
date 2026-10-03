@@ -52,12 +52,14 @@ merge it.
   "baseline_commit": "5d3aba3212957b8628a736f12f22eeb854357d9a",
   "approved_actors": ["benednied"],
   "approved_actor_ids": {"benednied": 116355829},
-  "gh_config_dir": "/home/bened/.local/state/agentd-selfhost/coding-github-read",
+  "gh_config_dir": "/home/bened/.local/state/agentd-selfhost/coding/github-read",
   "gh_executable": "/home/bened/.local/share/agentd-selfhost/gh-release-read",
   "status_gh_executable": "/home/bened/.local/share/agentd-selfhost/gh-release-status",
   "status_issue_number": 86,
   "databases": [
-    "/home/bened/.local/state/agentd-selfhost/coding-controller/state.sqlite"
+    "/home/bened/.local/state/agentd-selfhost/coding/controller/state.sqlite",
+    "/home/bened/.local/state/agentd-selfhost/coding/worker/worker/worker.sqlite",
+    "/home/bened/.local/state/agentd-selfhost/coding/worker/worker/sdk.sqlite"
   ],
   "image_repository": "agentd-selfhost",
   "poll_seconds": 300

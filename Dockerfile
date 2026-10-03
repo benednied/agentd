@@ -41,10 +41,6 @@ RUN cc \
         /build/bwrap_compat.c
 
 FROM ${PYTHON_IMAGE} AS runtime
-ARG SOURCE_SHA=unknown
-LABEL org.opencontainers.image.title="agentd" \
-      org.opencontainers.image.description="Hardened local agent control plane" \
-      org.opencontainers.image.revision="${SOURCE_SHA}"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -116,6 +112,11 @@ ENV PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:/usr/local/bin:/usr/bin:/bin"
 USER 1000:1000
 WORKDIR /home/bened/goldenage
 RUN /usr/local/bin/codex --version
+
+ARG SOURCE_SHA=unknown
+LABEL org.opencontainers.image.title="agentd" \
+      org.opencontainers.image.description="Hardened local agent control plane" \
+      org.opencontainers.image.revision="${SOURCE_SHA}"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/opt/agentd/venv/bin/python", "-c", "import os; os.kill(1, 0); import agentd"]
