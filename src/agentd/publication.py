@@ -33,6 +33,59 @@ class PublicationPending(PublicationError):
     """An ambiguous external effect requires read-only reconciliation."""
 
 
+_SAFE_PREFLIGHT_REASONS = frozenset(
+    {
+        "Coding job has no completed review handoff",
+        "Coding continuation changed the approved work order",
+        "Source authorization changed before publication",
+        "Coding execution ownership is unresolved",
+        "Authenticated coding result lacks Git evidence",
+        "Collected result profile does not match policy",
+        "Source identity does not match collected work",
+        "Collected result does not match controller intent",
+        "Profile clone URL does not match authorized repository",
+        "Authorized base must be an exact Git object identity",
+        "Trusted Git operation failed",
+        "Trusted publication cache path contains a symlink",
+        "Trusted publication cache is not a valid Git repository",
+        "Trusted publication cache preparation failed",
+        "Bundle provenance does not match controller intent",
+        "Bundle source revision does not match controller intent",
+        "Missing or oversized result bundle",
+        "Malformed result bundle",
+        "Result bundle digest or size mismatch",
+        "Bundle does not advertise the recorded result",
+        "Run result ref already identifies a different commit",
+    }
+)
+
+
+def _preflight_error(error: Exception) -> dict[str, str]:
+    # Never expose subprocess output, remote URLs, model text or arbitrary
+    # exception messages/classes through the GitHub status channel.
+    error_class = (
+        "PublicationPending"
+        if isinstance(error, PublicationPending)
+        else "PublicationError"
+        if isinstance(error, PublicationError)
+        else type(error).__name__
+        if type(error)
+        in {
+            FileNotFoundError,
+            PermissionError,
+            OSError,
+            KeyError,
+            ValueError,
+            TimeoutError,
+        }
+        else "PublicationFailure"
+    )
+    reason = "Trusted publication preflight failed"
+    if isinstance(error, PublicationError) and str(error) in _SAFE_PREFLIGHT_REASONS:
+        reason = str(error)
+    return {"status": "blocked", "reason": reason, "error_class": error_class}
+
+
 @dataclass(frozen=True)
 class PublicationIntent:
     job_id: str
@@ -152,6 +205,11 @@ class PublicationStore:
             db.execute("""CREATE TABLE IF NOT EXISTS coding_repair_outcomes (
                 job_id TEXT NOT NULL, run_id TEXT NOT NULL,
                 status TEXT NOT NULL, reason TEXT NOT NULL,
+                PRIMARY KEY (job_id, run_id)
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS publication_preflight_errors (
+                job_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                reason TEXT NOT NULL, error_class TEXT NOT NULL,
                 PRIMARY KEY (job_id, run_id)
             )""")
             for row in db.execute(
@@ -278,6 +336,49 @@ class PublicationStore:
             ).fetchone()
         return {"status": row[0], "reason": row[1]} if row else None
 
+    def record_preflight_error(
+        self, job_id: str, run_id: str, error: Exception
+    ) -> None:
+        """Retain a safe pre-candidate blocker without modifying execution."""
+        outcome = _preflight_error(error)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM publication_candidates WHERE job_id=? AND run_id=?",
+                (job_id, run_id),
+            ).fetchone():
+                # Bound candidates already retain their own immutable stage and
+                # validation evidence, including ambiguous external effects.
+                return
+            db.execute(
+                "INSERT INTO publication_preflight_errors VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(job_id, run_id) DO UPDATE SET "
+                "reason=excluded.reason, error_class=excluded.error_class",
+                (job_id, run_id, outcome["reason"], outcome["error_class"]),
+            )
+
+    def preflight_for(self, job_id: str, run_id: str) -> dict[str, str] | None:
+        """Return only the exact run's still-unbound, sanitized blocker."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT reason, error_class FROM publication_preflight_errors "
+                "WHERE job_id=? AND run_id=? AND NOT EXISTS "
+                "(SELECT 1 FROM publication_candidates WHERE job_id=? AND run_id=?)",
+                (job_id, run_id, job_id, run_id),
+            ).fetchone()
+        return (
+            {"status": "blocked", "reason": row[0], "error_class": row[1]}
+            if row
+            else None
+        )
+
+    def clear_preflight_error(self, job_id: str, run_id: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM publication_preflight_errors WHERE job_id=? AND run_id=?",
+                (job_id, run_id),
+            )
+
     @contextmanager
     def locked(self) -> Iterator[None]:
         # No long SQLite write transaction: quota/scheduler operations continue.
@@ -381,6 +482,10 @@ class PublicationStore:
                 "WHERE job_id = ? AND run_id = ?",
                 (intent.job_id, intent.run_id),
             ).fetchone()
+            db.execute(
+                "DELETE FROM publication_preflight_errors WHERE job_id=? AND run_id=?",
+                (intent.job_id, intent.run_id),
+            )
         return {
             "stage": row[1],
             "evidence": json.loads(row[2]) if row[2] else None,
@@ -440,6 +545,12 @@ class PublicationStore:
                     intent.payload(),
                 ),
             )
+            if stage == "published":
+                db.execute(
+                    "DELETE FROM publication_preflight_errors "
+                    "WHERE job_id=? AND run_id=?",
+                    (intent.job_id, intent.run_id),
+                )
 
 
 def _run(
@@ -480,6 +591,60 @@ def _git(repository: Path, *args: str, env: dict[str, str] | None = None) -> str
     return result.stdout.strip()
 
 
+def prepare_publication_cache(repository: Path) -> None:
+    """Prepare only the trusted administrative bare cache, without Git remotes.
+
+    A fresh installation publishes an initialized directory atomically. A
+    crash before the rename leaves the configured path absent and retryable.
+    Existing repositories are verified rather than reinitialized or repaired.
+    Previously configured ordinary repositories remain supported as caches;
+    linked worktrees and redirected Git metadata are not accepted.
+    """
+    repository = repository.absolute()
+    if any(path.is_symlink() for path in (repository, *repository.parents)):
+        raise PublicationError("Trusted publication cache path contains a symlink")
+    try:
+        repository.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        lock_path = repository.parent / f".{repository.name}.agentd-cache.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if repository.is_symlink():
+                raise PublicationError(
+                    "Trusted publication cache path contains a symlink"
+                )
+            if not repository.exists():
+                with tempfile.TemporaryDirectory(
+                    dir=repository.parent, prefix=".agentd-cache-"
+                ) as temp:
+                    staging = Path(temp)
+                    _git(staging, "-c", "init.templateDir=", "init", "--bare", ".")
+                    staging.rename(repository)
+            try:
+                bare = _git(repository, "rev-parse", "--is-bare-repository") == "true"
+                git_dir = _git(repository, "rev-parse", "--absolute-git-dir")
+                valid = (
+                    git_dir == str(repository)
+                    if bare
+                    else (
+                        git_dir == str(repository / ".git")
+                        and not (repository / ".git").is_symlink()
+                        and _git(repository, "rev-parse", "--show-toplevel")
+                        == str(repository)
+                    )
+                )
+            except PublicationError:
+                valid = False
+            if not valid:
+                raise PublicationError(
+                    "Trusted publication cache is not a valid Git repository"
+                )
+    except OSError as error:
+        raise PublicationError(
+            "Trusted publication cache preparation failed"
+        ) from error
+
+
 def ensure_authorized_base(
     repository: Path,
     expected_repository: str,
@@ -496,6 +661,7 @@ def ensure_authorized_base(
         raise PublicationError("Profile clone URL does not match authorized repository")
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_commit):
         raise PublicationError("Authorized base must be an exact Git object identity")
+    prepare_publication_cache(repository)
     try:
         _git(repository, "cat-file", "-e", f"{base_commit}^{{commit}}")
     except PublicationError:

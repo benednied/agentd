@@ -12,7 +12,7 @@ from typing import Any
 from agentd.coding.models import RepositoryProfile
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.domain.enums import JobState, RunOutcome, RunState
-from agentd.domain.models import CodingOperation
+from agentd.domain.models import CodingOperation, Job, RunRecord
 from agentd.intake.models import SourceIssue
 from agentd.publication import (
     CollectedCodingResult,
@@ -72,14 +72,37 @@ class CodingPublicationReconciler:
             try:
                 results.append(await asyncio.to_thread(self.publish_job, job.id))
             except Exception as error:
+                preflight = (
+                    self.publisher.store.preflight_for(job.id, latest.id)
+                    if latest is not None
+                    else None
+                )
                 results.append(
-                    {"job_id": job.id, "publication_error": type(error).__name__}
+                    {
+                        "job_id": job.id,
+                        "publication_error": preflight["error_class"]
+                        if preflight
+                        else "PublicationError"
+                        if isinstance(error, PublicationError)
+                        else "PublicationFailure",
+                        "preflight": preflight,
+                    }
                 )
         return tuple(results)
 
     def publish_job(self, job_id: str) -> dict[str, Any]:
-        job = self.store.get_job(job_id)
         run = self.store.latest_run(job_id)
+        try:
+            result = self._publish_job(self.store.get_job(job_id), run)
+        except Exception as error:
+            if run is not None:
+                self.publisher.store.record_preflight_error(job_id, run.id, error)
+            raise
+        if run is not None:
+            self.publisher.store.clear_preflight_error(job_id, run.id)
+        return result
+
+    def _publish_job(self, job: Job, run: RunRecord | None) -> dict[str, Any]:
         if (
             job.state is not JobState.REVIEW
             or run is None

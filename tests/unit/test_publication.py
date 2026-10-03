@@ -389,6 +389,95 @@ def test_bundle_import_fetches_new_authorized_base_before_verification(
         )
 
 
+def test_fresh_publication_cache_fetches_base_and_imports_existing_result(
+    result, tmp_path, monkeypatch
+):
+    from agentd import publication
+
+    repo, intent, collected = result
+    evidence = bundle_evidence(repo, intent, tmp_path)
+    cache = tmp_path / "fresh-install" / "agentd.git"
+    real_git = publication._git
+
+    def map_profile_remote(repository, *args, **kwargs):
+        args = tuple(
+            str(repo) if arg == "https://github.com/owner/repo.git" else arg
+            for arg in args
+        )
+        return real_git(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", map_profile_remote)
+    publication.ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", intent.base_commit
+    )
+    assert git(cache, "rev-parse", "--is-bare-repository") == "true"
+    assert git(cache, "remote") == ""
+    ref = publication.import_coding_bundle(intent, collected, evidence, cache)
+    assert git(cache, "rev-parse", ref) == intent.result_commit
+    before = (cache / "config").read_bytes()
+    publication.ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", intent.base_commit
+    )
+    assert (cache / "config").read_bytes() == before
+    assert git(cache, "rev-parse", ref) == intent.result_commit
+
+
+@pytest.mark.parametrize("kind", ["empty", "file", "malformed", "symlink", "parent"])
+def test_publication_cache_rejects_existing_invalid_or_symlink_paths(tmp_path, kind):
+    from agentd.publication import prepare_publication_cache
+
+    cache = tmp_path / "agentd.git"
+    if kind == "empty":
+        cache.mkdir()
+    elif kind == "file":
+        cache.write_text("existing evidence")
+    elif kind == "malformed":
+        git(tmp_path, "init", str(cache))
+        (cache / ".git" / "HEAD").write_text("invalid Git identity")
+    else:
+        target = tmp_path / "target"
+        git(tmp_path, "init", "--bare", str(target))
+        cache.symlink_to(target, target_is_directory=True)
+        if kind == "parent":
+            cache = cache / "nested.git"
+    with pytest.raises(PublicationError, match="Trusted publication cache"):
+        prepare_publication_cache(cache)
+    if kind == "file":
+        assert cache.read_text() == "existing evidence"
+    elif kind == "empty":
+        assert list(cache.iterdir()) == []
+
+
+def test_cache_preparation_preserves_existing_normal_repository(result):
+    from agentd.publication import prepare_publication_cache
+
+    repo, intent, _ = result
+    before = (repo / ".git" / "config").read_bytes()
+    prepare_publication_cache(repo)
+    assert git(repo, "rev-parse", "HEAD") == intent.result_commit
+    assert (repo / ".git" / "config").read_bytes() == before
+
+
+def test_cache_initialization_failure_remains_retryable(tmp_path, monkeypatch):
+    from agentd import publication
+
+    cache = tmp_path / "cache" / "agentd.git"
+    real_git = publication._git
+
+    def failed_init(repository, *args, **kwargs):
+        if "init" in args:
+            raise PublicationError("Trusted Git operation failed")
+        return real_git(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", failed_init)
+    with pytest.raises(PublicationError):
+        publication.prepare_publication_cache(cache)
+    assert not cache.exists()
+    monkeypatch.setattr(publication, "_git", real_git)
+    publication.prepare_publication_cache(cache)
+    assert git(cache, "rev-parse", "--is-bare-repository") == "true"
+
+
 @pytest.mark.parametrize(
     "change",
     [

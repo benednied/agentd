@@ -599,6 +599,7 @@ def status(store: SQLiteStateStore) -> list[dict[str, Any]]:
             continue
         run = store.latest_run(job.id)
         publication = publication_store.get(job.id)
+        preflight = publication_store.preflight_for(job.id, run.id) if run else None
         gate = store.backlog_gate(job.id)
         integration = integration_status(store, job.id)
         try:
@@ -621,6 +622,8 @@ def status(store: SQLiteStateStore) -> list[dict[str, Any]]:
                     "remains unknown and its reservation is retained. "
                     "New issues can proceed within the remaining allowance."
                     if run and run.state is RunState.QUARANTINED
+                    else preflight["reason"] + "; retrying publication automatically"
+                    if preflight
                     else runtime_reason
                 )
                 if job.state not in {JobState.COMPLETED, JobState.CANCELLED}

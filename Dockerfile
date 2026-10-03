@@ -17,8 +17,10 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/agentd/venv
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable
-RUN UV_PROJECT_ENVIRONMENT=/opt/agentd/validation-venv \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_PROJECT_ENVIRONMENT=/opt/agentd/validation-venv \
     uv sync --frozen --dev --no-install-project
 
 FROM ${PYTHON_IMAGE} AS bwrap-compat-builder

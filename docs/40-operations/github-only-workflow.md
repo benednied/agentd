@@ -69,11 +69,18 @@ they control its originating issue.
 | `/agentd retry` | Requests another bounded attempt using the previous task and recorded failures. |
 | `/agentd retry <instructions>` | Requests a bounded retry with additional task instructions. |
 | `/agentd steer <instructions>` | Supplies the same task feedback as an ordinary trusted comment. |
+| `/agentd abandon` | Asks the trusted host supervisor to stop and retire the issue's latest attempt when final usage is missing. It retains unknown accounting and permits fresh independent work within remaining allowance. |
 
 Controls cannot select credentials, shell commands, repository profiles, spending
 limits, or an alternate account. A request cannot bypass exhausted cumulative
 budget, the attempt cap, invalid telemetry, or unresolved worker ownership.
 Refused controls produce an explanation on GitHub.
+
+Abandonment requires the host recovery controls described in
+[self-host releases](selfhost-releases.md). It never marks the interrupted job
+complete or refunds its reservation. On the operations issue, select the attempt
+explicitly with `/agentd abandon <run_id>`. The same command can authorize a
+bounded retry of a failed recovery; its original stop proof remains immutable.
 
 An executed task retains its original source revision. Editing its issue title
 or body revokes that authority; a new issue is required for a different task.
