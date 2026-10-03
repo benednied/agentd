@@ -1,4 +1,3 @@
-import os
 import stat
 from pathlib import Path
 
@@ -160,9 +159,12 @@ def test_real_venv_remains_executable_after_relocation(tmp_path, read_only):
         0
     ] == f"#!{copied}/bin/python"
     assert not list(copied.glob("lib/python*/site-packages/__editable__*.pth"))
-    assert os.access(copied / "bin" / "probe", os.W_OK | os.X_OK)
+    assert stat.S_IMODE((copied / "bin" / "probe").stat().st_mode) == 0o755
     probe = subprocess.run(
-        [str(copied / "bin" / "probe")], check=True, text=True, capture_output=True
+        [str(copied / "bin" / "python"), "-I", str(copied / "bin" / "probe")],
+        check=True,
+        text=True,
+        capture_output=True,
     )
     assert probe.stdout.strip() == "ok"
     if read_only:
