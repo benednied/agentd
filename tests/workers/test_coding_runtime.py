@@ -229,4 +229,39 @@ def test_worker_envelope_records_real_usage_without_admitting_jobs(
             lookup(identity)
     assert len(store.list_nodes()) == 1
     assert store.get_quota_pool("execution-envelope:run").remaining == 180
+
+    from agentd.domain.models import DriverSession
+    from agentd.lifecycle import ControllerLock
+
+    second_order = second.operation.work_order
+    second_lease = store.get_workspace("run-2")
+    with pytest.raises(OperationError, match="exclusive worker ownership"):
+        driver.prove_provider_not_started("run-2", second_order, second_lease)
+    fence = ControllerLock(tmp_path / "worker.sqlite")
+    assert not fence.owned
+    with fence:
+        assert fence.owned
+        restarted_driver = coding_runtime._ContainedCodexDriver(
+            None, store, model="test-model", worker_owner=fence
+        )
+        unchanged = store.get_run("run-2")
+        proof = restarted_driver.prove_provider_not_started(
+            "run-2", second_order, second_lease
+        )
+        assert proof.metadata["provider_started"] is False
+        assert proof.usage.total_tokens == 0
+        assert store.get_run("run-2") == unchanged
+        with pytest.raises(OperationError, match="identity mismatch"):
+            restarted_driver.prove_provider_not_started(
+                "run-2", replace(second_order, objective="changed"), second_lease
+            )
+        store.save_driver_session(
+            DriverSession("run-2", "codex", "thread", thread_id="thread"),
+            expected=None,
+        )
+        with pytest.raises(OperationError, match="provider session exists"):
+            restarted_driver.prove_provider_not_started(
+                "run-2", second_order, second_lease
+            )
+    assert not fence.owned
     store.close()

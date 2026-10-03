@@ -7,6 +7,14 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 release_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 coding_env=/home/bened/.local/share/agentd/coding.env
 override=/home/bened/.local/share/agentd/coding.override.yaml
+case "${AGENTD_PROFILE:-goldenage}" in
+    goldenage) ;;
+    selfhost)
+        coding_env=/home/bened/.local/share/agentd-selfhost/coding.env
+        override=/home/bened/.local/share/agentd-selfhost/coding.override.yaml
+        ;;
+    *) echo 'AGENTD_PROFILE must be goldenage or selfhost' >&2; exit 2 ;;
+esac
 
 [ -f "$release_root/release.env" ] || {
     echo "missing release.env in $release_root" >&2

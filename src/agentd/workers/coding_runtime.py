@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 from agentd.coding.models import CodingWorkOrder
-from agentd.domain.enums import JobState, QuotaUnit, RunOutcome
+from agentd.domain.enums import JobState, QuotaUnit, RunOutcome, RunState
 from agentd.domain.models import (
     CodingOperation,
     EffortEstimate,
@@ -26,6 +27,7 @@ from agentd.domain.models import (
     ResourceAllocation,
     ResourceVector,
     RunHandle,
+    RunObservation,
     RunRecord,
     RunResult,
     StateTransition,
@@ -35,7 +37,9 @@ from agentd.domain.models import (
 )
 from agentd.harness.app_server import DEFAULT_CODEX_MODEL, OpenAICodexClient
 from agentd.harness.codex_sdk import CodexSdkDriver
+from agentd.harness.native_record import read_native_terminal_usage
 from agentd.harness.supervisor import RunSupervisor
+from agentd.lifecycle import ControllerLock
 from agentd.state.base import EntityNotFoundError
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.dependency_prep import (
@@ -65,12 +69,53 @@ class _ContainedCodexDriver(CodexSdkDriver):
         dependency_venv: Path | None = None,
         dependency_profile_id: str | None = None,
         dependency_python_root: Path | None = None,
+        worker_owner: ControllerLock | None = None,
+        native_codex_home: Path | None = None,
     ) -> None:
         super().__init__(supervisor, model=model)
         self._worker_store = store
         self._dependency_venv = dependency_venv
         self._dependency_profile_id = dependency_profile_id
         self._dependency_python_root = dependency_python_root
+        self._worker_owner = worker_owner
+        self._native_codex_home = native_codex_home
+
+    def _require_worker_owner(self) -> None:
+        expected_owner = ControllerLock(
+            Path(self._worker_store.path).resolve().parent / "worker.sqlite"
+        )
+        if (
+            self._worker_owner is None
+            or not self._worker_owner.owned
+            or self._worker_owner.path != expected_owner.path
+        ):
+            raise OperationError("recovery requires exclusive worker ownership")
+
+    async def recover_terminal_readonly(
+        self, run_id: str, order: CodingWorkOrder, lease: WorkspaceLease
+    ) -> RunObservation | None:
+        """Recover saved final usage after the old worker owner has exited."""
+        self._require_worker_owner()
+        run = self._worker_store.get_run(run_id)
+        if (
+            run.job_id != f"worker-envelope:{run_id}"
+            or not isinstance(run.contract.operation, CodingOperation)
+            or run.contract.operation.work_order != order
+            or run.contract.working_directory != lease.working_directory
+        ):
+            raise OperationError("terminal recovery envelope identity mismatch")
+        session = self._worker_store.get_driver_session(run_id)
+        runtime_version = session.metadata.get("runtime_version")
+        reader = None
+        if self._native_codex_home is not None and isinstance(runtime_version, str):
+            reader = partial(
+                read_native_terminal_usage,
+                codex_home=self._native_codex_home,
+                runtime_version=runtime_version,
+            )
+        return await self._supervisor.recover_terminal_readonly(
+            run_id, terminal_usage_reader=reader
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         capabilities = super().capabilities()
@@ -226,6 +271,64 @@ class _ContainedCodexDriver(CodexSdkDriver):
             },
         )
 
+    def prove_provider_not_started(
+        self,
+        run_id: str,
+        order: CodingWorkOrder,
+        lease: WorkspaceLease,
+    ) -> RunResult:
+        """Prove a fenced startup stopped before the first provider turn.
+
+        RunSupervisor persists its SDK session before issuing turn/start. A
+        session's absence therefore proves zero provider work only while this
+        process owns the exact worker journal's exclusive startup fence.
+        """
+        self._require_worker_owner()
+        try:
+            self._worker_store.get_driver_session(run_id)
+        except EntityNotFoundError:
+            pass
+        else:
+            raise OperationError(
+                "provider session exists; ownership and final usage remain unresolved"
+            )
+        run = self._worker_store.get_run(run_id)
+        workspace = self._worker_store.get_workspace(run_id)
+        job = self._worker_store.get_job(run.job_id)
+        reservation = self._worker_store.get_reservation(run.reservation_id)
+        if (
+            run.driver != "codex"
+            or run.state is not RunState.STARTING
+            or run.job_id != f"worker-envelope:{run_id}"
+            or not isinstance(run.contract.operation, CodingOperation)
+            or run.contract.operation.work_order != order
+            or run.contract.working_directory != lease.working_directory
+            or workspace.job_id != run.job_id
+            or workspace.working_directory != lease.working_directory
+            or job.state is not JobState.RUNNING
+            or job.objective != order.objective
+            or job.repository != lease.working_directory
+            or reservation.pool_id != f"execution-envelope:{run_id}"
+            or reservation.amount != order.maximum_quota - order.prior_consumed_quota
+            or reservation.consumed != 0
+            or self._worker_store.list_usage_samples(run_id)
+        ):
+            raise OperationError("pre-provider recovery envelope identity mismatch")
+        return RunResult(
+            RunOutcome.FAILED,
+            "Worker restarted before the provider turn began",
+            usage=TokenUsage(),
+            metadata={
+                "telemetry_valid": True,
+                "provider_started": False,
+                "preparation_failure": True,
+                "preparation_proof": (
+                    "exclusive worker fence; matching atomic envelope; "
+                    "SDK session absent"
+                ),
+            },
+        )
+
     async def close(self) -> None:
         await super().close()
         self._worker_store.close()
@@ -239,6 +342,7 @@ async def create_verified_coding_sdk(
     dependency_venv: Path | None = None,
     dependency_profile_id: str | None = None,
     dependency_python_root: Path | None = None,
+    worker_owner: ControllerLock | None = None,
 ) -> CodexSdkDriver:
     """Run the image-pinned probe, then grant narrowly proven capabilities.
 
@@ -286,4 +390,6 @@ async def create_verified_coding_sdk(
         dependency_venv=dependency_venv,
         dependency_profile_id=dependency_profile_id,
         dependency_python_root=dependency_python_root,
+        worker_owner=worker_owner,
+        native_codex_home=Path(runtime_environment["CODEX_HOME"]),
     )

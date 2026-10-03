@@ -15,6 +15,7 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.observability import event_logger
+from agentd.runtime.allowance import LocalAllowancePolicy
 from agentd.runtime.codex_oracle import AccountOracle
 from agentd.runtime.reset import detect_provider_reset, reset_event_for_decision
 from agentd.service import ControlPlane
@@ -63,12 +64,14 @@ class AgentDaemon:
         account_poll_seconds: float = 60,
         worker_heartbeat_seconds: float = 15,
         provider_reset_remaining: float | None = None,
+        local_allowance_policy: LocalAllowancePolicy | None = None,
         clock: Callable[[], datetime] = utc_now,
         on_error: Callable[[Exception], None] | None = None,
         source_reconciler: Callable[[], Awaitable[object]] | None = None,
         source_poll_seconds: float | None = None,
         result_reconciler: Callable[[], Awaitable[object]] | None = None,
         admission_enabled: Callable[[], bool] | None = None,
+        recovery_reporter: Callable[[Exception], Awaitable[object]] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -108,6 +111,12 @@ class AgentDaemon:
         self._account_poll = timedelta(seconds=account_poll_seconds)
         self._worker_heartbeat_poll = timedelta(seconds=worker_heartbeat_seconds)
         self._provider_reset_remaining = provider_reset_remaining
+        if local_allowance_policy is not None and not isinstance(
+            control_plane, _AdmissionInspectableControlPlane
+        ):
+            raise ValueError("Local allowance requires a durable control-plane store")
+        self._local_allowance_policy = local_allowance_policy
+        self._recovery_reporter = recovery_reporter
         self._clock = clock
         self._on_error = on_error
         self._last_error: Exception | None = None
@@ -124,8 +133,22 @@ class AgentDaemon:
 
         return self._last_error
 
+    @property
+    def source_refresh_failed(self) -> bool:
+        """Whether the last source observation failed and admission is held."""
+        return self._source_refresh_failed
+
     async def tick(self) -> RunRecord | None:
         now = self._clock()
+        allowance_failed = False
+        if self._local_allowance_policy is not None:
+            try:
+                self._local_allowance_policy.reconcile(
+                    self._control_plane.store, at=now
+                )
+            except Exception as error:
+                self._record_error(error, operation="local_allowance_refresh")
+                allowance_failed = True
         await self._refresh_worker_heartbeats(now)
         source_failed = self._source_refresh_failed
         should_refresh_source = self._source_reconciler is not None and (
@@ -202,7 +225,7 @@ class AgentDaemon:
             await self._control_plane.reconcile_managed_runs(
                 self._account_snapshot, at=now
             )
-        if source_failed:
+        if source_failed or allowance_failed:
             # Still collect and meter existing runs, but never launch or publish
             # against authority that could not be refreshed.
             return None
@@ -314,6 +337,15 @@ class AgentDaemon:
                 await self._control_plane.recover_managed_runs()
             except Exception as error:
                 self._record_error(error, operation="managed_run_recovery")
+                if self._recovery_reporter is not None:
+                    try:
+                        # Reporting may notify GitHub about the retained ownership
+                        # blocker. It must not launch work or replace reconciliation.
+                        await self._recovery_reporter(error)
+                    except Exception as report_error:
+                        self._record_error(
+                            report_error, operation="managed_run_recovery_report"
+                        )
             else:
                 return True
             try:

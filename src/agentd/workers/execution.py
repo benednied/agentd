@@ -239,6 +239,28 @@ class ExecutionService:
             persisted = await self._terminal_result(request.run_id)
             if persisted is not None:
                 return {"result": persisted}
+        if action == "coding-checkpoint":
+            self._expect_fields(request.payload, set())
+            if (
+                self._journal.run_claim_state(run_id=request.run_id) is None
+                or await self._terminal_result(request.run_id) is None
+            ):
+                raise WorkerOperationError(
+                    "coding checkpoint requires proven stopped ownership"
+                )
+            for capability in self._drivers.capabilities():
+                if "coding-checkpoints" not in capability.features:
+                    continue
+                driver = self._drivers.get(capability.name)
+                capture = getattr(driver, "capture_checkpoint", None)
+                if capture is not None:
+                    evidence = await capture(request.run_id)
+                    return {
+                        "checkpoint": {
+                            k: v for k, v in evidence.items() if k != "bundle_chunks"
+                        }
+                    }
+            raise WorkerOperationError("worker does not support coding checkpoints")
         state = self._run(request.run_id)
         if action == "observe":
             return await self._observe(request, state)
@@ -337,6 +359,25 @@ class ExecutionService:
                 raise WorkerProtocolError(
                     "worker status result is malformed"
                 ) from error
+            recorded = self._journal.load_run_result(run_id=state.run_id)
+            if recorded is not None and recorded != state.collected.to_dict():
+                # A later administrative checkpoint is a separate immutable
+                # sidecar, exposed through coding-checkpoint. It cannot rewrite
+                # the original terminal result or its accounting evidence.
+                def without_checkpoint(value: dict[str, Any]) -> dict[str, Any]:
+                    return {
+                        **value,
+                        "metadata": {
+                            k: v
+                            for k, v in value.get("metadata", {}).items()
+                            if k != "coding_checkpoint"
+                        },
+                    }
+
+                if without_checkpoint(recorded) == without_checkpoint(
+                    state.collected.to_dict()
+                ):
+                    state.collected = RunResult.from_dict(recorded)
             self._journal.save_run_result(
                 run_id=state.run_id, result=state.collected.to_dict()
             )

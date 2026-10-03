@@ -18,6 +18,8 @@ WORKDIR /build
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
+RUN UV_PROJECT_ENVIRONMENT=/opt/agentd/validation-venv \
+    uv sync --frozen --dev --no-install-project
 
 FROM ${PYTHON_IMAGE} AS bwrap-compat-builder
 RUN apt-get update \
@@ -70,6 +72,7 @@ RUN apt-get update \
 COPY --from=bwrap-compat-builder --chown=0:0 --chmod=0555 \
     /build/bwrap /usr/bin/bwrap
 COPY --from=builder /opt/agentd/venv /opt/agentd/venv
+COPY --from=builder /opt/agentd/validation-venv /opt/agentd/validation-venv
 RUN ln -s \
         /opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex \
         /usr/libexec/agentd/codex-linux-sandbox \
@@ -86,6 +89,7 @@ COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=codex-cli /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN chmod -R a+rX /usr/local/lib/node_modules
 COPY --chmod=0555 \
     deploy/security/runtime_sandbox_probe.py \
     deploy/security/sandbox_payload.py \
@@ -93,6 +97,8 @@ COPY --chmod=0555 \
 COPY --chmod=0555 \
     tools/qualify_coding_worker.py \
     tools/serve_coding_worker.py \
+    tools/validate_python_package.py \
+    tools/qualify_publication_sandbox.py \
     /opt/agentd/tools/
 COPY --chmod=0444 deploy/container/config.toml /opt/agentd/security/config.toml
 
@@ -106,6 +112,7 @@ ENV PATH="/opt/agentd/venv/bin:/usr/libexec/agentd:/usr/local/bin:/usr/bin:/bin"
 
 USER 1000:1000
 WORKDIR /home/bened/goldenage
+RUN /usr/local/bin/codex --version
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/opt/agentd/venv/bin/python", "-c", "import os; os.kill(1, 0); import agentd"]

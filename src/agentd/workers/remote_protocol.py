@@ -45,6 +45,7 @@ class RemoteAction(StrEnum):
     INTERRUPT = "interrupt"
     CANCEL = "cancel"
     COLLECT = "collect"
+    CODING_CHECKPOINT = "coding-checkpoint"
     HEARTBEAT = "heartbeat"
 
 

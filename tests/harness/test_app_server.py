@@ -24,6 +24,10 @@ class RecordingSdkClient:
         self.calls.append(("thread/resume", (thread_id, params)))
         return SimpleNamespace(thread=SimpleNamespace(id=thread_id))
 
+    async def thread_read(self, thread_id: str, include_turns: bool = False) -> object:
+        self.calls.append(("thread/read", (thread_id, include_turns)))
+        return SimpleNamespace(thread={"id": thread_id, "turns": []})
+
     async def turn_start(
         self,
         thread_id: str,
@@ -142,3 +146,14 @@ def test_isolated_environment_uses_explicit_clean_launch(monkeypatch):
         "stdio://",
     )
     assert not any("GITHUB_TOKEN" in value for value in args)
+
+
+def test_read_thread_only_requests_saved_history() -> None:
+    sdk = RecordingSdkClient()
+    client = OpenAICodexClient()
+    client._client = cast(AsyncCodexClient, sdk)
+    assert asyncio.run(client.read_thread("saved-thread")) == {
+        "id": "saved-thread",
+        "turns": [],
+    }
+    assert sdk.calls == [("thread/read", ("saved-thread", True))]

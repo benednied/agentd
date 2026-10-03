@@ -32,12 +32,30 @@ from agentd.domain.models import (
 )
 from agentd.domain.transitions import initial_transition, transition_job
 from agentd.runtime.accounts import maximum_checkpoint_command
+from agentd.runtime.allowance import LocalAllowancePolicy
 from agentd.runtime.quota import QuotaManager, QuotaMaximumExceeded
 from agentd.runtime.resources import ResourceManager
 from agentd.state.base import ConcurrentStateError
 from agentd.state.sqlite import SQLiteStateStore
 
 NOW = datetime(2026, 8, 9, 12, tzinfo=UTC)
+
+
+def test_local_allowance_preserves_active_usage_and_cumulative_job_maximum(
+    make_job: Callable[..., Job],
+) -> None:
+    store, job, run = _runtime(make_job, maximum=12)
+    manager = QuotaManager(store)
+    manager.apply_codex_usage(_sample(7))
+    before = store.get_reservation(run.reservation_id)
+    samples = store.list_usage_samples(run.id)
+    LocalAllowancePolicy("default", "daily-v1", 500).reconcile(store, at=NOW)
+    assert store.get_reservation(run.reservation_id) == before
+    assert store.list_usage_samples(run.id) == samples
+    assert store.get_job(job.id).quota_budget.maximum == 12
+    assert store.get_quota_pool("default").reserved == 3
+    assert manager.apply_codex_usage(_sample(9, sequence=2)).job_consumed == 9
+    assert store.get_quota_pool("default").remaining == 498
 
 
 def _contract(job: Job) -> ExecutionContract:

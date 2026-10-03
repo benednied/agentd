@@ -176,7 +176,9 @@ def _controller(path, store, server, worker, backend_type):
 
 
 @asynccontextmanager
-async def coding_rig(path, *, lose_ack=False):
+async def coding_rig(
+    path, *, lose_ack=False, provider=None, validation_commands=(("true",),)
+):
     repo = path / "repo"
     repo.mkdir()
     git(repo, "init", "-b", "master")
@@ -197,7 +199,7 @@ async def coding_rig(path, *, lose_ack=False):
         "v1",
         "test/repo",
         "https://github.com/test/repo.git",
-        validation_commands=(("true",),),
+        validation_commands=validation_commands,
     )
     compiler = CodingJobCompiler(
         profile,
@@ -216,7 +218,7 @@ async def coding_rig(path, *, lose_ack=False):
         labels=("agentd:approved",),
     )
     store = SQLiteStateStore(path / "controller.sqlite")
-    provider = PausedProvider()
+    provider = provider or PausedProvider()
     worker = CodingHarnessDriver(
         path / "worker",
         {"repo": profile},

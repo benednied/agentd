@@ -1473,6 +1473,133 @@ class SchedulerCoordinator:
         self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, final_run))
         return review
 
+    async def queue_coding_repair(
+        self,
+        job_id: str,
+        *,
+        diagnostics: tuple[str, ...],
+        maximum_attempts: int = 3,
+        actor: str = "trusted-validation",
+        event_id: str | None = None,
+    ) -> Job:
+        """Queue a new bounded coding attempt from a proven stopped result.
+
+        This never changes a prior run, its charges, source intent or limits.
+        Admission is still performed by the ordinary scheduler. The worker
+        captures the completed lease through authenticated lifecycle transport;
+        no model request runs while obtaining that checkpoint.
+        """
+        job = self._store.get_job(job_id)
+        run = self._require_latest_run(job_id)
+        explicit_retry = actor != "trusted-validation" and bool(event_id)
+        stopped_retry = explicit_retry and job.state in {
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.SUSPENDED,
+        }
+        if (
+            (job.state is not JobState.REVIEW and not stopped_retry)
+            or not isinstance(job.operation, CodingOperation)
+            or not isinstance(run.contract.operation, CodingOperation)
+            or run.state
+            not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+                RunState.SUSPENDED,
+            }
+            or run.result is None
+            or (not stopped_retry and run.result.outcome is not RunOutcome.COMPLETED)
+            or run.result.metadata.get("telemetry_valid") is not True
+            or run.result.usage is None
+            or not self._is_remote_run(run)
+        ):
+            raise LifecycleError("Coding repair requires a proven stopped metered run")
+        if (
+            not actor.strip()
+            or not diagnostics
+            or len(diagnostics) > 16
+            or any(not text or "\0" in text or len(text) > 8192 for text in diagnostics)
+        ):
+            raise LifecycleError("Coding repair requires bounded trusted feedback")
+        if (
+            not isinstance(maximum_attempts, int)
+            or isinstance(maximum_attempts, bool)
+            or not 1 <= maximum_attempts <= 100
+            or len(self._store.list_runs(job.id)) >= maximum_attempts
+        ):
+            raise LifecycleError("Coding repair attempt limit has been reached")
+        if (
+            self._store.find_active_run(job.id) is not None
+            or self._store.find_active_reservation(job.id) is not None
+            or self._store.find_active_allocation(job.id) is not None
+        ):
+            raise LifecycleError("Coding repair ownership or accounting is unresolved")
+        maximum = job.quota_budget.maximum
+        if maximum is None or self._job_consumed(job.id) >= maximum - 1e-9:
+            raise LifecycleError("Coding repair exhausted its cumulative quota maximum")
+
+        def authorized() -> None:
+            source = self._store.github_source_for_job(job.id)
+            gate = self._store.backlog_gate(job.id)
+            held = getattr(self._store, "github_job_held", lambda _: False)(job.id)
+            if (
+                held
+                or (gate is not None and not gate["ready"])
+                or source is None
+                or source["revoked"]
+                or not source["eligible"]
+                or source["revision"] != job.operation.work_order.source_revision
+                or source["approved_revision"] != source["revision"]
+            ):
+                raise LifecycleError("Coding repair source is held or unauthorized")
+
+        authorized()
+        backend = self._backend_for_run(run)
+        capture = getattr(backend, "capture_coding_checkpoint", None)
+        if capture is None:
+            raise LifecycleError("Worker lacks authenticated coding checkpoint capture")
+        evidence = await capture(run.id)
+        if (
+            not isinstance(evidence, dict)
+            or (
+                run.result.commit is not None
+                and evidence.get("result_commit") != run.result.commit
+            )
+            or evidence.get("cumulative_quota")
+            != run.contract.operation.work_order.prior_consumed_quota
+            + run.result.usage.total_tokens
+        ):
+            raise LifecycleError("Coding repair lacks an authenticated checkpoint")
+        self._save_coding_checkpoint(job, run, evidence)
+        checkpoint = self._store.latest_checkpoint(job.id)
+        assert checkpoint is not None
+        capsule = replace(
+            checkpoint.capsule,
+            known_failures=diagnostics,
+            decisions=(f"Repair requested by {actor}; event {event_id or run.id}",),
+        )
+        if checkpoint.capsule != capsule:
+            self._store.save_checkpoint(
+                Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
+            )
+        authorized()
+        if stopped_retry and job.state is not JobState.SUSPENDED:
+            suspended, event = transition_job(
+                job,
+                JobState.SUSPENDED,
+                f"Trusted GitHub retry {event_id} retained stopped run {run.id}",
+            )
+            self._store.save_job(suspended, event, expected=job)
+            job = suspended
+        queued, event = transition_job(
+            job,
+            JobState.READY,
+            f"Bounded coding repair requested by {actor}; event {event_id or run.id}",
+        )
+        self._store.save_job(queued, event, expected=job)
+        return queued
+
     def promote_suspended_to_review(self, job_id: str) -> Job:
         """Promote a completed, quiescent checkpoint after operator validation."""
 
@@ -1950,6 +2077,7 @@ class SchedulerCoordinator:
                         resolved_operation.work_order,
                         resume_from_run_id=checkpoint.run_id,
                         prior_consumed_quota=self._job_consumed(job.id),
+                        repair_context=checkpoint.capsule.known_failures,
                     )
                 )
         typed_operation = self._is_operation_workspace(workspace)

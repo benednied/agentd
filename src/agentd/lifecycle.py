@@ -31,6 +31,7 @@ class ControllerLock:
     def __init__(self, database: Path) -> None:
         self.path = database.with_name(f".{database.name}.controller.lock")
         self._handle: TextIO | None = None
+        self._owner_pid: int | None = None
 
     def acquire(self) -> None:
         if self._handle is not None:
@@ -49,9 +50,20 @@ class ControllerLock:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
         self._handle = handle
+        self._owner_pid = os.getpid()
+
+    @property
+    def owned(self) -> bool:
+        """Whether this process owns this object's acquired kernel lock."""
+        return bool(
+            self._handle is not None
+            and not self._handle.closed
+            and self._owner_pid == os.getpid()
+        )
 
     def release(self) -> None:
         handle, self._handle = self._handle, None
+        self._owner_pid = None
         if handle is None:
             return
         try:

@@ -15,7 +15,7 @@ transaction.
 | `CHECKPOINTED` | `RUNNING`, `METERING_PENDING`, `SUSPENDED`, `FAILED`, `CANCELLED` |
 | `METERING_PENDING` | `REVIEW`, `SUSPENDED`, `FAILED`, `CANCELLED` |
 | `SUSPENDED` | `READY`, `REVIEW`, `FAILED`, `CANCELLED` |
-| `REVIEW` | `RUNNING`, `METERING_PENDING`, `COMPLETED`, `FAILED`, `CANCELLED` |
+| `REVIEW` | `READY`, `RUNNING`, `METERING_PENDING`, `COMPLETED`, `FAILED`, `CANCELLED` |
 | `COMPLETED` | none |
 | `FAILED` | `SUSPENDED` |
 | `CANCELLED` | `SUSPENDED` |
@@ -29,3 +29,8 @@ worker proves terminal ownership and captures a trusted checkpoint. Explicit
 administrative recovery can restore `FAILED`/`CANCELLED` coding jobs to
 `SUSPENDED` with matching checkpoint evidence and reconciled accounting. The
 original terminal run and result remain unchanged; resuming creates a new run.
+
+A bounded remote coding repair uses `REVIEW -> READY -> ADMITTED -> RUNNING`
+after terminal ownership, usage, and checkpoint provenance are proven. A trusted
+GitHub retry can apply the same proof checks to stopped `FAILED` or `CANCELLED`
+jobs, restoring them through `SUSPENDED` without changing the original run.

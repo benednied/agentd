@@ -1,5 +1,5 @@
 {
-  "name": "agentd-coding",
+  "name": "${AGENTD_CODING_COMPOSE_PROJECT:-agentd-coding}",
   "services": {
     "coding-controller": {
       "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
@@ -96,7 +96,21 @@
         "/tmp:rw,noexec,nosuid,nodev,size=1073741824,uid=1000,gid=1000,mode=1770"
       ],
       "healthcheck": {
-        "disable": true
+        "test": [
+          "CMD",
+          "/opt/agentd/venv/bin/agentd",
+          "github",
+          "--config",
+          "/etc/agentd/controller.json",
+          "health",
+          "--liveness",
+          "--role",
+          "controller"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "start_period": "90s",
+        "retries": 3
       },
       "networks": [
         "coding"
@@ -150,12 +164,17 @@
         "--tls-cert",
         "/home/bened/.local/state/agentd/transport/worker.crt",
         "--tls-key",
-        "/home/bened/.local/state/agentd/transport/worker.key"
+        "/home/bened/.local/state/agentd/transport/worker.key",
+        "--model",
+        "${AGENTD_CODING_MODEL:-gpt-5.6-luna}"
       ],
       "environment": {
         "HOME": "/home/bened",
         "PYTHONUNBUFFERED": "1",
-        "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home"
+        "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home",
+        "AGENTD_DEPENDENCY_VENV": "${AGENTD_CODING_DEPENDENCY_VENV:-}",
+        "AGENTD_DEPENDENCY_PROFILE": "${AGENTD_CODING_DEPENDENCY_PROFILE:-}",
+        "AGENTD_DEPENDENCY_PYTHON_ROOT": "${AGENTD_CODING_DEPENDENCY_PYTHON_ROOT:-}"
       },
       "volumes": [
         {
@@ -210,7 +229,16 @@
         "/home/bened/.cache/uv:rw,exec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700"
       ],
       "healthcheck": {
-        "disable": true
+        "test": [
+          "CMD",
+          "/opt/agentd/venv/bin/python",
+          "-c",
+          "import json,pathlib,socket; d=json.loads(pathlib.Path('/home/bened/.local/state/agentd/worker.ready').read_text()); s=socket.create_connection(('127.0.0.1',d['port']),timeout=3); s.close()"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "start_period": "90s",
+        "retries": 3
       },
       "expose": [
         "38101"
@@ -298,7 +326,21 @@
         "/tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770"
       ],
       "healthcheck": {
-        "disable": true
+        "test": [
+          "CMD",
+          "/opt/agentd/venv/bin/agentd",
+          "github",
+          "--config",
+          "/etc/agentd/controller.json",
+          "health",
+          "--liveness",
+          "--role",
+          "publisher"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "start_period": "90s",
+        "retries": 3
       },
       "networks": [
         "coding"

@@ -67,6 +67,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     ),
     JobState.REVIEW: frozenset(
         {
+            JobState.READY,
             JobState.RUNNING,
             JobState.METERING_PENDING,
             JobState.COMPLETED,

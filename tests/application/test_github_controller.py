@@ -196,3 +196,110 @@ def test_publication_refresh_rejects_changed_authority(controller_config, change
         source.current = replace(approved, **change)
         with pytest.raises(ValueError):
             intake.refresh_authorization(approved)
+
+
+def test_standing_owner_policy_wires_automatic_intake_without_a_label_or_cli(
+    controller_config, monkeypatch
+):
+    path, source = controller_config
+    source.current = replace(
+        source.current,
+        labels=(),
+        author_login="owner",
+        author_id=123,
+        created_at="2026-09-20T12:00:00Z",
+        material_updated_at="2026-09-20T12:00:00Z",
+    )
+    source.issue_authority = lambda issue: (issue, (("owner", 123), ("owner", 123)))
+    source.comments = lambda *_args, **_kwargs: ()
+    source.reviews = lambda *_args, **_kwargs: ()
+    monkeypatch.setattr("agentd.coding.controller.GitHubWorkflowSource", lambda: source)
+    config = load_config(path)
+    config.update(
+        {
+            "eligibility_label": None,
+            "standing_github_policy": {
+                "trusted_actors": {"owner": 123},
+                "activated_at": "2026-09-20T11:00:00Z",
+            },
+        }
+    )
+
+    async def scenario():
+        runtime = create_controller(config)
+        try:
+            assert runtime.workflow is not None
+            assert runtime.intake.source is source
+            await runtime.intake.poll()
+            jobs = runtime.store.list_jobs()
+            assert len(jobs) == 1
+            assert jobs[0].quota_budget.maximum == 200
+            assert runtime.store.github_source_for_job(jobs[0].id)[
+                "approved_by"
+            ].startswith("github-policy:")
+            assert not runtime.store.list_runs()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_controller_liveness_survives_expected_quota_wait_but_stale_polling_is_dead(
+    controller_config, monkeypatch
+):
+    from datetime import timedelta
+
+    from agentd.coding.controller import health
+    from agentd.domain.models import (
+        ResourceVector,
+        WorkerHeartbeat,
+        WorkerNode,
+        utc_now,
+    )
+    from agentd.runtime.health import RuntimeHealthStore
+
+    path, _source = controller_config
+    config = load_config(path)
+    config["standing_github_policy"] = {
+        "trusted_actors": {"owner": 123},
+        "activated_at": "2026-09-20T11:00:00Z",
+    }
+    monkeypatch.setattr(
+        "agentd.coding.controller.ControllerLock.held", lambda _self: True
+    )
+    now = utc_now()
+    monkeypatch.setattr("agentd.coding.controller.utc_now", lambda: now)
+    with SQLiteStateStore(config["database"]) as store:
+        store.register_quota_pool(QuotaPool("account", "codex", 200))
+        store.register_node(
+            WorkerNode(
+                "worker",
+                labels={},
+                capacity=ResourceVector(1, 1),
+                harnesses=frozenset({"remote-coding"}),
+                heartbeat=WorkerHeartbeat(
+                    "epoch", frozenset({"remote-coding"}), 0, observed_at=now
+                ),
+            )
+        )
+        store.append_provider_quota_snapshot(
+            ProviderQuotaSnapshot(
+                "account", "pool", primary_used_percent=80, observed_at=now
+            )
+        )
+        with RuntimeHealthStore(config["database"]) as pulses:
+            pulses.pulse("controller", state="waiting_quota", at=now)
+            pulses.pulse("publisher", state="waiting_review", at=now)
+            pulses.pulse("source", at=now)
+        blocked = health(config, store)
+        assert blocked["controller_live"]
+        assert blocked["liveness"]["controller"]["expected_wait"]
+        assert blocked["source_fresh"]
+        assert blocked["workers"][0]["fresh"]
+        assert not blocked["admission_telemetry_ready"]
+        assert blocked["provider_wait_reason"] == "quota_provider_pressure"
+        later = now + timedelta(seconds=601)
+        monkeypatch.setattr("agentd.coding.controller.utc_now", lambda: later)
+        stale = health(config, store)
+        assert not stale["controller_live"]
+        assert stale["liveness"]["controller"]["reason"] == "heartbeat_stale"

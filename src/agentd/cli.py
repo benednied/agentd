@@ -70,7 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     github_serve.add_argument("--without-publication", action="store_true")
     github_commands.add_parser("publish", help="run only trusted draft publication")
-    github_commands.add_parser("health", help="check durable telemetry readiness")
+    github_health = github_commands.add_parser(
+        "health", help="check durable telemetry readiness"
+    )
+    github_health.add_argument("--liveness", action="store_true")
+    github_health.add_argument(
+        "--role", choices=("controller", "publisher"), default="controller"
+    )
     github_commands.add_parser(
         "drain", help="stop admission while collecting active work"
     )
@@ -352,7 +358,12 @@ async def _github_command(args: argparse.Namespace) -> int:
             if args.github_command == "health":
                 report = health(config, store)
                 print(json.dumps(report, indent=2))
-                return 0 if report["admission_telemetry_ready"] else 1
+                ready = (
+                    report["liveness"][args.role]["live"]
+                    if args.liveness
+                    else report["admission_telemetry_ready"]
+                )
+                return 0 if ready else 1
             if args.github_command == "status":
                 if config.get("backlog"):
                     backlog = create_backlog(config, create_intake(config, store))

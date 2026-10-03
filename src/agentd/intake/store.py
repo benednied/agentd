@@ -35,6 +35,19 @@ def migrate_intake(connection: sqlite3.Connection) -> None:
     connection.execute("""CREATE TABLE IF NOT EXISTS github_backlog_bindings (
         job_id TEXT PRIMARY KEY, node_revision TEXT NOT NULL,
         base_commit TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_workflow_holds (
+        job_id TEXT PRIMARY KEY, held INTEGER NOT NULL, event_id TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_control_events (
+        event_id TEXT PRIMARY KEY, job_id TEXT, issue_number INTEGER NOT NULL,
+        payload TEXT NOT NULL, state TEXT NOT NULL, reason TEXT)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_control_cursors (
+        stream TEXT PRIMARY KEY, cursor TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS github_status_outbox (
+        report_key TEXT PRIMARY KEY, repository TEXT NOT NULL,
+        repository_id INTEGER NOT NULL, issue_number INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        comment_id INTEGER, started INTEGER NOT NULL DEFAULT 0,
+        delivered_body TEXT)""")
 
 
 class IntakeStoreMixin:
@@ -51,6 +64,155 @@ class IntakeStoreMixin:
         ) -> None: ...
         def get_job(self, job_id: str) -> Job: ...
         def list_runs(self, job_id: str | None = None) -> list[Any]: ...
+
+    def github_job_held(self, job_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT held FROM github_workflow_holds WHERE job_id=?", (job_id,)
+            ).fetchone()
+            return bool(row and row[0])
+
+    def set_github_job_hold(self, job_id: str, *, held: bool, event_id: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO github_workflow_holds VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET held=excluded.held, "
+                "event_id=excluded.event_id",
+                (job_id, held, event_id),
+            )
+
+    def github_source(self, source_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM github_sources WHERE source_key=?", (source_key,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def revoke_github_source(self, issue: SourceIssue, *, actor: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_sources SET revoked=1 WHERE source_key=?",
+                (issue.key,),
+            )
+            self._event(issue, "policy_revoked", actor)
+
+    def github_control_cursor(self, stream: str, default: str) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT cursor FROM github_control_cursors WHERE stream=?", (stream,)
+            ).fetchone()
+            return str(row[0]) if row else default
+
+    def advance_github_control_cursor(self, stream: str, cursor: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO github_control_cursors VALUES (?, ?) "
+                "ON CONFLICT(stream) DO UPDATE SET cursor=excluded.cursor",
+                (stream, cursor),
+            )
+
+    def record_github_control(
+        self, event_id: str, issue_number: int, payload: dict[str, Any]
+    ) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT OR IGNORE INTO github_control_events "
+                "VALUES (?, NULL, ?, ?, 'pending', NULL)",
+                (event_id, issue_number, json.dumps(payload, sort_keys=True)),
+            )
+
+    def github_controls(self, state: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM github_control_events "
+                + ("WHERE state=? " if state else "")
+                + "ORDER BY rowid",
+                (state,) if state else (),
+            ).fetchall()
+            return [
+                {**dict(row), "payload": json.loads(row["payload"])} for row in rows
+            ]
+
+    def github_control(self, event_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM github_control_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def finish_github_control(
+        self,
+        event_id: str,
+        *,
+        job_id: str | None,
+        state: str,
+        reason: str | None = None,
+    ) -> None:
+        if state not in {"pending", "applied", "blocked", "ignored"}:
+            raise ValueError("invalid GitHub control state")
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_control_events SET job_id=?, state=?, reason=? "
+                "WHERE event_id=?",
+                (job_id, state, reason, event_id),
+            )
+
+    def queue_github_status(
+        self,
+        report_key: str,
+        repository: str,
+        repository_id: int,
+        issue_number: int,
+        body: str,
+    ) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "INSERT INTO github_status_outbox "
+                "(report_key, repository, repository_id, issue_number, body) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(report_key) DO UPDATE SET body=excluded.body",
+                (report_key, repository, repository_id, issue_number, body),
+            )
+
+    def resolve_github_control_blocks(self, job_id: str, event_id: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_control_events SET state='ignored' "
+                "WHERE job_id=? AND state='blocked' AND event_id!=?",
+                (job_id, event_id),
+            )
+
+    def pending_github_status(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM github_status_outbox "
+                "WHERE delivered_body IS NULL OR body!=delivered_body"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def start_github_status(self, report_key: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_status_outbox SET started=1 WHERE report_key=?",
+                (report_key,),
+            )
+
+    def retry_rejected_github_status(self, report_key: str) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_status_outbox SET started=0 WHERE report_key=?",
+                (report_key,),
+            )
+
+    def finish_github_status(
+        self, report_key: str, comment_id: int, delivered_body: str
+    ) -> None:
+        with self._lock, self._transaction():
+            self._connection.execute(
+                "UPDATE github_status_outbox SET comment_id=?, delivered_body=? "
+                "WHERE report_key=?",
+                (comment_id, delivered_body, report_key),
+            )
 
     def set_backlog_gate(
         self,

@@ -6,6 +6,7 @@ import asyncio
 import ssl
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from math import isfinite
 from typing import Any, TypeVar
 from uuid import uuid4
 
@@ -218,6 +219,52 @@ class RemoteWorkerClient:
             run_id=self._run_id(run),
             request_id=request_id,
             response_parser=self._result_from_dict,
+        )
+
+    async def capture_coding_checkpoint(
+        self,
+        run: RunHandle | str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        run_id = self._run_id(run)
+
+        def parse(value: dict[str, Any]) -> dict[str, Any]:
+            checkpoint = value.get("checkpoint")
+            required = {
+                "run_id",
+                "job_id",
+                "repository",
+                "base_commit",
+                "result_commit",
+                "profile_digest",
+                "source_revision",
+                "bundle_sha256",
+                "cumulative_quota",
+            }
+            if (
+                set(value) != {"checkpoint"}
+                or not isinstance(checkpoint, dict)
+                or set(checkpoint) != required
+                or checkpoint["run_id"] != run_id
+                or any(
+                    not isinstance(checkpoint[k], str) or not checkpoint[k]
+                    for k in required - {"cumulative_quota"}
+                )
+                or isinstance(checkpoint["cumulative_quota"], bool)
+                or not isinstance(checkpoint["cumulative_quota"], (int, float))
+                or not isfinite(checkpoint["cumulative_quota"])
+                or checkpoint["cumulative_quota"] < 0
+            ):
+                raise WorkerProtocolError("coding checkpoint response is malformed")
+            return checkpoint
+
+        return await self._call(
+            RemoteAction.CODING_CHECKPOINT,
+            {},
+            run_id=run_id,
+            request_id=request_id,
+            response_parser=parse,
         )
 
     async def _call(

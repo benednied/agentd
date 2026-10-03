@@ -161,6 +161,9 @@ class RemoteWorkerBackend:
     async def collect(self, run: RunHandle | str) -> RunResult:
         return await self._client.collect(self._remote_run_id(run))
 
+    async def capture_coding_checkpoint(self, run: RunHandle | str) -> dict[str, Any]:
+        return await self._client.capture_coding_checkpoint(self._remote_run_id(run))
+
     async def heartbeat(self) -> dict[str, Any]:
         try:
             snapshot = await self._client.heartbeat()

@@ -11,7 +11,7 @@ import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from threading import RLock
@@ -21,6 +21,7 @@ from agentd.domain.enums import (
     AllocationState,
     JobState,
     QuotaMode,
+    QuotaUnit,
     ReservationState,
     RunState,
 )
@@ -206,7 +207,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -398,6 +399,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     # Existing v5 controllers already have source provenance but not backlog
     # gates/bindings or durable report deduplication. Preserve all old rows.
     5: migrate_intake,
+    6: migrate_intake,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
@@ -981,6 +983,7 @@ class SQLiteStateStore(IntakeStoreMixin):
                 source["revoked"]
                 or not source["eligible"]
                 or source["revision"] != source["approved_revision"]
+                or self.github_job_held(job.id)
             ):
                 raise ConcurrentStateError("GitHub source approval was revoked")
         persisted_state = JobState(row["state"])
@@ -1378,6 +1381,86 @@ class SQLiteStateStore(IntakeStoreMixin):
                         if event.expected_reset_at is not None
                         else None
                     ),
+                    event.confidence,
+                    event.new_remaining,
+                    event.source,
+                    _dump(event),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated), pool.id),
+            )
+            return updated
+
+    def apply_local_allowance(self, event: QuotaResetEvent) -> QuotaPool:
+        """Apply one administrative spending window without changing provider state.
+
+        The grant and its ledger entry share a transaction with usage writes.
+        Reservations, debt, usage samples and provider observations survive it.
+        An older unseen window cannot refill a newer window after clock rollback.
+        """
+        from agentd.runtime.allowance import LOCAL_ALLOWANCE_SOURCE
+
+        self._validate_reset_event(event)
+        source_parts = event.source.removeprefix(LOCAL_ALLOWANCE_SOURCE).split(":")
+        if (
+            not event.source.startswith(LOCAL_ALLOWANCE_SOURCE)
+            or len(source_parts) != 2
+            or not all(source_parts)
+            or event.mode is not QuotaMode.RESET_CONFIRMED
+            or event.expected_reset_at is None
+            or event.expected_reset_at.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Local allowance requires an administrative window grant")
+        policy_prefix = LOCAL_ALLOWANCE_SOURCE + source_parts[0] + ":"
+        with self._lock, self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM quota_reset_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            if existing is not None:
+                stored = _load(existing["payload"], QuotaResetEvent.from_dict)
+                if stored != event:
+                    raise ConcurrentStateError(
+                        f"Local allowance event {event.id} already differs"
+                    )
+                return self.get_quota_pool(event.pool_id)
+            pool = self.get_quota_pool(event.pool_id)
+            if pool.unit is not QuotaUnit.TOKENS:
+                raise ValueError("Local token allowance requires a token quota pool")
+            previous_rows = self._connection.execute(
+                "SELECT payload FROM quota_reset_events WHERE pool_id = ?",
+                (event.pool_id,),
+            ).fetchall()
+            for row in previous_rows:
+                previous = _load(row["payload"], QuotaResetEvent.from_dict)
+                if not previous.source.startswith(policy_prefix):
+                    continue
+                if previous.source != event.source:
+                    raise ConcurrentStateError(
+                        "An established local allowance policy cannot "
+                        "change configuration"
+                    )
+                if (
+                    previous.expected_reset_at is not None
+                    and previous.expected_reset_at >= event.expected_reset_at
+                ):
+                    return pool
+            updated = replace(
+                pool,
+                remaining=event.new_remaining,
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "INSERT INTO quota_reset_events("
+                "id, pool_id, mode, expected_reset_at, confidence, "
+                "new_remaining, source, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    event.pool_id,
+                    event.mode.value,
+                    event.expected_reset_at.isoformat(),
                     event.confidence,
                     event.new_remaining,
                     event.source,
