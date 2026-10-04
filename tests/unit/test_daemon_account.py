@@ -207,15 +207,17 @@ def test_daemon_contains_account_refresh_failure_and_keeps_dispatching() -> None
 
 
 def test_daemon_applies_one_evidenced_reset_with_explicit_absolute_capacity() -> None:
+    now = [datetime(2026, 8, 9, 12, tzinfo=UTC)]
+
     class ResetOracle:
         def __init__(self) -> None:
             self.calls = 0
 
         async def snapshot(self) -> ProviderQuotaSnapshot:
             self.calls += 1
-            observed = datetime(2026, 8, 9, 12, tzinfo=UTC) + timedelta(
-                minutes=self.calls - 1
-            )
+            await asyncio.sleep(0)
+            now[0] += timedelta(seconds=20)
+            observed = now[0]
             return ProviderQuotaSnapshot(
                 id=f"reset-snapshot-{self.calls}",
                 pool_id="codex",
@@ -230,7 +232,6 @@ def test_daemon_applies_one_evidenced_reset_with_explicit_absolute_capacity() ->
             )
 
     async def scenario() -> None:
-        now = [datetime(2026, 8, 9, 12, tzinfo=UTC)]
         plane = RecordingPlane()
         daemon = AgentDaemon(
             plane,
