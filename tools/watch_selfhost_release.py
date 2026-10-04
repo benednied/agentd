@@ -842,11 +842,21 @@ class ReleaseWatcher:
             if problems
             else 0
         )
-        persistent = failures >= int(self.config.get("health_failure_observations", 2))
+        # An unrelated old failure cannot make a new transient persistent.
+        # Retain only currently observed problems, so recovery resets each streak.
+        previous_counts = self.status.get("health_failure_counts", {})
+        counts = {
+            problem: int(previous_counts.get(problem, 0)) + 1
+            for problem in set(problems)
+        }
+        threshold = int(self.config.get("health_failure_observations", 2))
+        self.status["health_failure_counts"] = counts
         self.status["health_failure_observations"] = failures
         self.status["runtime_health"] = {
             "problems": sorted(set(problems)),
-            "reported_problems": sorted(set(problems)) if persistent else [],
+            "reported_problems": sorted(
+                problem for problem, count in counts.items() if count >= threshold
+            ),
             "expected_waits": sorted(set(waits)),
             "observed_at": utc_timestamp(),
         }

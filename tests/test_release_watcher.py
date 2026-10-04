@@ -482,3 +482,88 @@ def test_old_supervisor_cannot_acknowledge_new_release(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_LOADED_RELEASE", watcher.root / ("b" * 40))
     watcher.acknowledge_supervisor_start()
     assert watcher.status["restart_pending"] is True
+
+
+def test_host_health_tracks_each_problem_across_restart_and_recovery(
+    tmp_path, monkeypatch
+):
+    watcher = ReleaseWatcher(config(tmp_path))
+    # Old releases persisted only this aggregate; it must not age a new problem.
+    watcher.status["health_failure_observations"] = 9
+    report = {
+        "liveness": {
+            "controller": {"live": True, "state": "polling"},
+            "publisher": {"live": True, "state": "polling"},
+        },
+        "source_fresh": True,
+        "workers": [{"fresh": True}],
+        "provider_wait_reason": "quota_unknown",
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(report), stderr=""
+        ),
+    )
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == []
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == [
+        "provider_telemetry_unavailable"
+    ]
+
+    # A new worker fault must not inherit the still-present quota fault's streak.
+    report["workers"][0]["fresh"] = False
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == [
+        "provider_telemetry_unavailable"
+    ]
+    # A supervisor replacement retains the individual observation counts.
+    watcher = ReleaseWatcher(config(tmp_path))
+    report["provider_wait_reason"] = None
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == [
+        "worker_heartbeat_stale"
+    ]
+
+    # Complete recovery clears streaks; recurrence starts at one again.
+    report["workers"][0]["fresh"] = True
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == []
+    report["workers"][0]["fresh"] = False
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == []
+
+
+def test_host_health_replacement_problem_needs_its_own_observations(
+    tmp_path, monkeypatch
+):
+    watcher = ReleaseWatcher(config(tmp_path))
+    report = {
+        "liveness": {
+            "controller": {"live": True, "state": "polling"},
+            "publisher": {"live": True, "state": "polling"},
+        },
+        "source_fresh": True,
+        "workers": [{"fresh": True}],
+        "provider_wait_reason": "quota_unknown",
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(report), stderr=""
+        ),
+    )
+    watcher.inspect_health()
+    watcher.inspect_health()
+    report["provider_wait_reason"] = None
+    report["workers"][0]["fresh"] = False
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["problems"] == ["worker_heartbeat_stale"]
+    assert watcher.status["runtime_health"]["reported_problems"] == []
+    watcher.inspect_health()
+    assert watcher.status["runtime_health"]["reported_problems"] == [
+        "worker_heartbeat_stale"
+    ]
