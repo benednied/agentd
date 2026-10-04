@@ -181,7 +181,14 @@ def _controller(path, store, server, worker, backend_type, **policies):
 
 @asynccontextmanager
 async def coding_rig(
-    path, *, lose_ack=False, provider=None, validation_commands=(("true",),), **policies
+    path,
+    *,
+    lose_ack=False,
+    provider=None,
+    validation_commands=(("true",),),
+    quota_basis="total-v1",
+    maximum_run_quota=None,
+    **policies,
 ):
     repo = path / "repo"
     repo.mkdir()
@@ -210,6 +217,8 @@ async def coding_rig(
         git(repo, "rev-parse", "HEAD"),
         QuotaBudget(100, maximum=200, pool_id="account", unit=QuotaUnit.TOKENS),
         EffortEstimate(1, 2),
+        quota_basis=quota_basis,
+        maximum_run_quota=maximum_run_quota,
     )
     issue = SourceIssue(
         "test/repo",
@@ -523,5 +532,141 @@ def test_slow_quota_poll_preserves_healthy_run_but_still_enforces_reserve(
             assert rig.store.get_job(rig.job.id).state is JobState.SUSPENDED
             assert rig.store.get_quota_pool("account").remaining == 988
             assert rig.provider.starts == 1
+
+    asyncio.run(scenario())
+
+
+def test_uncached_run_checkpoint_preserves_usage_across_controller_restart(tmp_path):
+    class CachedProvider(PausedProvider):
+        def observe(self, run_id):
+            observation = super().observe(run_id)
+            usage = TokenUsage(
+                input_tokens=1000, cached_input_tokens=995, output_tokens=7
+            )
+            return replace(
+                observation,
+                usage=usage,
+                result=replace(observation.result, usage=usage)
+                if observation.result is not None
+                else None,
+                metadata={"quota_basis": "uncached-v1"},
+            )
+
+    async def scenario():
+        async with coding_rig(
+            tmp_path,
+            provider=CachedProvider(),
+            quota_basis="uncached-v1",
+            maximum_run_quota=13,
+        ) as rig:
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            assert run is not None
+            await rig.coordinator.reconcile_managed_runs()
+            assert rig.store.get_job(rig.job.id).state is JobState.SUSPENDED
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert rig.store.get_run(run.id).result.usage.total_tokens == 1007
+            commands = rig.store.list_run_commands(run.id)
+            assert any(command.action == "checkpoint" for command in commands)
+            await rig.reopen_controller()
+            await rig.coordinator.recover_managed_runs()
+            await rig.coordinator.resume(rig.job.id)
+            rig.provider.finished = asyncio.Event()
+            await rig.plane.refresh_worker_heartbeats()
+            resumed = await rig.plane.dispatch_next()
+            order = resumed.contract.operation.work_order
+            assert order.prior_consumed_quota == 12
+            assert order.maximum_run_quota == 13
+            assert order.quota_basis == "uncached-v1"
+            assert rig.store.get_quota_pool("account").remaining == 988
+
+    asyncio.run(scenario())
+
+
+def test_budget_reset_retains_history_and_starts_fresh_bounded_attempts(tmp_path):
+    from agentd.coding.attempts import (
+        CodingAttemptLimits,
+        current_attempts,
+        current_consumed,
+    )
+    from agentd.coding.controller import guard_coding_resume
+
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            rig.quota()
+            old_run = await rig.plane.dispatch_next()
+            assert old_run is not None
+            arguments = dict(
+                expected_run_id=old_run.id,
+                actor="operator",
+                maximum_tokens=900,
+                maximum_run_tokens=300,
+            )
+            with pytest.raises(LifecycleError, match="stopped"):
+                await rig.coordinator.reset_coding_budget(rig.job.id, **arguments)
+            await rig.worker.cancel(rig.worker._runs[old_run.id].handle)
+            await rig.coordinator.reconcile_managed_runs()
+            original = rig.store.get_run(old_run.id)
+            assert rig.store.get_quota_pool("account").remaining == 988
+            reset = await rig.coordinator.reset_coding_budget(rig.job.id, **arguments)
+            assert reset.state is JobState.READY
+            assert rig.store.get_run(old_run.id) == original
+            assert current_consumed(reset, rig.store.list_reservations(reset.id)) == 0
+            assert current_attempts(reset, rig.store.list_runs(reset.id)) == []
+            assert (
+                await rig.coordinator.reset_coding_budget(reset.id, **arguments)
+                == reset
+            )
+            await rig.reopen_controller()
+            for attempt in range(3):
+                rig.provider.finished = asyncio.Event()
+                await rig.plane.refresh_worker_heartbeats()
+                run = await rig.plane.dispatch_next()
+                assert run is not None
+                order = run.contract.operation.work_order
+                assert order.prior_consumed_quota == attempt * 12
+                assert order.maximum_quota == 900
+                assert order.maximum_run_quota == 300
+                assert order.quota_basis == "uncached-v1"
+                # A repeated old reset must not grant fresh credit to a live run.
+                assert (
+                    await rig.coordinator.reset_coding_budget(reset.id, **arguments)
+                ).state is JobState.RUNNING
+                await rig.worker.interrupt(rig.worker._runs[run.id].handle)
+                await rig.coordinator.reconcile_managed_runs()
+                assert rig.store.get_job(reset.id).state is JobState.SUSPENDED
+                if attempt < 2:
+                    guard_coding_resume(
+                        rig.store, reset.id, CodingAttemptLimits(3, 3, 3)
+                    )
+                    await rig.coordinator.resume(reset.id)
+            with pytest.raises(LifecycleError, match="attempt limit"):
+                guard_coding_resume(rig.store, reset.id, CodingAttemptLimits(3, 3, 3))
+            latest = rig.store.get_job(reset.id)
+            assert current_consumed(latest, rig.store.list_reservations(reset.id)) == 36
+            assert rig.store.get_quota_pool("account").remaining == 952
+            assert len(rig.store.list_runs(reset.id)) == 4
+            assert rig.store.get_run(old_run.id) == original
+
+    asyncio.run(scenario())
+
+
+def test_unstarted_budget_configuration_cannot_change_started_work(tmp_path):
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            args = dict(
+                expected_run_id=None,
+                actor="operator",
+                maximum_tokens=900,
+                maximum_run_tokens=300,
+            )
+            configured = await rig.coordinator.reset_coding_budget(rig.job.id, **args)
+            assert configured.operation.work_order.quota_basis == "uncached-v1"
+            assert configured.quota_budget.maximum == 900
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            assert run.contract.operation.work_order.maximum_run_quota == 300
+            with pytest.raises(LifecycleError, match="without runs"):
+                await rig.coordinator.reset_coding_budget(rig.job.id, **args)
 
     asyncio.run(scenario())

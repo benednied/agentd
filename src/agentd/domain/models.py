@@ -545,6 +545,18 @@ class TokenUsage(Serializable):
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def uncached_tokens(self) -> int:
+        """Input cache hits consume no local budget; output includes reasoning."""
+        return self.input_tokens - self.cached_input_tokens + self.output_tokens
+
+    def quota_tokens(self, basis: str = "total-v1") -> int:
+        if basis == "uncached-v1":
+            return self.uncached_tokens
+        if basis == "total-v1":
+            return self.total_tokens
+        raise ValueError("unsupported token quota basis")
+
     def dominates(self, previous: TokenUsage) -> bool:
         """Return whether every cumulative counter is monotonic."""
 
@@ -610,7 +622,12 @@ class UsageSample(Serializable):
         if (
             self.unit is QuotaUnit.TOKENS
             and self.tokens is not None
-            and self.cumulative_quota != self.tokens.total_tokens
+            and self.cumulative_quota
+            != (
+                self.tokens.quota_tokens(
+                    str(self.metadata.get("quota_basis", "total-v1"))
+                )
+            )
         ):
             raise ValueError(
                 "Token usage counters must equal the cumulative token quota"
@@ -618,7 +635,11 @@ class UsageSample(Serializable):
         if self.delta is not None and (
             not isfinite(self.delta)
             or self.delta < 0
-            or (self.delta == 0 and not self.final)
+            or (
+                self.delta == 0
+                and not self.final
+                and self.metadata.get("quota_basis") != "uncached-v1"
+            )
         ):
             raise ValueError(
                 "An applied usage delta must be positive, or zero for a final marker"
@@ -1435,7 +1456,11 @@ class RunObservation(Serializable):
         if self.cumulative_quota is not None:
             return self.cumulative_quota
         if self.unit is QuotaUnit.TOKENS and self.usage is not None:
-            return float(self.usage.total_tokens)
+            return float(
+                self.usage.quota_tokens(
+                    str(self.metadata.get("quota_basis", "total-v1"))
+                )
+            )
         return None
 
     def to_usage_sample(self, sequence: int) -> UsageSample:

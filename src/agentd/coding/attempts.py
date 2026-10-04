@@ -6,7 +6,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from agentd.domain.enums import RunOutcome, RunState
-from agentd.domain.models import CodingOperation, RunRecord, TokenUsage
+from agentd.domain.models import (
+    CodingOperation,
+    Job,
+    QuotaReservation,
+    RunRecord,
+    TokenUsage,
+)
 
 
 def is_proven_preparation_failure(run: RunRecord) -> bool:
@@ -92,3 +98,23 @@ class CodingAttemptLimits:
         ):
             return "Coding repair preparation attempt limit has been reached"
         return None
+
+
+def current_attempts(job: Job, runs: Iterable[RunRecord]) -> list[RunRecord]:
+    """Count only the current operator-authorized budget cycle."""
+    retired = (
+        job.operation.work_order.retired_run_ids
+        if isinstance(job.operation, CodingOperation)
+        else ()
+    )
+    return [run for run in runs if run.id not in retired]
+
+
+def current_consumed(job: Job, reservations: Iterable[QuotaReservation]) -> float:
+    """Old charges remain in the account ledger, outside a fresh job allowance."""
+    retired = (
+        job.operation.work_order.retired_reservation_ids
+        if isinstance(job.operation, CodingOperation)
+        else ()
+    )
+    return sum(item.consumed for item in reservations if item.id not in retired)

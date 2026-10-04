@@ -17,6 +17,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from agentd.coding.attempts import current_consumed
 from agentd.domain.enums import (
     AllocationState,
     JobState,
@@ -1827,7 +1828,25 @@ class SQLiteStateStore(IntakeStoreMixin):
             raise ConcurrentStateError("Usage samples must have increasing sequences")
         previous_cumulative = previous.cumulative_quota if previous is not None else 0
         delta = sample.cumulative_quota - previous_cumulative
-        if delta < 0 or (delta == 0 and (not sample.final or previous is None)):
+        cache_only_progress = (
+            sample.metadata.get("quota_basis") == "uncached-v1"
+            and sample.tokens is not None
+            and sample.tokens.total_tokens
+            > (
+                previous.tokens.total_tokens
+                if previous is not None and previous.tokens is not None
+                else 0
+            )
+        )
+        if previous is not None and previous.metadata.get(
+            "quota_basis", "total-v1"
+        ) != sample.metadata.get("quota_basis", "total-v1"):
+            raise ValueError("Quota basis cannot change within a run turn")
+        if delta < 0 or (
+            delta == 0
+            and not cache_only_progress
+            and (not sample.final or previous is None)
+        ):
             raise ValueError(
                 "A new usage sample must contribute a positive delta, unless it "
                 "is a final marker for existing cumulative usage"
@@ -3010,17 +3029,17 @@ class SQLiteStateStore(IntakeStoreMixin):
             "SELECT payload FROM quota_reservations WHERE job_id = ?",
             (job_id,),
         ).fetchall()
-        total = 0.0
+        reservations = []
         replaced = False
         for row in rows:
             reservation = _load(row["payload"], QuotaReservation.from_dict)
             if replacement is not None and reservation.id == replacement.id:
                 reservation = replacement
                 replaced = True
-            total += reservation.consumed
+            reservations.append(reservation)
         if replacement is not None and not replaced:
-            total += replacement.consumed
-        return total
+            reservations.append(replacement)
+        return current_consumed(self.get_job(job_id), reservations)
 
     def _one(
         self, query: str, args: tuple[object, ...], entity_name: str
