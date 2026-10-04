@@ -122,7 +122,12 @@ def compose(store, source, **workflow_options):
     workflow = GitHubWorkflow(
         intake,
         source,
-        StandingGitHubPolicy("owner/repo", 42, {"owner": 123}, "2026-10-03T10:00:00Z"),
+        workflow_options.pop(
+            "policy",
+            StandingGitHubPolicy(
+                "owner/repo", 42, {"owner": 123}, "2026-10-03T10:00:00Z"
+            ),
+        ),
         **workflow_options,
     )
     intake.workflow = workflow
@@ -911,3 +916,38 @@ def test_reporter_distinguishes_attempt_budgets_and_explains_exhausted_retry():
         assert "Post a new issue to authorize a separate job" in body
         assert "A new job shares the account's existing spending allowance" in body
         assert "`/agentd resume`, `/agentd retry`" not in body
+
+
+@pytest.mark.parametrize("trusted_editor", [True, False])
+def test_repository_backlog_opt_in_admits_existing_trusted_issues(
+    tmp_path, trusted_editor
+):
+    old = source_issue(created_at="2025-01-01T00:00:00Z")
+    source = Source(old)
+    if not trusted_editor:
+        source.actors = (("owner", 123), ("stranger", 456))
+    policy = StandingGitHubPolicy(
+        "owner/repo",
+        42,
+        {"owner": 123},
+        "2026-10-03T10:00:00Z",
+        include_existing_issues=True,
+    )
+    with SQLiteStateStore(tmp_path / "state.sqlite") as store:
+        intake, _ = compose(store, source, policy=policy)
+        asyncio.run(intake.poll())
+        asyncio.run(intake.poll())
+        assert len(store.list_jobs()) == int(trusted_editor)
+
+
+def test_repository_backlog_setting_requires_explicit_boolean():
+    with pytest.raises(ValueError, match="boolean"):
+        StandingGitHubPolicy.from_dict(
+            {
+                "repository": "owner/repo",
+                "repository_id": 42,
+                "trusted_actors": {"owner": 123},
+                "activated_at": "2026-10-03T10:00:00Z",
+                "include_existing_issues": "false",
+            }
+        )

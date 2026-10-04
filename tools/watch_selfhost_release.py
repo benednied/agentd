@@ -288,6 +288,10 @@ def approved_merge(
     )
 
 
+# Capture before coding-current can be switched by this process.
+_LOADED_RELEASE = Path(__file__).resolve().parents[1]
+
+
 class ReleaseWatcher:
     def __init__(self, config: dict[str, Any]) -> None:
         if config.get("repository_name", "benednied/agentd") != "benednied/agentd":
@@ -848,6 +852,25 @@ class ReleaseWatcher:
         }
         write_json(self.status_file, self.status)
 
+    def acknowledge_supervisor_start(self) -> None:
+        """Only the process loaded from the activated release clears restart intent.
+
+        systemctl can kill its caller before returning. Clearing the intent after
+        that call races with SIGTERM; clearing it before loses crash recovery.
+        The replacement process acknowledges under the supervisor ownership lock.
+        """
+        if not self.status.get("restart_pending"):
+            return
+        sha = self.status.get("deployed_commit")
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+            return
+        expected = self.root / sha
+        current = self.root.parent / "coding-current"
+        if expected != _LOADED_RELEASE or current.resolve() != expected:
+            return
+        self.status["restart_pending"] = False
+        self.record("current", supervisor_commit=sha)
+
     def restart_supervisor(self) -> None:
         if not self.status.get("restart_pending"):
             return
@@ -861,8 +884,6 @@ class ReleaseWatcher:
             ),
             timeout=30,
         )
-        self.status["restart_pending"] = False
-        write_json(self.status_file, self.status)
 
     def backup(self, sha: str) -> list[str]:
         paths = []
@@ -1088,6 +1109,7 @@ def main() -> int:
             fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 1
+        watcher.acknowledge_supervisor_start()
         while not stop:
             try:
                 watcher.tick()

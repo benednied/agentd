@@ -26,6 +26,7 @@ class AccountPolicyThresholds:
     urgent_only_used_percent: float = 90
     snapshot_stale_after: timedelta = timedelta(minutes=5)
     pre_reset_burn_window: timedelta = timedelta(hours=12)
+    require_both_windows: bool = False
 
     def __post_init__(self) -> None:
         percentages = (
@@ -34,8 +35,8 @@ class AccountPolicyThresholds:
         )
         if any(not isfinite(value) or not 0 <= value <= 100 for value in percentages):
             raise ValueError("Account percentages must be between zero and 100")
-        if self.background_block_used_percent >= self.urgent_only_used_percent:
-            raise ValueError("Background block must precede urgent-only mode")
+        if self.background_block_used_percent > self.urgent_only_used_percent:
+            raise ValueError("Background block must not exceed urgent-only mode")
         if self.snapshot_stale_after <= timedelta(0):
             raise ValueError("Snapshot staleness threshold must be positive")
         if self.pre_reset_burn_window <= timedelta(0):
@@ -140,6 +141,10 @@ def unattended_provider_wait_reason(
         return "quota_stale"
     if provider_quota_reached(snapshot):
         return "quota_provider_pressure"
+    if policy.require_both_windows and (
+        snapshot.primary_used_percent is None or snapshot.secondary_used_percent is None
+    ):
+        return "quota_unknown"
     used = provider_used_percent(snapshot)
     if used is None:
         return "quota_unknown"

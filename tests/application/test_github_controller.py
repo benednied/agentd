@@ -393,3 +393,85 @@ def test_controller_liveness_survives_expected_quota_wait_but_stale_polling_is_d
         stale = health(config, store)
         assert not stale["controller_live"]
         assert stale["liveness"]["controller"]["reason"] == "heartbeat_stale"
+
+
+@pytest.mark.parametrize("primary,secondary", [(90, 20), (20, 90), (90, 90)])
+def test_reserve_policy_is_shared_by_admission_and_active_governor(primary, secondary):
+    from agentd.coding.controller import coding_provider_policies
+    from agentd.domain.models import utc_now
+    from agentd.runtime.accounts import unattended_provider_wait_reason
+    from agentd.runtime.governor import provider_stop_command
+
+    account, stop = coding_provider_policies({"provider_reserve_percent": 10})
+    now = utc_now()
+    snapshot = ProviderQuotaSnapshot(
+        pool_id="account",
+        bucket_id="codex",
+        observed_at=now,
+        primary_used_percent=primary,
+        secondary_used_percent=secondary,
+    )
+    assert unattended_provider_wait_reason(snapshot, at=now, policy=account) == (
+        "quota_provider_pressure"
+    )
+    assert (
+        provider_stop_command(
+            snapshot, run_id="run", at=now, policy=stop, account_policy=account
+        ).action
+        == "interrupt"
+    )
+    below = replace(snapshot, primary_used_percent=89.9, secondary_used_percent=89.9)
+    assert unattended_provider_wait_reason(below, at=now, policy=account) is None
+    assert (
+        provider_stop_command(
+            below, run_id="run", at=now, policy=stop, account_policy=account
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("reserve", [True, "10", -1, 1, 100, float("nan")])
+def test_invalid_provider_reserve_is_rejected(reserve):
+    from agentd.coding.controller import coding_provider_policies
+
+    with pytest.raises(ValueError):
+        coding_provider_policies({"provider_reserve_percent": reserve})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"secondary_used_percent": None},
+        {"primary_used_percent": None},
+        {"confidence": 0},
+        {"age": 301},
+        {"age": -60},
+    ],
+)
+def test_reserve_policy_stops_when_telemetry_cannot_protect_both_windows(changes):
+    from datetime import timedelta
+
+    from agentd.coding.controller import coding_provider_policies
+    from agentd.domain.models import utc_now
+    from agentd.runtime.accounts import unattended_provider_wait_reason
+    from agentd.runtime.governor import provider_stop_command
+
+    changes = dict(changes)
+    now = utc_now()
+    age = changes.pop("age", 0)
+    snapshot = ProviderQuotaSnapshot(
+        pool_id="account",
+        bucket_id="codex",
+        observed_at=now - timedelta(seconds=age),
+        **({"primary_used_percent": 20, "secondary_used_percent": 20} | changes),
+    )
+    account, stop = coding_provider_policies({"provider_reserve_percent": 10})
+    assert unattended_provider_wait_reason(snapshot, at=now, policy=account) in {
+        "quota_unknown",
+        "quota_stale",
+    }
+    command = provider_stop_command(
+        snapshot, run_id="run", at=now, policy=stop, account_policy=account
+    )
+    assert command.action == "interrupt"
+    assert command.payload["reason"] == "provider reserve telemetry is unavailable"

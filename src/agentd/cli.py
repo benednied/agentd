@@ -294,6 +294,7 @@ def _run_process_command(
 async def _github_command(args: argparse.Namespace) -> int:
     from agentd.coding.controller import (
         coding_attempt_limits,
+        coding_provider_policies,
         create_backlog,
         create_controller,
         create_intake,
@@ -392,7 +393,11 @@ async def _github_command(args: argparse.Namespace) -> int:
                 )
                 return 0 if ready else 1
             if args.github_command == "status":
-                reports = status(store, attempt_limits=coding_attempt_limits(config))
+                reports = status(
+                    store,
+                    attempt_limits=coding_attempt_limits(config),
+                    account_policy=coding_provider_policies(config)[0],
+                )
                 if config.get("backlog"):
                     backlog = create_backlog(config, create_intake(config, store))
                     print(

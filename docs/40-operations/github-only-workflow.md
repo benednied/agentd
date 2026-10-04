@@ -19,7 +19,7 @@ policy activation time receive durable approval for their exact title and body.
 When the deployment sets `eligibility_label` to `null`, no special label is needed.
 An enabled eligibility label remains an additional condition.
 
-Existing issues are deliberately outside automatic intake. To authorize one,
+By default, existing issues are outside automatic intake. To authorize one,
 post a fresh `/agentd approve` comment on that issue after reviewing its current
 contents. A comment made before a later title or body edit cannot approve the
 changed task. You can bind approval explicitly with
@@ -30,6 +30,33 @@ local capacity, and runs a bounded coding attempt. The publisher independently
 validates the result and opens a draft PR. The issue's status comment records
 progress, waiting reasons, delivery, and integration; the same comment is updated
 when the state changes.
+
+An operator can opt the whole existing backlog into the standing policy with
+`standing_github_policy.include_existing_issues: true`. Existing issues then use
+the same immutable repository, trusted author/editor, eligibility, exact revision,
+and deduplication checks as new issues. The activation timestamp still fences
+GitHub comments and control commands. This setting does not revive exhausted
+attempts, authorize untrusted contributors, or rebind a task that already ran.
+Use the native backlog mode when execution requires dependency ordering.
+
+## Protect the interactive reserve
+
+Set `provider_reserve_percent: 10` in the trusted controller and publisher
+configuration to protect 10% of both provider windows. This setting overrides the
+legacy admission/checkpoint percentages: admission, top-ups, automatic continuation,
+health/status reporting, and active-run interruption use the same 90% used boundary.
+The most constrained window wins. Both window percentages must be present and
+fresh; missing, future, zero-confidence, or stale telemetry blocks new work and
+interrupts active work when an unavailable observation is evaluated. Provider
+percentages never become token balances. The independent local allowance and
+per-job attempt/token limits still apply.
+
+The reserve is an observed-usage stop threshold, not an exact provider-side cap.
+Polling latency, batched usage, in-flight requests, and your other sessions can
+consume quota before an interrupt takes effect. No client can guarantee precisely
+10% remains. Without this setting, the legacy 75% admission / 90% checkpoint /
+98% hard-stop behavior remains. The configurable reserve cannot be below the
+existing 2% safety floor.
 
 ## Give feedback
 

@@ -40,6 +40,7 @@ class StandingGitHubPolicy:
     repository_id: int
     trusted_actors: Mapping[str, int]
     activated_at: str
+    include_existing_issues: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -55,6 +56,8 @@ class StandingGitHubPolicy:
             )
         ):
             raise ValueError("standing policy requires immutable trusted GitHub actors")
+        if not isinstance(self.include_existing_issues, bool):
+            raise ValueError("include_existing_issues must be a boolean")
         _instant(self.activated_at)
 
     def trusts(self, login: str | None, identity: int | None) -> bool:
@@ -76,6 +79,7 @@ class StandingGitHubPolicy:
                 for login, identity in values["trusted_actors"].items()
             },
             activated_at=values["activated_at"],
+            include_existing_issues=values.get("include_existing_issues", False),
         )
 
 
@@ -358,7 +362,10 @@ class GitHubWorkflow:
         if (
             not self.policy.trusts(issue.author_login, issue.author_id)
             or issue.created_at is None
-            or _instant(issue.created_at) < _instant(self.policy.activated_at)
+            or (
+                not self.policy.include_existing_issues
+                and _instant(issue.created_at) < _instant(self.policy.activated_at)
+            )
         ):
             return issue
         verified, actors = await asyncio.to_thread(self.source.issue_authority, issue)
@@ -368,7 +375,10 @@ class GitHubWorkflow:
             return verified
         if (
             verified.created_at is None
-            or _instant(verified.created_at) < _instant(self.policy.activated_at)
+            or (
+                not self.policy.include_existing_issues
+                and _instant(verified.created_at) < _instant(self.policy.activated_at)
+            )
             or not all(self.policy.trusts(*actor) for actor in actors)
         ):
             return verified
