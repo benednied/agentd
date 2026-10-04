@@ -520,6 +520,7 @@ def test_codex_config_is_explicit_nonsecret_and_provisioned_mode_0600() -> None:
     assert filesystem[":workspace_roots"] == {".": "write"}
     for root in (
         "/opt/agentd/venv",
+        "/opt/agentd/repository-runtime",
         "/usr/local/bin",
         "/usr/bin",
         "/usr/libexec/agentd",
