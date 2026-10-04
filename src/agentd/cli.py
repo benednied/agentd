@@ -119,6 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
     reset_coding.add_argument("--actor", required=True)
     reset_coding.add_argument("--maximum-tokens", type=float, required=True)
     reset_coding.add_argument("--maximum-run-tokens", type=float, required=True)
+    reset_status = github_commands.add_parser(
+        "reset-budget-status", help="read an operator budget reset request"
+    )
+    reset_status.add_argument("request_id")
     recover_coding = github_commands.add_parser(
         "recover", help="import a trusted worker checkpoint for a stopped legacy run"
     )
@@ -356,7 +360,25 @@ async def _github_command(args: argparse.Namespace) -> int:
 
         await serve_publisher(config)
         return 0
-    if args.github_command in {"resume", "recover", "quarantine", "reset-budget"}:
+    if args.github_command in {"reset-budget", "reset-budget-status"}:
+        from agentd.coding.admin import CodingAdminStore
+
+        requests = CodingAdminStore(config["database"])
+        if args.github_command == "reset-budget-status":
+            report = requests.get(args.request_id)
+        else:
+            report = requests.enqueue(
+                {
+                    "job_id": args.job_id,
+                    "expected_run_id": args.expected_run_id,
+                    "actor": args.actor,
+                    "maximum_tokens": args.maximum_tokens,
+                    "maximum_run_tokens": args.maximum_run_tokens,
+                }
+            )
+        print(json.dumps(report))
+        return 0
+    if args.github_command in {"resume", "recover", "quarantine"}:
         runtime = create_controller(config)
         try:
             coordinator = runtime.coordinator
@@ -373,14 +395,6 @@ async def _github_command(args: argparse.Namespace) -> int:
                     actor=args.actor,
                     event_id=args.event_id,
                     stop_proof=proof,
-                )
-            elif args.github_command == "reset-budget":
-                job = await coordinator.reset_coding_budget(
-                    args.job_id,
-                    expected_run_id=args.expected_run_id,
-                    actor=args.actor,
-                    maximum_tokens=args.maximum_tokens,
-                    maximum_run_tokens=args.maximum_run_tokens,
                 )
             elif args.github_command == "recover":
                 job = coordinator.restore_coding_checkpoint(

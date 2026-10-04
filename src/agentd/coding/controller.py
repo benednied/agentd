@@ -497,8 +497,13 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             else None
         )
 
+        from agentd.coding.admin import CodingAdminStore
+
+        admin_requests = CodingAdminStore(config["database"])
+
         async def publish() -> None:
             runtime_health.pulse("controller")
+            await admin_requests.apply_pending(coordinator)
             if (
                 config.get("auto_resume_checkpoints", True)
                 and not Path(
