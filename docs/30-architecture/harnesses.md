@@ -8,7 +8,7 @@ rank, scarcity, or scheduler reasoning.
 ## Implementations
 
 - `FakeHarnessDriver` is deterministic and performs no harness I/O.
-- `CodexSdkDriver` uses the pinned `openai-codex==0.144.4` SDK and App Server.
+- `CodexSdkDriver` uses the pinned `openai-codex==0.160.0` SDK and App Server.
   It starts or resumes threads, streams observations and token usage, supports
   steering and safe-boundary checkpoint/suspend commands, and supports same-thread
   repair continuation.

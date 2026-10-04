@@ -58,8 +58,8 @@ jobs:
           add-paths: |
             pyproject.toml
             uv.lock
-            src/agentd/harness/app_server.py
-            deploy/security/runtime_sandbox_probe.py
+            src/agentd/codex_versions.py
+            docs/30-architecture/harnesses.md
             Dockerfile
       # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
       # Dispatch CI at the candidate branch so quality is bound to its head SHA.

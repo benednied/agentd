@@ -11,11 +11,8 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 SDK_PINS = (
     ("pyproject.toml", r"(openai-codex==)([0-9.]+)"),
-    ("src/agentd/harness/app_server.py", r'(PINNED_OPENAI_CODEX_VERSION = ")([0-9.]+)'),
-    (
-        "deploy/security/runtime_sandbox_probe.py",
-        r'(EXPECTED_SDK_VERSION = ")([0-9.]+)',
-    ),
+    ("src/agentd/codex_versions.py", r'(PINNED_OPENAI_CODEX_VERSION = ")([0-9.]+)'),
+    ("docs/30-architecture/harnesses.md", r"(openai-codex==)([0-9.]+)"),
 )
 CLI_PIN = ("Dockerfile", r"(ARG CODEX_VERSION=)([0-9.]+)")
 

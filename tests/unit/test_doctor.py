@@ -36,3 +36,25 @@ def test_service_config_paths_can_be_constructed_for_doctor(tmp_path: Path) -> N
     )
 
     assert config.database.parent.name == "state"
+
+
+def test_doctor_accepts_installed_sdk_and_rejects_other_versions(tmp_path, monkeypatch):
+    from agentd import doctor
+    from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
+
+    config = ServiceConfig(
+        database=tmp_path / "state.sqlite",
+        workspace_root=tmp_path / "workspaces",
+        codex_home=tmp_path / "codex-home",
+        uv_cache=tmp_path / "uv-cache",
+    )
+    check = next(
+        c for c in doctor.run_doctor(config).checks if c.name == "openai-codex"
+    )
+    assert check.ok
+    assert check.detail == PINNED_OPENAI_CODEX_VERSION
+    monkeypatch.setattr(doctor, "version", lambda name: "0.0.1")
+    check = next(
+        c for c in doctor.run_doctor(config).checks if c.name == "openai-codex"
+    )
+    assert not check.ok

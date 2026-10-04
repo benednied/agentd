@@ -21,8 +21,8 @@ Python dependency in `pyproject.toml` and `uv.lock`. The Dockerfile's
 worker runtime. Neither executable upgrades itself at worker startup.
 
 `Prepare Codex updates` runs weekly on Monday at 07:17 UTC or on manual dispatch.
-It reads stable releases from PyPI and npm, synchronizes the SDK dependency and
-its two version guards, resolves `uv.lock`, runs the full CI checks, and builds
+It reads stable releases from PyPI and npm, synchronizes the SDK dependency, shared
+runtime version pin, and current architecture documentation, resolves `uv.lock`, runs the full CI checks, and builds
 the container before opening or refreshing `codex/dependency-updates`. Invalid
 versions, downgrades, inconsistent pins, resolution failures, test failures, or
 build failures stop PR publication. Enable GitHub Actions' permission to create

@@ -89,8 +89,8 @@ def test_model_check_fails_closed(pages, error):
 
 def test_inconsistent_sdk_guards_stop_update(tmp_path):
     seed(tmp_path)
-    path = tmp_path / "deploy/security/runtime_sandbox_probe.py"
-    pattern = updater.SDK_PINS[-1][1]
+    path = tmp_path / "src/agentd/codex_versions.py"
+    pattern = updater.SDK_PINS[1][1]
     path.write_text(updater.re.sub(pattern, lambda m: m[1] + "0.0.1", path.read_text()))
     before = path.read_text()
     with pytest.raises(ValueError, match="disagree"):

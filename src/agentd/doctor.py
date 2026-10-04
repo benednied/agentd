@@ -12,9 +12,8 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
 from agentd.config import ServiceConfig
-
-PINNED_OPENAI_CODEX_VERSION = "0.144.4"
 
 
 @dataclass(frozen=True, slots=True)

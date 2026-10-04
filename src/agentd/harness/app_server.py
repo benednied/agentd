@@ -17,9 +17,9 @@ from openai_codex.async_client import AsyncCodexClient
 from openai_codex.client import CodexConfig
 from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
 
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
 from agentd.domain.models import JsonValue
 
-PINNED_OPENAI_CODEX_VERSION = "0.160.0"
 DEFAULT_CODEX_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_PERMISSION_PROFILE = "agentd-workspace"

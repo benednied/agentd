@@ -605,9 +605,7 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     )
     payload = (DEPLOY / "security" / "sandbox_payload.py").read_text(encoding="utf-8")
 
-    from agentd.harness.app_server import PINNED_OPENAI_CODEX_VERSION
-
-    assert f'EXPECTED_SDK_VERSION = "{PINNED_OPENAI_CODEX_VERSION}"' in preflight
+    assert "EXPECTED_SDK_VERSION = PINNED_OPENAI_CODEX_VERSION" in preflight
     assert "bundled_codex_path" in preflight
     assert "launch_args_override" not in preflight
     assert "CommandExecParams" not in preflight

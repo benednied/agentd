@@ -22,9 +22,10 @@ from openai_codex.generated.v2_all import (
     PermissionProfileListResponse,
 )
 
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
 from agentd.harness.app_server import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT
 
-EXPECTED_SDK_VERSION = "0.160.0"
+EXPECTED_SDK_VERSION = PINNED_OPENAI_CODEX_VERSION
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
 CONFIG_FILE = Path("/home/bened/.local/share/agentd/codex-home/config.toml")
 STATE_DATABASE = Path("/home/bened/.local/state/agentd/state.sqlite")
