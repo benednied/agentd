@@ -158,7 +158,7 @@ docker exec agentd-selfhost-agentd-1 agentd submit \
   --objective "Review and improve the self-hosting operator documentation; run validation" \
   --p50 60000 --p90 150000 --p99 300000 \
   --quota 150000 --quota-maximum 350000 --quota-pool codex \
-  --harness codex --model-class gpt-5.6-terra \
+  --harness codex --model-class gpt-6-luna \
   --accept ".venv/bin/ruff check . and .venv/bin/pytest tests/deployment -q pass"
 docker exec agentd-selfhost-agentd-1 agentd jobs
 ```

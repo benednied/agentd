@@ -110,8 +110,8 @@ def test_submit_persists_codex_cumulative_maximum(
         job = store.list_jobs()[0]
     assert job.quota_budget.maximum == 150_000
     assert job.quota_budget.unit is QuotaUnit.TOKENS
-    assert job.preferred_model_class == "gpt-5.6-terra"
-    assert job.minimum_model_class == "gpt-5.6-terra"
+    assert job.preferred_model_class == "gpt-6-luna"
+    assert job.minimum_model_class == "gpt-6-luna"
     assert job.base_ref == "f360390442659908c6a4b740b988c76b1dddef6c"
 
 

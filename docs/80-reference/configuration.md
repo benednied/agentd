@@ -14,8 +14,8 @@ validated when configuration is constructed.
 | `AGENTD_WORKSPACE_ROOT` | `$XDG_DATA_HOME/agentd/workspaces` | filesystem path |
 | `AGENTD_CODEX_HOME` | `$XDG_DATA_HOME/agentd/codex-home` | filesystem path |
 | `UV_CACHE_DIR` | `$XDG_CACHE_HOME/uv` | filesystem path |
-| `AGENTD_CODEX_MODEL` | `gpt-5.6-terra` | string |
-| `AGENTD_CODEX_REASONING_EFFORT` | `medium` | string |
+| `AGENTD_CODEX_MODEL` | `gpt-6-luna` | string |
+| `AGENTD_CODEX_REASONING_EFFORT` | `xhigh` | string |
 | `AGENTD_POLL_SECONDS` | `1` | finite positive number |
 | `AGENTD_WORKER_HEARTBEAT_SECONDS` | `15` | finite positive number |
 | `AGENTD_ACCOUNT_POLL_SECONDS` | `60` | finite positive number |
@@ -27,8 +27,8 @@ validated when configuration is constructed.
 | `AGENTD_LOG_LEVEL` | `INFO` | supported Loguru level |
 | `AGENTD_LOG_FORMAT` | `json` | `json` or `text` |
 
-The trusted production composition enforces model `gpt-5.6-terra` and reasoning
-effort `medium`. The portable configuration can represent other values for tests
+The trusted production composition enforces model `gpt-6-luna` and reasoning
+effort `xhigh`. The portable configuration can represent other values for tests
 and local integrations.
 
 ## Remote worker controller

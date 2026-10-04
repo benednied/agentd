@@ -520,7 +520,7 @@ def _submit(
 ) -> None:
     harnesses = tuple(args.harness or ["fake"])
     model_class = args.model_class or (
-        "gpt-5.6-terra" if "codex" in harnesses else "standard"
+        "gpt-6-luna" if "codex" in harnesses else "standard"
     )
     job = Job(
         project=args.project,
