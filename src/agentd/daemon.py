@@ -186,7 +186,7 @@ class AgentDaemon:
                     decision = detect_provider_reset(
                         previous_snapshot,
                         current_snapshot,
-                        at=now,
+                        at=self._clock(),
                     )
                     if decision.confirmed:
                         event = reset_event_for_decision(
@@ -210,7 +210,6 @@ class AgentDaemon:
                             ).info("provider_reset_applied")
                 self._account_snapshot = current_snapshot
                 self._control_plane.apply_provider_snapshot(current_snapshot)
-                self._last_account_refresh = now
                 event_logger(component="account_oracle").info(
                     "provider_quota_refreshed"
                 )
@@ -219,8 +218,11 @@ class AgentDaemon:
                 # becomes stale; the coordinator then blocks nonurgent work.
                 self._record_error(error, operation="provider_quota_refresh")
             finally:
-                self._last_account_refresh = now
+                self._last_account_refresh = self._clock()
                 self._refreshed_admissions.update(admission_keys)
+        # Polling can take seconds. Evaluate telemetry against the current clock,
+        # not tick entry, or a freshly fetched snapshot appears to be in the future.
+        now = self._clock()
         if isinstance(self._control_plane, _ReconcilableControlPlane):
             await self._control_plane.reconcile_managed_runs(
                 self._account_snapshot, at=now

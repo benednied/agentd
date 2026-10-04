@@ -13,6 +13,7 @@ from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.descriptor import RemoteCodingDescriptor
 from agentd.coding.models import RepositoryProfile
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
+from agentd.daemon import AgentDaemon
 from agentd.domain.enums import JobState, QuotaUnit, RunOutcome, RunState
 from agentd.domain.models import (
     EffortEstimate,
@@ -29,6 +30,8 @@ from agentd.domain.models import (
 )
 from agentd.harness.registry import DriverRegistry
 from agentd.intake.models import IntakePolicy, SourceIssue
+from agentd.runtime.accounts import AccountPolicyThresholds
+from agentd.runtime.governor import ProviderStopPolicy
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers import (
@@ -153,7 +156,7 @@ class RecoveryRig:
         )
 
 
-def _controller(path, store, server, worker, backend_type):
+def _controller(path, store, server, worker, backend_type, **policies):
     host, port = server.address
     client = RemoteWorkerClient(
         host,
@@ -171,13 +174,14 @@ def _controller(path, store, server, worker, backend_type):
         GitWorkspaceManager(path / "unused-controller-worktrees"),
         DriverRegistry([RemoteCodingDescriptor(worker.capabilities().features)]),
         backends=BackendRegistry([backend]),
+        **policies,
     )
     return client, backend, coordinator, ControlPlane(store, coordinator=coordinator)
 
 
 @asynccontextmanager
 async def coding_rig(
-    path, *, lose_ack=False, provider=None, validation_commands=(("true",),)
+    path, *, lose_ack=False, provider=None, validation_commands=(("true",),), **policies
 ):
     repo = path / "repo"
     repo.mkdir()
@@ -246,6 +250,7 @@ async def coding_rig(
         server,
         worker,
         LostStartAckBackend if lose_ack else RemoteWorkerBackend,
+        **policies,
     )
     plane.register_node(
         WorkerNode(
@@ -440,5 +445,83 @@ def test_worker_terminal_result_recovers_without_live_observation_handle(
             assert rig.store.get_run(run.id).result.consumed_quota == 35
             assert rig.store.get_quota_pool("account").remaining == 965
             assert rig.provider.starts == len(rig.store.list_runs(rig.job.id)) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stop", ["reserve", "future", "stale", "fetch_failed"])
+def test_slow_quota_poll_preserves_healthy_run_but_still_enforces_reserve(
+    tmp_path, stop
+):
+    async def scenario():
+        now = [utc_now()]
+        used = [9]
+        skew = [timedelta()]
+        failed = [False]
+        async with coding_rig(
+            tmp_path,
+            account_policy=AccountPolicyThresholds(
+                background_block_used_percent=90,
+                urgent_only_used_percent=90,
+                require_complete_windows=True,
+            ),
+            provider_stop_policy=ProviderStopPolicy(remaining_fraction=0.1),
+        ) as rig:
+            window = {
+                "primary_window_minutes": 10080,
+                "primary_reset_at": now[0] + timedelta(days=7),
+                "metadata": {"reported_windows": ["primary"]},
+            }
+            rig.quota(9, **window)
+            run = await rig.plane.dispatch_next()
+            assert run is not None
+
+            class SlowOracle:
+                async def snapshot(self):
+                    await asyncio.sleep(0)
+                    now[0] += timedelta(seconds=20)
+                    if failed[0]:
+                        raise RuntimeError("quota fetch failed")
+                    snapshot = ProviderQuotaSnapshot(
+                        pool_id="account",
+                        bucket_id="account",
+                        primary_used_percent=used[0],
+                        observed_at=now[0] + skew[0],
+                        **window,
+                    )
+                    rig.store.append_provider_quota_snapshot(snapshot)
+                    return snapshot
+
+            daemon = AgentDaemon(
+                rig.plane,
+                account_oracle=SlowOracle(),
+                account_poll_seconds=1,
+                clock=lambda: now[0],
+            )
+            await daemon.tick()
+            assert rig.provider.cancels == 0
+            assert rig.store.get_run(run.id).state is RunState.RUNNING
+            assert rig.store.list_run_commands(run.id) == []
+            assert rig.store.get_quota_pool("account").remaining == 988
+
+            now[0] += timedelta(seconds=1)
+            if stop == "reserve":
+                used[0] = 90
+            elif stop == "future":
+                skew[0] = timedelta(seconds=1)
+            elif stop == "stale":
+                skew[0] = -timedelta(minutes=6)
+            else:
+                failed[0] = True
+                now[0] += timedelta(minutes=6)
+            await daemon.tick()
+            assert rig.provider.cancels >= 1
+            assert any(
+                command.action == "interrupt"
+                for command in rig.store.list_run_commands(run.id)
+            )
+            assert rig.store.get_job(rig.job.id).state is JobState.SUSPENDED
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert rig.provider.starts == 1
 
     asyncio.run(scenario())
