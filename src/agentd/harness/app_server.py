@@ -20,8 +20,8 @@ from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
 from agentd.domain.models import JsonValue
 
 PINNED_OPENAI_CODEX_VERSION = "0.144.4"
-DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
-DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_CODEX_MODEL = "gpt-6-luna"
+DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_PERMISSION_PROFILE = "agentd-workspace"
 # Error notifications describe a turn-level problem, but they are not a final
 # turn result.  In particular, ``ErrorNotification.willRetry`` may be true and

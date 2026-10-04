@@ -16,8 +16,8 @@ def test_service_config_has_portable_xdg_defaults() -> None:
     assert config.codex_home == Path("/home/operator/.local/share/agentd/codex-home")
     assert config.uv_cache == Path("/home/operator/.cache/uv")
     assert config.uv_python_install_directory == Path("/home/operator/.cache/uv/python")
-    assert config.model == "gpt-5.6-terra"
-    assert config.reasoning_effort == "medium"
+    assert config.model == "gpt-6-luna"
+    assert config.reasoning_effort == "xhigh"
     assert config.worker_heartbeat_seconds == 15
     assert config.account_poll_seconds == 60
     assert config.account_stale_seconds == 300
@@ -34,8 +34,8 @@ def test_service_config_parses_explicit_environment() -> None:
             "AGENTD_WORKSPACE_ROOT": "/workspaces",
             "AGENTD_CODEX_HOME": "/codex-home",
             "UV_CACHE_DIR": "/uv-cache",
-            "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
-            "AGENTD_CODEX_REASONING_EFFORT": "medium",
+            "AGENTD_CODEX_MODEL": "gpt-6-luna",
+            "AGENTD_CODEX_REASONING_EFFORT": "xhigh",
             "AGENTD_POLL_SECONDS": "2.5",
             "AGENTD_WORKER_HEARTBEAT_SECONDS": "12.5",
             "AGENTD_ACCOUNT_POLL_SECONDS": "30",
@@ -54,7 +54,7 @@ def test_service_config_parses_explicit_environment() -> None:
     assert config.codex_home == Path("/codex-home")
     assert config.uv_cache == Path("/uv-cache")
     assert config.uv_python_install_directory == Path("/uv-cache/python")
-    assert config.reasoning_effort == "medium"
+    assert config.reasoning_effort == "xhigh"
     assert config.poll_interval_seconds == 2.5
     assert config.worker_heartbeat_seconds == 12.5
     assert config.account_poll_seconds == 30

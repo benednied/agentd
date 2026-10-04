@@ -53,8 +53,8 @@ def _rendered_service() -> dict[str, object]:
     for name, value in list(service["environment"].items()):
         if str(value).startswith("${"):
             service["environment"][name] = {
-                "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
-                "AGENTD_CODEX_REASONING_EFFORT": "medium",
+                "AGENTD_CODEX_MODEL": "gpt-6-luna",
+                "AGENTD_CODEX_REASONING_EFFORT": "xhigh",
             }.get(name, "1")
     return service
 
@@ -230,8 +230,8 @@ def test_rendered_compose_security_validator_rejects_unreviewed_exposure(
         for name, value in list(service["environment"].items()):
             if str(value).startswith("${"):
                 service["environment"][name] = {
-                    "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
-                    "AGENTD_CODEX_REASONING_EFFORT": "medium",
+                    "AGENTD_CODEX_MODEL": "gpt-6-luna",
+                    "AGENTD_CODEX_REASONING_EFFORT": "xhigh",
                 }.get(name, "1")
         if case == "environment":
             service["environment"]["UNREVIEWED_SECRET"] = "forbidden"
@@ -272,8 +272,8 @@ def test_rendered_validator_requires_explicit_exact_alternate_mount_policy(
     for name, value in list(service["environment"].items()):
         if str(value).startswith("${"):
             service["environment"][name] = {
-                "AGENTD_CODEX_MODEL": "gpt-5.6-terra",
-                "AGENTD_CODEX_REASONING_EFFORT": "medium",
+                "AGENTD_CODEX_MODEL": "gpt-6-luna",
+                "AGENTD_CODEX_REASONING_EFFORT": "xhigh",
             }.get(name, "1")
     rendered = tmp_path / "compose-alternate.json"
     rendered.write_text(

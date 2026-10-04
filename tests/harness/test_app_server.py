@@ -54,19 +54,19 @@ def test_openai_client_uses_experimental_permission_profile_wire_fields() -> Non
     async def scenario() -> str:
         thread_id = await client.start_thread(
             cwd="/leases/job-1",
-            model="gpt-5.6-terra",
+            model="gpt-6-luna",
         )
         await client.resume_thread(
             thread_id,
             cwd="/leases/job-1",
-            model="gpt-5.6-terra",
+            model="gpt-6-luna",
         )
         return await client.start_turn(
             thread_id,
             "do the work",
             cwd="/leases/job-1",
-            model="gpt-5.6-terra",
-            effort="medium",
+            model="gpt-6-luna",
+            effort="xhigh",
             output_schema=schema,
         )
 
@@ -80,7 +80,7 @@ def test_openai_client_uses_experimental_permission_profile_wire_fields() -> Non
                 "approvalPolicy": "never",
                 "cwd": "/leases/job-1",
                 "ephemeral": False,
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-luna",
                 "permissions": "agentd-workspace",
                 "runtimeWorkspaceRoots": ["/leases/job-1"],
                 "serviceName": "agentd",
@@ -93,7 +93,7 @@ def test_openai_client_uses_experimental_permission_profile_wire_fields() -> Non
                 {
                     "approvalPolicy": "never",
                     "cwd": "/leases/job-1",
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-luna",
                     "permissions": "agentd-workspace",
                     "runtimeWorkspaceRoots": ["/leases/job-1"],
                 },
@@ -107,8 +107,8 @@ def test_openai_client_uses_experimental_permission_profile_wire_fields() -> Non
                 {
                     "approvalPolicy": "never",
                     "cwd": "/leases/job-1",
-                    "effort": "medium",
-                    "model": "gpt-5.6-terra",
+                    "effort": "xhigh",
+                    "model": "gpt-6-luna",
                     "outputSchema": schema,
                     "permissions": "agentd-workspace",
                     "runtimeWorkspaceRoots": ["/leases/job-1"],

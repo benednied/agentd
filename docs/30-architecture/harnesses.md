@@ -16,8 +16,8 @@ rank, scarcity, or scheduler reasoning.
   process-group termination behavior but has no managed restart or live-token path.
 - `CodexDriver` remains a Python import alias for the legacy CLI adapter.
 
-Managed production turns are fixed to model `gpt-5.6-terra` and reasoning effort
-`medium` at the trusted runtime boundary. The SDK adapter uses the reviewed
+Managed production turns are fixed to model `gpt-6-luna` and reasoning effort
+`xhigh` at the trusted runtime boundary. The SDK adapter uses the reviewed
 `agentd-workspace` permission profile, the validated lease as its dynamic writable
 root, and no access to Codex account state or agentd SQLite state.
 

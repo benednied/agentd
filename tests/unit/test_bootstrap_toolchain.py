@@ -13,7 +13,9 @@ from agentd.config import ServiceConfig
     ("override", "message"),
     [
         ({"model": "experimental"}, "Production deployment model"),
+        ({"model": "gpt-5.6-terra"}, "Production deployment model"),
         ({"reasoning_effort": "high"}, "Production deployment reasoning effort"),
+        ({"reasoning_effort": "medium"}, "Production deployment reasoning effort"),
     ],
 )
 def test_production_policy_is_enforced_at_composition_boundary(

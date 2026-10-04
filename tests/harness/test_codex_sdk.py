@@ -183,7 +183,7 @@ class ScriptedAppServerClient:
         self.closed = True
 
     async def start_thread(self, *, cwd: str, model: str) -> str:
-        assert model == "gpt-5.6-terra"
+        assert model == "gpt-6-luna"
         return "thread-1"
 
     async def resume_thread(self, thread_id: str, *, cwd: str, model: str) -> str:
@@ -452,8 +452,8 @@ def test_sdk_driver_streams_usage_commands_and_structured_terminal_result(
         assert client.interrupts == [("thread-1", "turn-1")]
 
         call = client.turn_calls[0]
-        assert call.model == "gpt-5.6-terra"
-        assert call.effort == "medium"
+        assert call.model == "gpt-6-luna"
+        assert call.effort == "xhigh"
         assert call.output_schema["additionalProperties"] is False
         assert client.closed
 
@@ -517,7 +517,7 @@ def test_supervisor_recovers_thread_and_replays_pending_checkpoint(
         handle = await second_driver.recover("run-1", execution)
         result = await second_driver.collect(handle)
 
-        assert second.resumed == [("thread-1", "/workspace", "gpt-5.6-terra")]
+        assert second.resumed == [("thread-1", "/workspace", "gpt-6-luna")]
         assert "Current bounded assignment" in second.turn_calls[0].prompt
         assert "structured durable checkpoint" in second.steers[0][2]
         assert "checkpoint-after-restart" in store.acknowledgements
@@ -574,7 +574,7 @@ def test_supervisor_continues_terminal_thread_without_double_charging(
         second_result = await driver.collect(second_handle)
 
         assert second_handle.id == first_handle.id
-        assert second.resumed == [("thread-1", "/workspace", "gpt-5.6-terra")]
+        assert second.resumed == [("thread-1", "/workspace", "gpt-6-luna")]
         assert "Repair the review findings" in second.turn_calls[0].prompt
         assert second_result.usage is not None
         assert second_result.usage.total_tokens == 40

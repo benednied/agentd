@@ -34,7 +34,7 @@ the limitations below are not commitments to future capabilities.
 - Invalid terminal telemetry leaves a job in `METERING_PENDING`; there is no
   automatic provider-side settlement.
 - The trusted deployment currently fixes Python 3.14, the `dev` extra, model
-  `gpt-5.6-terra`, and reasoning effort `medium` at the production boundary.
+  `gpt-6-luna`, and reasoning effort `xhigh` at the production boundary.
 - SQLite schema version 5 bootstraps version 0 as version 1 and applies the
   explicit `v1 -> v2 -> v3 -> v4 -> v5` migration chain. Version 5 adds GitHub
   source observations and approval events. Future schema changes still

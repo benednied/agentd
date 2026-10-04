@@ -54,8 +54,8 @@ class ServiceConfig:
     workspace_root: Path
     codex_home: Path
     uv_cache: Path
-    model: str = "gpt-5.6-terra"
-    reasoning_effort: str = "medium"
+    model: str = "gpt-6-luna"
+    reasoning_effort: str = "xhigh"
     poll_interval_seconds: float = 1.0
     worker_heartbeat_seconds: float = 15.0
     account_poll_seconds: float = 60.0
@@ -142,10 +142,10 @@ class ServiceConfig:
             uv_cache=Path(
                 values.get("UV_CACHE_DIR", str(cache_home / "uv"))
             ).expanduser(),
-            model=values.get("AGENTD_CODEX_MODEL", "gpt-5.6-terra"),
+            model=values.get("AGENTD_CODEX_MODEL", "gpt-6-luna"),
             reasoning_effort=values.get(
                 "AGENTD_CODEX_REASONING_EFFORT",
-                "medium",
+                "xhigh",
             ),
             poll_interval_seconds=_positive_float(
                 values,

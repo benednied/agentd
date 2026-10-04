@@ -30,8 +30,8 @@ from agentd.workers.protocol import WorkerBackend
 from agentd.workers.registry import BackendRegistry
 from agentd.workspaces.git import GitWorkspaceManager
 
-_PRODUCTION_MODEL = "gpt-5.6-terra"
-_PRODUCTION_REASONING_EFFORT = "medium"
+_PRODUCTION_MODEL = "gpt-6-luna"
+_PRODUCTION_REASONING_EFFORT = "xhigh"
 
 
 @dataclass(slots=True)

@@ -137,7 +137,7 @@ uv run agentd --db .agentd/state.sqlite submit \
   --objective "Implement and validate the bounded change" \
   --p50 25000 --p90 75000 --p99 100000 \
   --quota 75000 --quota-maximum 100000 --quota-pool codex \
-  --harness codex --model-class gpt-5.6-terra \
+  --harness codex --model-class gpt-6-luna \
   --accept "Tests pass"
 ```
 

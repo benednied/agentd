@@ -48,10 +48,10 @@ rm -f -- "$archive"
 [ -f "$staging/Dockerfile" ] && [ -f "$staging/deploy/compose.yaml" ] \
     || die "release commit does not contain deployment artifacts"
 
-model=${AGENTD_CODEX_MODEL:-gpt-5.6-terra}
-reasoning=${AGENTD_CODEX_REASONING_EFFORT:-medium}
-[ "$model" = gpt-5.6-terra ] || die "production Codex model is fixed to gpt-5.6-terra"
-[ "$reasoning" = medium ] || die "production Codex reasoning effort is fixed to medium"
+model=${AGENTD_CODEX_MODEL:-gpt-6-luna}
+reasoning=${AGENTD_CODEX_REASONING_EFFORT:-xhigh}
+[ "$model" = gpt-6-luna ] || die "production Codex model is fixed to gpt-6-luna"
+[ "$reasoning" = xhigh ] || die "production Codex reasoning effort is fixed to xhigh"
 cat >"$staging/release.env" <<EOF
 AGENTD_IMAGE=$image_repository:$release_sha
 AGENTD_COMPOSE_PROJECT=$AGENTD_COMPOSE_PROJECT
