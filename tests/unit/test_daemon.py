@@ -265,3 +265,36 @@ def test_drain_preserves_collection_and_publication_until_admission_resumes() ->
         assert (plane.dispatches, plane.collections, len(publications)) == (1, 2, 2)
 
     asyncio.run(scenario())
+
+
+def test_slow_publication_does_not_starve_admission_with_stale_worker() -> None:
+    async def scenario() -> None:
+        now = [datetime(2026, 8, 9, 12, tzinfo=UTC)]
+
+        class Plane:
+            heartbeat_at = now[0]
+            admitted = 0
+
+            async def refresh_worker_heartbeats(self):
+                self.heartbeat_at = now[0]
+                return ()
+
+            async def dispatch_next(self):
+                if now[0] - self.heartbeat_at <= timedelta(seconds=30):
+                    self.admitted += 1
+                return None
+
+        async def slow_publication() -> None:
+            now[0] += timedelta(seconds=45)
+
+        plane = Plane()
+        daemon = AgentDaemon(
+            cast(ControlPlane, plane),
+            clock=lambda: now[0],
+            result_reconciler=slow_publication,
+        )
+        await daemon.tick()
+        await daemon.tick()
+        assert plane.admitted == 2
+
+    asyncio.run(scenario())
