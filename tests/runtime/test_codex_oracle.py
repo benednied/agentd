@@ -137,6 +137,7 @@ def test_codex_oracle_preserves_rate_limit_windows_and_opaque_credits() -> None:
         "sdk_version": "0.144.4",
         "runtime_version": "0.144.4",
         "reported_bucket_id": "codex",
+        "reported_windows": ["primary", "secondary"],
     }
 
 
@@ -251,3 +252,132 @@ def test_codex_oracle_marks_explicit_credit_exhaustion() -> None:
 
         assert snapshot.credits_exhausted is True
         assert client.closed
+
+
+def test_explicit_single_window_plan_preserves_reserve_and_round_trips():
+    from datetime import timedelta
+
+    from agentd.coding.controller import coding_provider_policies
+    from agentd.domain.models import utc_now
+    from agentd.runtime.accounts import unattended_provider_wait_reason
+    from agentd.runtime.governor import provider_stop_command
+
+    now = utc_now()
+    account, stop = coding_provider_policies({"provider_reserve_percent": 10})
+    for used in (7, 89.99, 90, 100):
+        client = ScriptedAccountClient(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "planType": "prolite",
+                        "primary": {
+                            "usedPercent": used,
+                            "windowDurationMins": 10080,
+                            "resetsAt": int((now + timedelta(days=6)).timestamp()),
+                        },
+                        "secondary": None,
+                    }
+                },
+            }
+        )
+        snapshot = asyncio.run(
+            CodexAccountOracle(
+                "codex", client_factory=lambda client=client: client
+            ).snapshot()
+        )
+        snapshot = ProviderQuotaSnapshot.from_dict(snapshot.to_dict())
+        assert snapshot.metadata["reported_windows"] == ["primary"]
+        reason = unattended_provider_wait_reason(snapshot, policy=account)
+        command = provider_stop_command(
+            snapshot,
+            run_id="run",
+            at=snapshot.observed_at,
+            policy=stop,
+            account_policy=account,
+        )
+        if used < 90:
+            assert reason is None
+            assert command is None
+        else:
+            assert reason == "quota_provider_pressure"
+            assert command.action == "interrupt"
+
+
+def test_missing_or_incomplete_window_is_not_a_single_window_plan():
+    from datetime import timedelta
+
+    from agentd.coding.controller import coding_provider_policies
+    from agentd.domain.models import utc_now
+    from agentd.runtime.accounts import unattended_provider_wait_reason
+
+    now = utc_now()
+    account, _ = coding_provider_policies({"provider_reserve_percent": 10})
+    primary = {
+        "usedPercent": 7,
+        "windowDurationMins": 10080,
+        "resetsAt": int((now + timedelta(days=6)).timestamp()),
+    }
+    for bucket in (
+        {"primary": primary},
+        {"primary": primary, "secondary": {}},
+        {"primary": primary, "secondary": {"windowDurationMins": 300}},
+        {"primary": {"usedPercent": 7}, "secondary": None},
+        {"primary": None, "secondary": None},
+    ):
+        client = ScriptedAccountClient({"rateLimits": {"limitId": "codex", **bucket}})
+        snapshot = asyncio.run(
+            CodexAccountOracle(
+                "codex", client_factory=lambda client=client: client
+            ).snapshot()
+        )
+        assert (
+            unattended_provider_wait_reason(snapshot, policy=account) == "quota_unknown"
+        )
+
+
+def test_five_hour_window_is_enforced_when_provider_adds_it():
+    from datetime import timedelta
+
+    from agentd.coding.controller import coding_provider_policies
+    from agentd.domain.models import utc_now
+    from agentd.runtime.accounts import unattended_provider_wait_reason
+    from agentd.runtime.governor import provider_stop_command
+
+    now = utc_now()
+    weekly = {
+        "usedPercent": 7,
+        "windowDurationMins": 10080,
+        "resetsAt": int((now + timedelta(days=6)).timestamp()),
+    }
+    client = ScriptedAccountClient(
+        {"rateLimits": {"limitId": "codex", "primary": weekly, "secondary": None}}
+    )
+    oracle = CodexAccountOracle("codex", client_factory=lambda: client)
+    account, stop = coding_provider_policies({"provider_reserve_percent": 10})
+    first = asyncio.run(oracle.snapshot())
+    assert unattended_provider_wait_reason(first, policy=account) is None
+    client.response = {
+        "rateLimits": {
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": 90,
+                "windowDurationMins": 300,
+                "resetsAt": int((now + timedelta(hours=2)).timestamp()),
+            },
+            "secondary": weekly,
+        }
+    }
+    changed = asyncio.run(oracle.snapshot())
+    assert (
+        unattended_provider_wait_reason(changed, policy=account)
+        == "quota_provider_pressure"
+    )
+    command = provider_stop_command(
+        changed,
+        run_id="run",
+        at=changed.observed_at,
+        policy=stop,
+        account_policy=account,
+    )
+    assert command.action == "interrupt"

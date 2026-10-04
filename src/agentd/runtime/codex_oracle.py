@@ -97,6 +97,17 @@ class CodexAccountOracle:
                 "sdk_version": metadata.sdk_version,
                 "runtime_version": metadata.runtime_version,
                 "reported_bucket_id": _optional_string(bucket.get("limitId")),
+                "reported_windows": [
+                    name
+                    for name in ("primary", "secondary")
+                    if bucket[name] is not None
+                ]
+                if all(
+                    name in bucket
+                    and (bucket[name] is None or isinstance(bucket[name], dict))
+                    for name in ("primary", "secondary")
+                )
+                else None,
             },
         )
 
