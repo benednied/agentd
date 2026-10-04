@@ -26,7 +26,7 @@ class AccountPolicyThresholds:
     urgent_only_used_percent: float = 90
     snapshot_stale_after: timedelta = timedelta(minutes=5)
     pre_reset_burn_window: timedelta = timedelta(hours=12)
-    require_both_windows: bool = False
+    require_complete_windows: bool = False
 
     def __post_init__(self) -> None:
         percentages = (
@@ -117,6 +117,36 @@ def snapshot_is_stale(
     return now - snapshot.observed_at > policy.snapshot_stale_after
 
 
+def provider_windows_complete(snapshot: ProviderQuotaSnapshot) -> bool:
+    """Require all reported windows without inventing an absent plan limit.
+
+    Old snapshots with both percentages remain complete. A single-window plan
+    requires explicit oracle evidence that the other slot was null, plus the
+    reported window's duration and reset. Missing response keys are not absence.
+    """
+    if (
+        snapshot.primary_used_percent is not None
+        and snapshot.secondary_used_percent is not None
+    ):
+        return True
+    windows = snapshot.metadata.get("reported_windows")
+    if windows == ["primary"]:
+        return (
+            snapshot.primary_used_percent is not None
+            and snapshot.primary_window_minutes is not None
+            and snapshot.primary_reset_at is not None
+            and snapshot.secondary_used_percent is None
+        )
+    if windows == ["secondary"]:
+        return (
+            snapshot.secondary_used_percent is not None
+            and snapshot.secondary_window_minutes is not None
+            and snapshot.secondary_reset_at is not None
+            and snapshot.primary_used_percent is None
+        )
+    return False
+
+
 def unattended_provider_wait_reason(
     snapshot: ProviderQuotaSnapshot | None,
     *,
@@ -141,9 +171,7 @@ def unattended_provider_wait_reason(
         return "quota_stale"
     if provider_quota_reached(snapshot):
         return "quota_provider_pressure"
-    if policy.require_both_windows and (
-        snapshot.primary_used_percent is None or snapshot.secondary_used_percent is None
-    ):
+    if policy.require_complete_windows and not provider_windows_complete(snapshot):
         return "quota_unknown"
     used = provider_used_percent(snapshot)
     if used is None:

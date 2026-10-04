@@ -45,8 +45,10 @@ Set `provider_reserve_percent: 10` in the trusted controller and publisher
 configuration to protect 10% of both provider windows. This setting overrides the
 legacy admission/checkpoint percentages: admission, top-ups, automatic continuation,
 health/status reporting, and active-run interruption use the same 90% used boundary.
-The most constrained window wins. Both window percentages must be present and
-fresh; missing, future, zero-confidence, or stale telemetry blocks new work and
+The most constrained reported window wins. Every reported window must be fresh
+and have a percentage. An explicitly null window is absent from that plan, not
+unknown usage; a single reported window also requires its duration and reset.
+Missing response keys do not establish that a window is absent; missing, future, zero-confidence, or stale telemetry blocks new work and
 interrupts active work when an unavailable observation is evaluated. Provider
 percentages never become token balances. The independent local allowance and
 per-job attempt/token limits still apply.

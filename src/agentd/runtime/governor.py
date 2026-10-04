@@ -69,11 +69,11 @@ def evaluate_provider_stop(
     """Evaluate a provider hard stop without fabricating an absolute balance.
 
     Legacy policy ignores stale telemetry. Explicit reserve policies require
-    both windows and stop when telemetry cannot establish remaining capacity;
-    this is an unavailable-telemetry stop, not a claim that quota was consumed.
+    complete reported windows and stop when telemetry cannot establish remaining
+    capacity; this is an unavailable-telemetry stop, not a quota-consumption claim.
     """
 
-    telemetry_unavailable = account_policy.require_both_windows and (
+    telemetry_unavailable = account_policy.require_complete_windows and (
         unattended_provider_wait_reason(snapshot, at=at, policy=account_policy)
         in {"quota_unknown", "quota_stale"}
     )

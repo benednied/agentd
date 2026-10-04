@@ -126,7 +126,7 @@ def coding_provider_policies(
         AccountPolicyThresholds(
             background_block_used_percent=ceiling,
             urgent_only_used_percent=ceiling,
-            require_both_windows=True,
+            require_complete_windows=True,
         ),
         stop,
     )
