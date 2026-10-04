@@ -768,6 +768,66 @@ def test_failed_stop_without_terminal_proof_keeps_ownership_unresolved(tmp_path)
     asyncio.run(scenario())
 
 
+def test_restarted_worker_recovers_fenced_pre_provider_failure_with_zero_usage(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from agentd.lifecycle import ControllerLock
+
+    async def scenario():
+        worker, _, contract = setup(tmp_path)
+        store = SQLiteStateStore(tmp_path / "sdk.sqlite")
+        fence = ControllerLock(tmp_path / "worker.sqlite")
+        supervisor = SimpleNamespace(observe=lambda _: None)
+        entries = []
+
+        async def crash_before_turn(self, run_id, execution):
+            entries.append(run_id)
+            assert store.get_run(run_id).contract == execution
+            raise OSError("process stopped before SDK session creation")
+
+        monkeypatch.setattr(
+            coding_runtime.CodexSdkDriver, "start_managed", crash_before_turn
+        )
+        try:
+            with fence:
+                sdk = coding_runtime._ContainedCodexDriver(
+                    supervisor, store, model="standard", worker_owner=fence
+                )
+                worker.harnesses = {"codex": sdk}
+                with pytest.raises(OSError):
+                    await worker.start_managed("run", contract)
+            assert not (worker._lease("run") / "result.json").exists()
+            with fence:
+                restarted_sdk = coding_runtime._ContainedCodexDriver(
+                    supervisor, store, model="standard", worker_owner=fence
+                )
+                restarted = CodingHarnessDriver(
+                    worker.root,
+                    worker.profiles,
+                    {"codex": restarted_sdk},
+                    account_pools=worker.account_pools,
+                )
+                result = await restarted.recover_terminal("run")
+                assert result.outcome is RunOutcome.FAILED
+                assert result.metadata["provider_started"] is False
+                assert result.metadata["telemetry_valid"] is True
+                assert result.usage.total_tokens == result.consumed_quota == 0
+                assert await restarted.recover_terminal("run") == result
+                checkpoint = await restarted.capture_checkpoint("run")
+                assert checkpoint["cumulative_quota"] == 0
+                assert (
+                    checkpoint["result_commit"]
+                    == contract.operation.work_order.base_commit
+                )
+            assert entries == ["run"]  # recovery never enters the provider
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_trusted_handoff_does_not_execute_model_git_configuration(tmp_path):
     async def scenario():
         worker, provider, contract = setup(tmp_path)

@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import signal
+import stat
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -70,7 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     github_serve.add_argument("--without-publication", action="store_true")
     github_commands.add_parser("publish", help="run only trusted draft publication")
-    github_commands.add_parser("health", help="check durable telemetry readiness")
+    github_health = github_commands.add_parser(
+        "health", help="check durable telemetry readiness"
+    )
+    github_health.add_argument("--liveness", action="store_true")
+    github_health.add_argument(
+        "--role", choices=("controller", "publisher"), default="controller"
+    )
     github_commands.add_parser(
         "drain", help="stop admission while collecting active work"
     )
@@ -108,6 +115,13 @@ def build_parser() -> argparse.ArgumentParser:
     recover_coding.add_argument("job_id")
     recover_coding.add_argument("--checkpoint", type=Path, required=True)
     recover_coding.add_argument("--actor", required=True)
+    quarantine_coding = github_commands.add_parser(
+        "quarantine", help="retire a host-stopped attempt without settling usage"
+    )
+    quarantine_coding.add_argument("run_id")
+    quarantine_coding.add_argument("--actor", required=True)
+    quarantine_coding.add_argument("--event-id", required=True)
+    quarantine_coding.add_argument("--stop-proof", type=Path, required=True)
 
     worker = commands.add_parser(
         "worker-serve",
@@ -279,9 +293,11 @@ def _run_process_command(
 
 async def _github_command(args: argparse.Namespace) -> int:
     from agentd.coding.controller import (
+        coding_attempt_limits,
         create_backlog,
         create_controller,
         create_intake,
+        guard_coding_resume,
         health,
         load_config,
         status,
@@ -329,17 +345,34 @@ async def _github_command(args: argparse.Namespace) -> int:
 
         await serve_publisher(config)
         return 0
-    if args.github_command in {"resume", "recover"}:
+    if args.github_command in {"resume", "recover", "quarantine"}:
         runtime = create_controller(config)
         try:
             coordinator = runtime.coordinator
-            if args.github_command == "recover":
+            if args.github_command == "quarantine":
+                proof_path = args.stop_proof
+                proof_stat = proof_path.lstat()
+                if not stat.S_ISREG(proof_stat.st_mode) or proof_stat.st_size > 20000:
+                    raise ValueError("Quarantine requires a bounded regular stop proof")
+                proof = json.loads(proof_path.read_text())
+                if not isinstance(proof, dict):
+                    raise ValueError("Quarantine stop proof must be an object")
+                job = await coordinator.quarantine_run(
+                    args.run_id,
+                    actor=args.actor,
+                    event_id=args.event_id,
+                    stop_proof=proof,
+                )
+            elif args.github_command == "recover":
                 job = coordinator.restore_coding_checkpoint(
                     args.job_id,
                     json.loads(args.checkpoint.read_text()),
                     actor=args.actor,
                 )
             else:
+                guard_coding_resume(
+                    runtime.store, args.job_id, coding_attempt_limits(config)
+                )
                 job = await coordinator.resume(
                     args.job_id, maximum_tokens=args.maximum_tokens, actor=args.actor
                 )
@@ -352,18 +385,24 @@ async def _github_command(args: argparse.Namespace) -> int:
             if args.github_command == "health":
                 report = health(config, store)
                 print(json.dumps(report, indent=2))
-                return 0 if report["admission_telemetry_ready"] else 1
+                ready = (
+                    report["liveness"][args.role]["live"]
+                    if args.liveness
+                    else report["admission_telemetry_ready"]
+                )
+                return 0 if ready else 1
             if args.github_command == "status":
+                reports = status(store, attempt_limits=coding_attempt_limits(config))
                 if config.get("backlog"):
                     backlog = create_backlog(config, create_intake(config, store))
                     print(
                         json.dumps(
-                            {"jobs": status(store), "backlog": backlog.ledger.status()},
+                            {"jobs": reports, "backlog": backlog.ledger.status()},
                             indent=2,
                         )
                     )
                 else:
-                    print(json.dumps(status(store), indent=2))
+                    print(json.dumps(reports, indent=2))
             elif args.github_command in {"plan", "approve-graph"}:
                 if not config.get("backlog"):
                     raise ValueError("configure a backlog epic or explicit issue set")

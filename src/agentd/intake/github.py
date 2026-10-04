@@ -63,4 +63,7 @@ class GitHubIssueSource:
             state=str(data["state"]),
             labels=tuple(str(label["name"]) for label in data.get("labels", [])),
             is_pull_request="pull_request" in data,
+            author_login=data.get("user", {}).get("login"),
+            author_id=data.get("user", {}).get("id"),
+            created_at=data.get("created_at"),
         )

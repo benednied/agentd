@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,7 @@ class DependencyRuntimePreparation:
                 shutil.copytree(source, destination, symlinks=True)
             else:
                 shutil.copy2(source, destination)
+            self._make_copy_writable(destination)
             self._relocate(destination, source)
             prepared.append(destination)
         return tuple(prepared)
@@ -95,6 +97,42 @@ class DependencyRuntimePreparation:
                         raise DependencyPreparationError(
                             "nested dependency symlink escapes immutable runtime roots"
                         )
+
+    @staticmethod
+    def _make_copy_writable(destination: Path) -> None:
+        """Restore owner writes in the private copy without touching symlinks."""
+
+        def writable(path: Path) -> None:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                return
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) or not (stat.S_ISREG(opened.st_mode) or stat.S_ISDIR(opened.st_mode)):
+                    raise DependencyPreparationError(
+                        "dependency copy changed during preparation"
+                    )
+                if opened.st_uid != os.geteuid():
+                    raise DependencyPreparationError(
+                        "dependency copy must belong to the worker"
+                    )
+                # fchmod works on older Linux runtimes without fchmodat2 support.
+                # The descriptor pins the checked copy and never follows a link.
+                os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) | stat.S_IWUSR)
+            finally:
+                os.close(descriptor)
+
+        writable(destination)
+        if destination.is_dir():
+            for directory, dirs, files in os.walk(destination, followlinks=False):
+                for name in (*dirs, *files):
+                    writable(Path(directory) / name)
 
     @staticmethod
     def _relocate(destination: Path, source: Path) -> None:

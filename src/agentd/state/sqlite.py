@@ -11,7 +11,7 @@ import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from threading import RLock
@@ -21,8 +21,10 @@ from agentd.domain.enums import (
     AllocationState,
     JobState,
     QuotaMode,
+    QuotaUnit,
     ReservationState,
     RunState,
+    WorkspaceState,
 )
 from agentd.domain.models import (
     AgentRequestRecord,
@@ -206,7 +208,7 @@ CREATE TABLE IF NOT EXISTS run_command_acks (
 );
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -393,11 +395,23 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS run_quarantines ("
+        "run_id TEXT PRIMARY KEY REFERENCES runs(id), "
+        "job_id TEXT NOT NULL REFERENCES jobs(id), "
+        "event_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, "
+        "created_at TEXT NOT NULL, payload TEXT NOT NULL)"
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: migrate_intake,
     # Existing v5 controllers already have source provenance but not backlog
     # gates/bindings or durable report deduplication. Preserve all old rows.
     5: migrate_intake,
+    6: migrate_intake,
+    7: _migrate_v7_to_v8,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
@@ -968,6 +982,14 @@ class SQLiteStateStore(IntakeStoreMixin):
         persisted = _load(row["payload"], Job.from_dict)
         if persisted != expected:
             raise ConcurrentStateError(f"Job {job.id} changed concurrently")
+        quarantined = self._connection.execute(
+            "SELECT 1 FROM runs WHERE job_id = ? AND state = ? LIMIT 1",
+            (job.id, RunState.QUARANTINED.value),
+        ).fetchone()
+        if quarantined is not None and job.state is not JobState.METERING_PENDING:
+            raise ConcurrentStateError(
+                "Quarantined attempt requires explicit final accounting settlement"
+            )
         if job.state is JobState.ADMITTED:
             gate = self.backlog_gate(job.id)
             if gate is not None and (
@@ -981,6 +1003,7 @@ class SQLiteStateStore(IntakeStoreMixin):
                 source["revoked"]
                 or not source["eligible"]
                 or source["revision"] != source["approved_revision"]
+                or self.github_job_held(job.id)
             ):
                 raise ConcurrentStateError("GitHub source approval was revoked")
         persisted_state = JobState(row["state"])
@@ -1390,6 +1413,86 @@ class SQLiteStateStore(IntakeStoreMixin):
             )
             return updated
 
+    def apply_local_allowance(self, event: QuotaResetEvent) -> QuotaPool:
+        """Apply one administrative spending window without changing provider state.
+
+        The grant and its ledger entry share a transaction with usage writes.
+        Reservations, debt, usage samples and provider observations survive it.
+        An older unseen window cannot refill a newer window after clock rollback.
+        """
+        from agentd.runtime.allowance import LOCAL_ALLOWANCE_SOURCE
+
+        self._validate_reset_event(event)
+        source_parts = event.source.removeprefix(LOCAL_ALLOWANCE_SOURCE).split(":")
+        if (
+            not event.source.startswith(LOCAL_ALLOWANCE_SOURCE)
+            or len(source_parts) != 2
+            or not all(source_parts)
+            or event.mode is not QuotaMode.RESET_CONFIRMED
+            or event.expected_reset_at is None
+            or event.expected_reset_at.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Local allowance requires an administrative window grant")
+        policy_prefix = LOCAL_ALLOWANCE_SOURCE + source_parts[0] + ":"
+        with self._lock, self._transaction():
+            existing = self._connection.execute(
+                "SELECT payload FROM quota_reset_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            if existing is not None:
+                stored = _load(existing["payload"], QuotaResetEvent.from_dict)
+                if stored != event:
+                    raise ConcurrentStateError(
+                        f"Local allowance event {event.id} already differs"
+                    )
+                return self.get_quota_pool(event.pool_id)
+            pool = self.get_quota_pool(event.pool_id)
+            if pool.unit is not QuotaUnit.TOKENS:
+                raise ValueError("Local token allowance requires a token quota pool")
+            previous_rows = self._connection.execute(
+                "SELECT payload FROM quota_reset_events WHERE pool_id = ?",
+                (event.pool_id,),
+            ).fetchall()
+            for row in previous_rows:
+                previous = _load(row["payload"], QuotaResetEvent.from_dict)
+                if not previous.source.startswith(policy_prefix):
+                    continue
+                if previous.source != event.source:
+                    raise ConcurrentStateError(
+                        "An established local allowance policy cannot "
+                        "change configuration"
+                    )
+                if (
+                    previous.expected_reset_at is not None
+                    and previous.expected_reset_at >= event.expected_reset_at
+                ):
+                    return pool
+            updated = replace(
+                pool,
+                remaining=event.new_remaining,
+                updated_at=utc_now(),
+            )
+            self._connection.execute(
+                "INSERT INTO quota_reset_events("
+                "id, pool_id, mode, expected_reset_at, confidence, "
+                "new_remaining, source, payload"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.id,
+                    event.pool_id,
+                    event.mode.value,
+                    event.expected_reset_at.isoformat(),
+                    event.confidence,
+                    event.new_remaining,
+                    event.source,
+                    _dump(event),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE quota_pools SET payload = ? WHERE id = ?",
+                (_dump(updated), pool.id),
+            )
+            return updated
+
     @staticmethod
     def _validate_reset_event(event: QuotaResetEvent) -> None:
         if not isinstance(event, QuotaResetEvent):
@@ -1442,6 +1545,7 @@ class SQLiteStateStore(IntakeStoreMixin):
 
     def save_reservation(self, reservation: QuotaReservation) -> None:
         with self._lock, self._transaction():
+            self._reject_quarantined_reservation(reservation.id)
             self._execute_insert_idempotent(
                 "quota_reservations",
                 reservation.id,
@@ -1568,6 +1672,7 @@ class SQLiteStateStore(IntakeStoreMixin):
             raise ValueError("Updated pool quota does not match final consumption")
 
         with self._lock, self._transaction():
+            self._reject_quarantined_reservation(expected_reservation.id)
             self._expect_quota_pool(expected_pool)
             self._expect_reservation(expected_reservation)
             self._connection.execute(
@@ -1650,6 +1755,10 @@ class SQLiteStateStore(IntakeStoreMixin):
         if run_row is None:
             raise EntityNotFoundError(f"Run {sample.run_id} does not exist")
         run = _load(run_row["payload"], RunRecord.from_dict)
+        if run.state is RunState.QUARANTINED:
+            raise ConcurrentStateError(
+                "Quarantined usage requires explicit final accounting settlement"
+            )
         job_row = self._connection.execute(
             "SELECT state, payload FROM jobs WHERE id = ?", (run.job_id,)
         ).fetchone()
@@ -1819,6 +1928,7 @@ class SQLiteStateStore(IntakeStoreMixin):
                 "Minimum dispatchable quota must be finite and non-negative"
             )
         with self._lock, self._transaction():
+            self._reject_quarantined_reservation(reservation_id)
             reservation = self._reservation_for_usage(reservation_id)
             if reservation.state is not ReservationState.ACTIVE:
                 raise ValueError("Only an active reservation can be topped up")
@@ -1893,6 +2003,7 @@ class SQLiteStateStore(IntakeStoreMixin):
         if final_sample is not None and not final_sample.final:
             raise ValueError("A final settlement sample must be marked final")
         with self._lock, self._transaction():
+            self._reject_quarantined_reservation(reservation_id)
             reservation = self._reservation_for_usage(reservation_id)
             if reservation.state in {
                 ReservationState.RELEASED,
@@ -2049,11 +2160,164 @@ class SQLiteStateStore(IntakeStoreMixin):
         with self._lock, self._transaction():
             self._save_run_in_transaction(run, expected)
 
+    def get_run_quarantine(self, run_id: str) -> dict[str, Any] | None:
+        rows = self._all(
+            "SELECT payload FROM run_quarantines WHERE run_id = ?", (run_id,)
+        )
+        return json.loads(rows[0]["payload"]) if rows else None
+
+    def quarantine_run(
+        self,
+        job: Job,
+        transition: StateTransition | None,
+        run: RunRecord,
+        evidence: dict[str, Any],
+        *,
+        expected_job: Job,
+        expected_run: RunRecord,
+    ) -> dict[str, Any]:
+        """Retire proven physical capacity without settling unknown accounting.
+
+        The authenticated worker certificate is checked by the coordinator.
+        Quarantine preserves the entire original result, contract, reservation,
+        pool and usage history; only allocation ownership is released. The
+        audit row and resource/state changes are one transaction.
+        """
+        if (
+            job.state is not JobState.METERING_PENDING
+            or run != replace(expected_run, state=RunState.QUARANTINED)
+            or run.job_id != job.id
+            or evidence.get("run_id") != run.id
+            or evidence.get("job_id") != job.id
+            or evidence.get("node_id") != run.node_id
+            or evidence.get("physical_retired") is not True
+            or evidence.get("metering_unknown") is not True
+            or not isinstance(evidence.get("actor"), str)
+            or not evidence["actor"].strip()
+            or not isinstance(evidence.get("event_id"), str)
+            or not evidence["event_id"].strip()
+            or (
+                run.result is not None
+                and run.result.metadata.get("telemetry_valid") is True
+                and run.result.usage is not None
+            )
+        ):
+            raise ValueError(
+                "Quarantine requires exact physically retired unknown attempt"
+            )
+        with self._lock, self._transaction():
+            existing = self.get_run_quarantine(run.id)
+            if existing is not None:
+                if existing["worker_evidence"] != evidence:
+                    raise ConcurrentStateError("Run quarantine evidence changed")
+                return existing
+            reservation = self._reservation_for_usage(run.reservation_id, job.id)
+            if reservation.state not in {
+                ReservationState.ACTIVE,
+                ReservationState.METERING_PENDING,
+            }:
+                raise ValueError("Unknown usage must retain an outstanding reservation")
+            self._save_job_in_transaction(job, transition, expected_job)
+            self._save_run_in_transaction(run, expected_run, allow_quarantine=True)
+            allocation = self.get_allocation(run.allocation_id)
+            if allocation.job_id != job.id or allocation.node_id != run.node_id:
+                raise ValueError("Quarantine allocation identity mismatch")
+            if allocation.state is AllocationState.ACTIVE:
+                node = self.get_node(run.node_id)
+                if not allocation.resources.fits_within(node.allocated):
+                    raise ConcurrentStateError(
+                        "Quarantine node capacity is inconsistent"
+                    )
+                now = utc_now()
+                released = replace(
+                    allocation, state=AllocationState.RELEASED, released_at=now
+                )
+                updated_node = replace(
+                    node,
+                    allocated=node.allocated - allocation.resources,
+                    updated_at=now,
+                )
+                self._connection.execute(
+                    "UPDATE resource_allocations SET state = ?, payload = ? "
+                    "WHERE id = ?",
+                    (released.state.value, _dump(released), released.id),
+                )
+                self._connection.execute(
+                    "UPDATE nodes SET state = ?, payload = ? WHERE id = ?",
+                    (updated_node.state.value, _dump(updated_node), updated_node.id),
+                )
+            if reservation.state is ReservationState.ACTIVE:
+                pending = replace(reservation, state=ReservationState.METERING_PENDING)
+                self._connection.execute(
+                    "UPDATE quota_reservations SET state = ?, payload = ? WHERE id = ?",
+                    (pending.state.value, _dump(pending), pending.id),
+                )
+            workspace = self.get_workspace(run.workspace_id)
+            if workspace.state is WorkspaceState.LEASED:
+                retained = replace(workspace, state=WorkspaceState.RETAINED)
+                self._connection.execute(
+                    "UPDATE workspaces SET state = ?, payload = ? WHERE id = ?",
+                    (retained.state.value, _dump(retained), retained.id),
+                )
+            session_row = self._connection.execute(
+                "SELECT payload FROM driver_sessions WHERE run_id = ?", (run.id,)
+            ).fetchone()
+            if session_row is not None:
+                session = _load(session_row["payload"], DriverSession.from_dict)
+                inactive = replace(
+                    session,
+                    active=False,
+                    metadata={
+                        **session.metadata,
+                        "physical_quarantine": evidence["event_id"],
+                    },
+                    updated_at=utc_now(),
+                )
+                self._connection.execute(
+                    "UPDATE driver_sessions SET active = 0, updated_at = ?, "
+                    "payload = ? "
+                    "WHERE run_id = ?",
+                    (inactive.updated_at.isoformat(), _dump(inactive), run.id),
+                )
+            audit = {
+                "run_id": run.id,
+                "job_id": job.id,
+                "node_id": run.node_id,
+                "actor": evidence["actor"],
+                "event_id": evidence["event_id"],
+                "physical_retired": True,
+                "metering_unknown": True,
+                "worker_evidence": evidence,
+                "created_at": utc_now().isoformat(),
+            }
+            self._connection.execute(
+                "INSERT INTO run_quarantines VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run.id,
+                    job.id,
+                    evidence["event_id"],
+                    evidence["actor"],
+                    audit["created_at"],
+                    json.dumps(audit, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            return audit
+
     def _save_run_in_transaction(
         self,
         run: RunRecord,
         expected: RunRecord | None,
+        *,
+        allow_quarantine: bool = False,
     ) -> None:
+        if (
+            run.state is RunState.QUARANTINED
+            and not allow_quarantine
+            and (expected is None or expected.state is not RunState.QUARANTINED)
+        ):
+            raise ConcurrentStateError(
+                "Quarantine requires its atomic retirement audit"
+            )
         self._validate_run_links(run)
         row = self._connection.execute(
             "SELECT job_id, payload FROM runs WHERE id = ?", (run.id,)
@@ -2080,6 +2344,8 @@ class SQLiteStateStore(IntakeStoreMixin):
         persisted = _load(row["payload"], RunRecord.from_dict)
         if persisted != expected or row["job_id"] != expected.job_id:
             raise ConcurrentStateError(f"Run {run.id} changed concurrently")
+        if persisted.state is RunState.QUARANTINED and run != persisted:
+            raise ConcurrentStateError("Quarantined run evidence is immutable")
         if expected.job_id != run.job_id:
             raise ValueError(f"Run {run.id} cannot change ownership")
         cursor = self._connection.execute(
@@ -2193,6 +2459,8 @@ class SQLiteStateStore(IntakeStoreMixin):
             if run_row is None:
                 raise EntityNotFoundError(f"Run {session.run_id} does not exist")
             run = _load(run_row["payload"], RunRecord.from_dict)
+            if run.state is RunState.QUARANTINED:
+                raise ConcurrentStateError("Quarantined driver session is immutable")
             if run.driver != session.driver:
                 raise ValueError("Driver session belongs to another driver")
             existing_row = self._connection.execute(
@@ -2295,6 +2563,9 @@ class SQLiteStateStore(IntakeStoreMixin):
         ):
             raise ValueError("Observation cursor and run identifiers must agree")
         with self._lock, self._transaction():
+            run = self.get_run(run_id)
+            if run.state is RunState.QUARANTINED:
+                raise ConcurrentStateError("Quarantined observation is immutable")
             row = self._connection.execute(
                 "SELECT payload FROM driver_sessions WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -2657,6 +2928,19 @@ class SQLiteStateStore(IntakeStoreMixin):
         if _load(row["payload"], QuotaReservation.from_dict) != expected:
             raise ConcurrentStateError(
                 f"Reservation {expected.id} changed concurrently"
+            )
+
+    def _reject_quarantined_reservation(self, reservation_id: str) -> None:
+        rows = self._connection.execute(
+            "SELECT payload FROM runs WHERE state = ?",
+            (RunState.QUARANTINED.value,),
+        ).fetchall()
+        if any(
+            _load(row["payload"], RunRecord.from_dict).reservation_id == reservation_id
+            for row in rows
+        ):
+            raise ConcurrentStateError(
+                "Quarantined reservation requires explicit final accounting settlement"
             )
 
     def _reservation_for_usage(

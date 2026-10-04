@@ -54,6 +54,7 @@ reasoning=${AGENTD_CODEX_REASONING_EFFORT:-medium}
 [ "$reasoning" = medium ] || die "production Codex reasoning effort is fixed to medium"
 cat >"$staging/release.env" <<EOF
 AGENTD_IMAGE=$image_repository:$release_sha
+AGENTD_COMPOSE_PROJECT=$AGENTD_COMPOSE_PROJECT
 AGENTD_STATE_ROOT=$AGENTD_STATE_ROOT
 AGENTD_DB=$AGENTD_DB
 AGENTD_WORKSPACE_ROOT=$AGENTD_WORKSPACE_ROOT
@@ -82,7 +83,8 @@ docker compose \
     --file "$staging/deploy/compose.yaml" \
     config --quiet
 "$staging/deploy/scripts/check-container-security.sh" \
-    "$staging/release.env" static
+    "$staging/release.env" static \
+    "${AGENTD_MOUNT_POLICY:+$staging/deploy/security/selfhost-mount-policy.json}"
 
 mv "$staging" "$release_dir"
 trap - EXIT HUP INT TERM

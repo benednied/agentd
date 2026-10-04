@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
+from agentd.domain.enums import JobState
 from agentd.domain.models import Job
 from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
+
+if TYPE_CHECKING:
+    from agentd.intake.workflow import GitHubWorkflow
 
 
 class IssueSource(Protocol):
@@ -32,8 +36,11 @@ class GitHubIntake:
         self.policies = {policy.repository: policy for policy in policies}
         self.compile_job = compile_job
         self.control_plane = control_plane
+        self.workflow: GitHubWorkflow | None = None
 
     async def poll(self) -> tuple[str, ...]:
+        if self.workflow is not None:
+            await self.workflow.poll_controls()
         observed = []
         for policy in self.policies.values():
             for issue in await asyncio.to_thread(self.source.poll, policy.repository):
@@ -49,7 +56,12 @@ class GitHubIntake:
             old = SourceIssue.from_dict(json.loads(record["payload"]))
             policy = self.policies.get(old.repository)
             if policy is None:
-                await self.control_plane.cancel(job.id)
+                # A repository switch retains historical jobs and delivery.
+                # Global run reconciliation still owns any outstanding attempt.
+                if job.state in {JobState.READY, JobState.ADMITTED} or (
+                    self.store.find_active_run(job.id) is not None
+                ):
+                    await self.control_plane.cancel(job.id)
                 continue
             current = await asyncio.to_thread(
                 self.source.get, old.repository, old.number
@@ -61,6 +73,8 @@ class GitHubIntake:
         policy = self.policies.get(issue.repository)
         if policy is None:
             raise ValueError("repository is not allowlisted")
+        if self.workflow is not None:
+            issue = await self.workflow.prepare_issue(issue)
         decision = self.store.observe_github_issue(issue, policy)
         try:
             job = self.store.get_job(issue.job_id)

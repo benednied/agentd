@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from inspect import isawaitable
 from typing import Any
 
+from agentd.coding.attempts import CodingAttemptLimits, is_proven_preparation_failure
 from agentd.domain.enums import (
     ArtifactKind,
     JobState,
@@ -86,6 +87,7 @@ from agentd.state.base import ConcurrentStateError, EntityNotFoundError, StateSt
 from agentd.workers.errors import WorkerStartUncertainError, WorkerTransportError
 from agentd.workers.protocol import ARTIFACT_VERIFICATION_FEATURE, WorkerBackend
 from agentd.workers.registry import BackendRegistry
+from agentd.workers.remote_protocol import payload_hash
 from agentd.workspaces.base import WorkspaceManager, WorkspaceReleaseError
 
 
@@ -920,7 +922,7 @@ class SchedulerCoordinator:
                 first_error = error
         for job in self._store.list_jobs(frozenset({JobState.METERING_PENDING})):
             run = self._store.latest_run(job.id)
-            if run is None or run.result is None:
+            if run is None or run.state is RunState.QUARANTINED or run.result is None:
                 continue
             marker = run.result.metadata.get(_MANAGED_TELEMETRY_VALID)
             if not isinstance(marker, bool):
@@ -1177,6 +1179,13 @@ class SchedulerCoordinator:
         normal failed operation.  Transport/backend failures remain retryable
         and never fall back to a controller-local driver.
         """
+
+        if run.state is RunState.QUARANTINED:
+            if self._store.get_run_quarantine(run.id) is None:
+                raise LifecycleError(
+                    "Quarantined attempt lacks its physical retirement audit"
+                )
+            return None
 
         # Persisting the worker result is deliberately a separate step from
         # publishing the terminal run/job transition.  If the controller dies
@@ -1473,6 +1482,262 @@ class SchedulerCoordinator:
         self._raise_cleanup_errors(self._cleanup_execution_capacity(job_id, final_run))
         return review
 
+    async def queue_coding_repair(
+        self,
+        job_id: str,
+        *,
+        diagnostics: tuple[str, ...],
+        maximum_attempts: int = 3,
+        maximum_preparation_attempts: int = 3,
+        maximum_total_attempts: int | None = None,
+        actor: str = "trusted-validation",
+        event_id: str | None = None,
+    ) -> Job:
+        """Queue a new bounded coding attempt from a proven stopped result.
+
+        This never changes a prior run, its charges, source intent or limits.
+        Admission is still performed by the ordinary scheduler. The worker
+        captures the completed lease through authenticated lifecycle transport;
+        no model request runs while obtaining that checkpoint.
+        """
+        job = self._store.get_job(job_id)
+        run = self._require_latest_run(job_id)
+        explicit_retry = actor != "trusted-validation" and bool(event_id)
+        stopped_retry = explicit_retry and job.state in {
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.SUSPENDED,
+        }
+        if (
+            (job.state is not JobState.REVIEW and not stopped_retry)
+            or not isinstance(job.operation, CodingOperation)
+            or not isinstance(run.contract.operation, CodingOperation)
+            or run.state
+            not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+                RunState.SUSPENDED,
+            }
+            or run.result is None
+            or (not stopped_retry and run.result.outcome is not RunOutcome.COMPLETED)
+            or run.result.metadata.get("telemetry_valid") is not True
+            or run.result.usage is None
+            or not self._is_remote_run(run)
+        ):
+            raise LifecycleError("Coding repair requires a proven stopped metered run")
+        if (
+            not actor.strip()
+            or not diagnostics
+            or len(diagnostics) > 16
+            or any(not text or "\0" in text or len(text) > 8192 for text in diagnostics)
+        ):
+            raise LifecycleError("Coding repair requires bounded trusted feedback")
+        try:
+            attempts = CodingAttemptLimits(
+                maximum_attempts,
+                maximum_preparation_attempts,
+                maximum_total_attempts,
+            )
+        except ValueError as error:
+            raise LifecycleError(
+                "Coding repair attempt limits must be bounded"
+            ) from error
+        blocked = attempts.blocked_reason(
+            self._store.list_runs(job.id),
+            preparation_retry=is_proven_preparation_failure(run),
+        )
+        if blocked is not None:
+            raise LifecycleError(blocked)
+        if (
+            self._store.find_active_run(job.id) is not None
+            or self._store.find_active_reservation(job.id) is not None
+            or self._store.find_active_allocation(job.id) is not None
+        ):
+            raise LifecycleError("Coding repair ownership or accounting is unresolved")
+        maximum = job.quota_budget.maximum
+        if maximum is None or self._job_consumed(job.id) >= maximum - 1e-9:
+            raise LifecycleError("Coding repair exhausted its cumulative quota maximum")
+
+        def authorized() -> None:
+            source = self._store.github_source_for_job(job.id)
+            gate = self._store.backlog_gate(job.id)
+            held = getattr(self._store, "github_job_held", lambda _: False)(job.id)
+            if (
+                held
+                or (gate is not None and not gate["ready"])
+                or source is None
+                or source["revoked"]
+                or not source["eligible"]
+                or source["revision"] != job.operation.work_order.source_revision
+                or source["approved_revision"] != source["revision"]
+            ):
+                raise LifecycleError("Coding repair source is held or unauthorized")
+
+        authorized()
+        backend = self._backend_for_run(run)
+        capture = getattr(backend, "capture_coding_checkpoint", None)
+        if capture is None:
+            raise LifecycleError("Worker lacks authenticated coding checkpoint capture")
+        evidence = await capture(run.id)
+        if (
+            not isinstance(evidence, dict)
+            or (
+                run.result.commit is not None
+                and evidence.get("result_commit") != run.result.commit
+            )
+            or evidence.get("cumulative_quota")
+            != run.contract.operation.work_order.prior_consumed_quota
+            + run.result.usage.total_tokens
+        ):
+            raise LifecycleError("Coding repair lacks an authenticated checkpoint")
+        self._save_coding_checkpoint(job, run, evidence)
+        checkpoint = self._store.latest_checkpoint(job.id)
+        assert checkpoint is not None
+        capsule = replace(
+            checkpoint.capsule,
+            known_failures=diagnostics,
+            decisions=(f"Repair requested by {actor}; event {event_id or run.id}",),
+        )
+        if checkpoint.capsule != capsule:
+            self._store.save_checkpoint(
+                Checkpoint(job_id=job.id, run_id=run.id, capsule=capsule)
+            )
+        authorized()
+        if stopped_retry and job.state is not JobState.SUSPENDED:
+            suspended, event = transition_job(
+                job,
+                JobState.SUSPENDED,
+                f"Trusted GitHub retry {event_id} retained stopped run {run.id}",
+            )
+            self._store.save_job(suspended, event, expected=job)
+            job = suspended
+        queued, event = transition_job(
+            job,
+            JobState.READY,
+            f"Bounded coding repair requested by {actor}; event {event_id or run.id}",
+        )
+        self._store.save_job(queued, event, expected=job)
+        return queued
+
+    async def quarantine_run(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+        event_id: str,
+        stop_proof: dict[str, Any],
+    ) -> Job:
+        """Retire host-fenced physical ownership after authenticated consent.
+
+        The caller authenticates the GitHub actor/event. Unknown usage and its
+        reservation remain outstanding; no result, counter or refund is made.
+        """
+        if any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 256
+            or "\0" in value
+            for value in (run_id, actor, event_id)
+        ):
+            raise LifecycleError("Quarantine requires an identified trusted event")
+        run = self._store.get_run(run_id)
+        job = self._store.get_job(run.job_id)
+        existing = self._store.get_run_quarantine(run.id)
+        if existing is not None:
+            if (
+                existing["actor"] != actor
+                or existing["event_id"] != event_id
+                or existing["worker_evidence"]["stop_proof_sha256"]
+                != payload_hash(stop_proof)
+            ):
+                raise LifecycleError("Attempt already retired by another trusted event")
+            return job
+        if (
+            run != self._store.latest_run(job.id)
+            or not isinstance(run.contract.operation, CodingOperation)
+            or not isinstance(job.operation, CodingOperation)
+            or not self._is_remote_run(run)
+            or job.state
+            not in {
+                JobState.ADMITTED,
+                JobState.RUNNING,
+                JobState.DRAINING,
+                JobState.CHECKPOINTED,
+                JobState.METERING_PENDING,
+            }
+            or (
+                run.result is not None
+                and run.result.metadata.get("telemetry_valid") is True
+                and run.result.usage is not None
+            )
+        ):
+            raise LifecycleError(
+                "Quarantine requires the latest unknown coding attempt"
+            )
+        start_hash = payload_hash(
+            {"driver": run.driver, "contract": run.contract.to_dict(), "managed": True}
+        )
+        for key, value in {
+            "run_id": run.id,
+            "node_id": run.node_id,
+            "start_hash": start_hash,
+            "job_id": job.id,
+            "actor": actor,
+            "event_id": event_id,
+            "proof_version": 1,
+            "running": False,
+            "pid": 0,
+        }.items():
+            if stop_proof.get(key) != value or (
+                key in {"proof_version", "pid"}
+                and isinstance(stop_proof.get(key), bool)
+            ):
+                raise LifecycleError("Quarantine stop proof identity mismatch")
+        backend = self._backend_for_run(run)
+        quarantine = getattr(backend, "quarantine_run", None)
+        if quarantine is None:
+            raise LifecycleError("Worker does not support physical quarantine")
+        evidence = await quarantine(
+            run.id, actor=actor, event_id=event_id, stop_proof=stop_proof
+        )
+        for key, value in {
+            "proof_version": 1,
+            "run_id": run.id,
+            "job_id": job.id,
+            "node_id": run.node_id,
+            "session_epoch": stop_proof["session_epoch"],
+            "start_hash": start_hash,
+            "actor": actor,
+            "event_id": event_id,
+            "physical_retired": True,
+            "metering_unknown": True,
+            "stop_proof_sha256": payload_hash(stop_proof),
+        }.items():
+            if evidence.get(key) != value or (
+                key in {"physical_retired", "metering_unknown"}
+                and evidence.get(key) is not True
+            ):
+                raise LifecycleError("Worker quarantine certificate identity mismatch")
+        if job.state is JobState.METERING_PENDING:
+            pending, transition = job, None
+        else:
+            pending, transition = transition_job(
+                job,
+                JobState.METERING_PENDING,
+                f"Trusted actor {actor} physically retired run {run.id}; "
+                f"final usage remains unknown; event {event_id}",
+            )
+        self._store.quarantine_run(
+            pending,
+            transition,
+            replace(run, state=RunState.QUARANTINED),
+            evidence,
+            expected_job=job,
+            expected_run=run,
+        )
+        return pending
+
     def promote_suspended_to_review(self, job_id: str) -> Job:
         """Promote a completed, quiescent checkpoint after operator validation."""
 
@@ -1508,6 +1773,11 @@ class SchedulerCoordinator:
 
     async def complete(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
+        latest = self._store.latest_run(job_id)
+        if latest is not None and latest.state is RunState.QUARANTINED:
+            raise LifecycleError(
+                "Physically retired attempt has unresolved final usage"
+            )
         if job.state is JobState.SUSPENDED and isinstance(
             job.operation, CodingOperation
         ):
@@ -1626,6 +1896,15 @@ class SchedulerCoordinator:
         run = self._store.find_active_run(job_id)
         if run is None:
             run = self._store.latest_run(job_id)
+
+        if run is not None and run.state is RunState.QUARANTINED:
+            if self._store.get_run_quarantine(run.id) is None:
+                raise LifecycleError(
+                    "Quarantined attempt lacks its physical retirement audit"
+                )
+            # Closing/revoking the issue cannot manufacture a final result or
+            # release the original outstanding reservation.
+            return job
 
         if job.terminal:
             self._raise_cleanup_errors(
@@ -1950,6 +2229,7 @@ class SchedulerCoordinator:
                         resolved_operation.work_order,
                         resume_from_run_id=checkpoint.run_id,
                         prior_consumed_quota=self._job_consumed(job.id),
+                        repair_context=checkpoint.capsule.known_failures,
                     )
                 )
         typed_operation = self._is_operation_workspace(workspace)
@@ -2350,6 +2630,10 @@ class SchedulerCoordinator:
         completed: bool,
         cancelled: bool = False,
     ) -> list[BaseException]:
+        if run is not None and run.state is RunState.QUARANTINED:
+            if self._store.get_run_quarantine(run.id) is None:
+                return [LifecycleError("Quarantined run lacks its retirement audit")]
+            return []
         errors: list[BaseException] = []
         workspace = self._store.find_workspace(job_id)
         if workspace is not None and workspace.state in {
@@ -2396,6 +2680,10 @@ class SchedulerCoordinator:
     ) -> list[BaseException]:
         """Release retry-safe allocation/quota effects while retaining workspace."""
 
+        if run.state is RunState.QUARANTINED:
+            if self._store.get_run_quarantine(run.id) is None:
+                return [LifecycleError("Quarantined run lacks its retirement audit")]
+            return []
         errors: list[BaseException] = []
         allocation = self._store.find_active_allocation(job_id)
         if allocation is not None:

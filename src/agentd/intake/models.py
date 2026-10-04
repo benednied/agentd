@@ -21,6 +21,10 @@ class SourceIssue:
     state: str = "open"
     labels: tuple[str, ...] = ()
     is_pull_request: bool = False
+    author_login: str | None = None
+    author_id: int | None = None
+    created_at: str | None = None
+    material_updated_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.repository != repository_name(self.repository):
@@ -28,6 +32,9 @@ class SourceIssue:
         if self.repository_id <= 0 or self.number <= 0 or not self.node_id:
             raise ValueError("source requires stable GitHub identities")
         datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
+        for value in (self.created_at, self.material_updated_at):
+            if value is not None:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
         if self.state not in {"open", "closed"}:
             raise ValueError("invalid issue state")
 
@@ -65,7 +72,7 @@ class SourceIssue:
 class IntakePolicy:
     repository: str
     repository_id: int
-    eligibility_label: str = "agentd:approved"
+    eligibility_label: str | None = "agentd:approved"
 
     def __post_init__(self) -> None:
         if (
@@ -73,7 +80,7 @@ class IntakePolicy:
             or self.repository_id <= 0
         ):
             raise ValueError("policy requires a canonical repository and immutable ID")
-        if not self.eligibility_label:
+        if self.eligibility_label is not None and not self.eligibility_label:
             raise ValueError("policy requires an explicit eligibility label")
 
     def eligible(self, issue: SourceIssue) -> bool:
@@ -82,5 +89,7 @@ class IntakePolicy:
             and issue.repository_id == self.repository_id
             and issue.state == "open"
             and not issue.is_pull_request
-            and self.eligibility_label in issue.labels
+            and (
+                self.eligibility_label is None or self.eligibility_label in issue.labels
+            )
         )

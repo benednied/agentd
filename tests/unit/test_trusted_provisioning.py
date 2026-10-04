@@ -141,6 +141,46 @@ def test_provisioner_surfaces_failure_without_secret_output(tmp_path: Path) -> N
         asyncio.run(provisioner.prepare(_lease(workspace)))
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ('[dependency-groups]\ndev = ["pytest"]\n', ("--group", "dev")),
+        ('[project.optional-dependencies]\ndev = ["pytest"]\n', ("--extra", "dev")),
+        ('[project]\nname = "minimal"\n', ()),
+    ],
+)
+def test_development_dependencies_follow_repository_metadata(
+    tmp_path: Path, metadata: str, expected: tuple[str, ...]
+) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(metadata)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(arguments, _cwd, _environment):
+        commands.append(tuple(arguments))
+        return 0, b"", b""
+
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+        development_dependencies=True,
+        runner=runner,
+    )
+    asyncio.run(provisioner.prepare(_lease(workspace)))
+    command = commands[-1]
+    assert command[command.index("uv") :] == (
+        "uv",
+        "sync",
+        "--frozen",
+        *expected,
+        "--python",
+        "3.14",
+    )
+
+
 def test_provisioner_rejects_python_install_outside_dedicated_cache(
     tmp_path: Path,
 ) -> None:
@@ -171,6 +211,47 @@ def test_provisioner_rejects_missing_workspace(tmp_path: Path) -> None:
 
     with pytest.raises(RepositoryProvisioningError, match="does not exist"):
         asyncio.run(provisioner.prepare(_lease(tmp_path / "missing")))
+
+
+@pytest.mark.parametrize("python_pin", ["3.12", "3.12.12"])
+def test_repository_python_pin_overrides_fallback(
+    tmp_path: Path, python_pin: str
+) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / ".python-version").write_text(python_pin + "\n")
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(arguments, _cwd, _environment):
+        commands.append(tuple(arguments))
+        return 0, b"", b""
+
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+        runner=runner,
+    )
+    asyncio.run(provisioner.prepare(_lease(workspace)))
+    assert commands[0][-3:] == ("python", "install", python_pin)
+    assert commands[1][-2:] == ("--python", python_pin)
+
+
+def test_provisioner_rejects_option_like_repository_python_pin(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / ".python-version").write_text("--system")
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+    )
+    with pytest.raises(RepositoryProvisioningError, match="numeric Python version"):
+        asyncio.run(provisioner.prepare(_lease(workspace)))
 
 
 def test_command_runner_kills_and_reaps_process_group_when_cancelled(

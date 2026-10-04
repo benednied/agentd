@@ -113,6 +113,7 @@ class CodingWorkOrder:
     quota_unit: str = "tokens"
     resume_from_run_id: str | None = None
     prior_consumed_quota: float = 0
+    repair_context: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.resume_from_run_id is not None and (
@@ -125,6 +126,13 @@ class CodingWorkOrder:
             raise ValueError("continuation requires remaining cumulative quota")
         if self.prior_consumed_quota and self.resume_from_run_id is None:
             raise ValueError("prior usage requires a checkpoint run")
+        if self.repair_context and self.resume_from_run_id is None:
+            raise ValueError("repair context requires a checkpoint run")
+        if len(self.repair_context) > 16 or any(
+            not isinstance(item, str) or not item or "\0" in item or len(item) > 8192
+            for item in self.repair_context
+        ):
+            raise ValueError("repair context must contain bounded diagnostics")
         repository_name(self.repository)
         exact_commit(self.base_commit)
         for digest in (self.profile_digest, self.source_revision):
@@ -173,6 +181,8 @@ class CodingWorkOrder:
             data.pop("resume_from_run_id")
         if not self.prior_consumed_quota:
             data.pop("prior_consumed_quota")
+        if not self.repair_context:
+            data.pop("repair_context")
         return data
 
     @classmethod
@@ -184,5 +194,6 @@ class CodingWorkOrder:
                 data.get("required_capabilities", ("remote-coding",))
             ),
             "context_references": tuple(data.get("context_references", ())),
+            "repair_context": tuple(data.get("repair_context", ())),
         }
         return cls(**values)

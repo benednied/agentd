@@ -201,18 +201,24 @@ def test_validation_failure_persisted_and_never_published(result, tmp_path, code
     intent = replace(
         intent,
         validation_commands=((sys.executable, "-c", code),),
-        validation_timeout_seconds=0.1,
+        validation_timeout_seconds=0.1 if "time.sleep" in code else 5,
     )
     adapter = Adapter()
     publisher = DraftPublisher(
         PublicationStore(tmp_path / "state.db"), adapter, finalizer()
     )
-    with pytest.raises(PublicationError, match="validation failed"):
+    infrastructure_failure = "time.sleep" in code
+    message = (
+        "infrastructure unavailable" if infrastructure_failure else "validation failed"
+    )
+    with pytest.raises(PublicationError, match=message):
         publisher.publish(intent, collected, repo)
-    with pytest.raises(PublicationError, match="validation failed"):
+    with pytest.raises(PublicationError, match=message):
         publisher.publish(intent, collected, repo)
     assert adapter.pushes == adapter.creates == 0
-    assert publisher.store.bind(intent)["stage"] == "validation_failed"
+    assert publisher.store.bind(intent)["stage"] == (
+        "validation_unavailable" if infrastructure_failure else "validation_failed"
+    )
 
 
 def test_credentials_not_in_validation_environment(result, monkeypatch):
@@ -383,6 +389,95 @@ def test_bundle_import_fetches_new_authorized_base_before_verification(
         )
 
 
+def test_fresh_publication_cache_fetches_base_and_imports_existing_result(
+    result, tmp_path, monkeypatch
+):
+    from agentd import publication
+
+    repo, intent, collected = result
+    evidence = bundle_evidence(repo, intent, tmp_path)
+    cache = tmp_path / "fresh-install" / "agentd.git"
+    real_git = publication._git
+
+    def map_profile_remote(repository, *args, **kwargs):
+        args = tuple(
+            str(repo) if arg == "https://github.com/owner/repo.git" else arg
+            for arg in args
+        )
+        return real_git(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", map_profile_remote)
+    publication.ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", intent.base_commit
+    )
+    assert git(cache, "rev-parse", "--is-bare-repository") == "true"
+    assert git(cache, "remote") == ""
+    ref = publication.import_coding_bundle(intent, collected, evidence, cache)
+    assert git(cache, "rev-parse", ref) == intent.result_commit
+    before = (cache / "config").read_bytes()
+    publication.ensure_authorized_base(
+        cache, "owner/repo", "https://github.com/owner/repo.git", intent.base_commit
+    )
+    assert (cache / "config").read_bytes() == before
+    assert git(cache, "rev-parse", ref) == intent.result_commit
+
+
+@pytest.mark.parametrize("kind", ["empty", "file", "malformed", "symlink", "parent"])
+def test_publication_cache_rejects_existing_invalid_or_symlink_paths(tmp_path, kind):
+    from agentd.publication import prepare_publication_cache
+
+    cache = tmp_path / "agentd.git"
+    if kind == "empty":
+        cache.mkdir()
+    elif kind == "file":
+        cache.write_text("existing evidence")
+    elif kind == "malformed":
+        git(tmp_path, "init", str(cache))
+        (cache / ".git" / "HEAD").write_text("invalid Git identity")
+    else:
+        target = tmp_path / "target"
+        git(tmp_path, "init", "--bare", str(target))
+        cache.symlink_to(target, target_is_directory=True)
+        if kind == "parent":
+            cache = cache / "nested.git"
+    with pytest.raises(PublicationError, match="Trusted publication cache"):
+        prepare_publication_cache(cache)
+    if kind == "file":
+        assert cache.read_text() == "existing evidence"
+    elif kind == "empty":
+        assert list(cache.iterdir()) == []
+
+
+def test_cache_preparation_preserves_existing_normal_repository(result):
+    from agentd.publication import prepare_publication_cache
+
+    repo, intent, _ = result
+    before = (repo / ".git" / "config").read_bytes()
+    prepare_publication_cache(repo)
+    assert git(repo, "rev-parse", "HEAD") == intent.result_commit
+    assert (repo / ".git" / "config").read_bytes() == before
+
+
+def test_cache_initialization_failure_remains_retryable(tmp_path, monkeypatch):
+    from agentd import publication
+
+    cache = tmp_path / "cache" / "agentd.git"
+    real_git = publication._git
+
+    def failed_init(repository, *args, **kwargs):
+        if "init" in args:
+            raise PublicationError("Trusted Git operation failed")
+        return real_git(repository, *args, **kwargs)
+
+    monkeypatch.setattr(publication, "_git", failed_init)
+    with pytest.raises(PublicationError):
+        publication.prepare_publication_cache(cache)
+    assert not cache.exists()
+    monkeypatch.setattr(publication, "_git", real_git)
+    publication.prepare_publication_cache(cache)
+    assert git(cache, "rev-parse", "--is-bare-repository") == "true"
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -504,7 +599,13 @@ def test_bubblewrap_constructs_private_credential_free_boundary(tmp_path, monkey
         "/workspace",
     ]
     assert command.count("--bind") == 1
-    assert not any(path in command for path in ("/home", "/root", "/Users", "/etc"))
+    assert not any(path in command for path in ("/home", "/root", "/Users"))
+    loader = command.index("/opt/agentd/validation-loader")
+    assert command[loader - 1 : loader + 2] == [
+        "--ro-bind-try",
+        "/opt/agentd/validation-loader",
+        "/etc",
+    ]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
@@ -668,3 +769,212 @@ else:
         timeout=20,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_failed_candidates_keep_evidence_and_repair_publishes_once(result, tmp_path):
+    repo, intent, collected = result
+    intent = replace(
+        intent,
+        validation_commands=(
+            (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; "
+                "assert Path('file').read_text() == 'repaired'",
+            ),
+        ),
+    )
+    adapter = Adapter()
+    database = tmp_path / "state.db"
+    publisher = DraftPublisher(PublicationStore(database), adapter, finalizer())
+    with pytest.raises(PublicationError, match="validation failed"):
+        publisher.publish(intent, collected, repo)
+    failed = publisher.store.candidates(intent.job_id)[0]
+    assert failed["stage"] == "validation_failed"
+    assert "AssertionError" in failed["evidence"][0]["stderr"]
+    (repo / "file").write_text("repaired")
+    git(repo, "commit", "-am", "repair")
+    repaired = replace(
+        intent, run_id="repair-run", result_commit=git(repo, "rev-parse", "HEAD")
+    )
+    repaired_result = replace(
+        collected, run_id=repaired.run_id, result_commit=repaired.result_commit
+    )
+    pr = publisher.publish(repaired, repaired_result, repo)
+    restarted = DraftPublisher(PublicationStore(database), adapter, finalizer())
+    assert restarted.publish(repaired, repaired_result, tmp_path / "unavailable") == pr
+    assert adapter.pushes == adapter.creates == 1
+    candidates = restarted.store.candidates(intent.job_id)
+    assert candidates[0] == failed
+    assert [candidate["generation"] for candidate in candidates] == [1, 2]
+    assert candidates[1]["evidence"][0]["commit"] == repaired.result_commit
+    delivery = restarted.store.get(intent.job_id)["delivery"]
+    from datetime import datetime
+
+    assert (
+        datetime.fromisoformat(delivery["completed_at"]).utcoffset().total_seconds()
+        == 0
+    )
+    assert {key: value for key, value in delivery.items() if key != "completed_at"} == {
+        "outcome": "delivered",
+        "pr_url": pr["url"],
+        "result_commit": repaired.result_commit,
+        "run_id": repaired.run_id,
+        "acceptance": "pending-human-review",
+    }
+    with pytest.raises(PublicationError):
+        restarted.publish(intent, collected, repo)
+
+
+class UpdatingAdapter(Adapter):
+    def __init__(self, fail_update=None):
+        super().__init__()
+        self.updates = self.edits = 0
+        self.fail_update = fail_update
+
+    def update_branch(self, intent, repository, expected_commit):
+        assert self.head == expected_commit
+        self.updates += 1
+        self.head = intent.result_commit
+        self.pr["headRefOid"] = intent.result_commit
+        if self.fail_update == "push":
+            self.fail_update = None
+            raise ConnectionError("lost update acknowledgement")
+
+    def update_pr(self, intent, pr, body):
+        self.edits += 1
+        self.pr["body"] = body
+        if self.fail_update == "edit":
+            self.fail_update = None
+            raise ConnectionError("lost edit acknowledgement")
+        return self.pr
+
+
+@pytest.mark.parametrize("failure", [None, "push", "edit"])
+def test_trusted_feedback_updates_one_pr_with_head_cas(result, tmp_path, failure):
+    repo, intent, collected = result
+    intent = replace(
+        intent,
+        validation_commands=(
+            (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; "
+                "assert Path('file').read_text() in {'result', 'updated'}",
+            ),
+        ),
+    )
+    adapter = UpdatingAdapter(failure)
+    database = tmp_path / "state.db"
+    publisher = DraftPublisher(PublicationStore(database), adapter, finalizer())
+    original = publisher.publish(intent, collected, repo).copy()
+    (repo / "file").write_text("updated")
+    git(repo, "commit", "-am", "feedback")
+    update = replace(
+        intent, run_id="feedback-run", result_commit=git(repo, "rev-parse", "HEAD")
+    )
+    update_result = replace(
+        collected, run_id=update.run_id, result_commit=update.result_commit
+    )
+    with pytest.raises(PublicationError, match="trusted update grant"):
+        publisher.publish(update, update_result, repo)
+    assert adapter.updates == 0
+    publisher.store.authorize_update(
+        intent.job_id, intent.run_id, event_id="comment:123"
+    )
+    if failure:
+        with pytest.raises(ConnectionError):
+            publisher.publish(update, update_result, repo)
+        publisher = DraftPublisher(PublicationStore(database), adapter, finalizer())
+    pr = publisher.publish(update, update_result, repo)
+    assert pr["url"] == original["url"]
+    assert pr["headRefOid"] == update.result_commit
+    assert update.run_id in pr["body"]
+    assert adapter.pushes == adapter.creates == adapter.updates == 1
+    history = publisher.store.candidates(intent.job_id)
+    assert history[0]["pr"] == original
+    assert history[0]["intent"]["result_commit"] == intent.result_commit
+    assert history[1]["intent"]["result_commit"] == update.result_commit
+
+
+def test_feedback_does_not_overwrite_human_branch_edits(result, tmp_path):
+    repo, intent, collected = result
+    adapter = UpdatingAdapter()
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"), adapter, finalizer()
+    )
+    publisher.publish(intent, collected, repo)
+    publisher.store.authorize_update(intent.job_id, intent.run_id, event_id="comment:1")
+    update = replace(intent, run_id="feedback-run")
+    adapter.head = "a" * 40
+    with pytest.raises(PublicationError, match="conflicting result"):
+        publisher.publish(update, replace(collected, run_id=update.run_id), repo)
+    assert adapter.updates == 0
+
+
+def test_failed_candidate_cannot_replace_an_ambiguous_external_effect(result, tmp_path):
+    repo, intent, collected = result
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"), Adapter("create"), finalizer()
+    )
+    with pytest.raises(ConnectionError):
+        publisher.publish(intent, collected, repo)
+    other = replace(intent, run_id="other-run")
+    with pytest.raises(PublicationError, match="external effects remain unresolved"):
+        publisher.publish(other, replace(collected, run_id=other.run_id), repo)
+
+
+def test_validation_infrastructure_retry_keeps_immutable_attempts(result, tmp_path):
+    repo, intent, collected = result
+
+    class RecoveringRunner(TestProcessRunner):
+        calls = 0
+
+        def run(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("sandbox temporarily unavailable")
+            return super().run(*args, **kwargs)
+
+    runner = RecoveringRunner()
+    adapter = Adapter()
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"), adapter, TrustedFinalizer(runner)
+    )
+    with pytest.raises(PublicationPending, match="infrastructure unavailable"):
+        publisher.publish(intent, collected, repo)
+    assert publisher.store.get(intent.job_id)["stage"] == "validation_unavailable"
+    publisher.publish(intent, collected, repo)
+    evidence = publisher.store.get(intent.job_id)["evidence"]
+    assert [item["validation_attempt"] for item in evidence] == [1, 2]
+    assert [item["returncode"] for item in evidence] == [None, 0]
+    assert runner.calls == 2
+    assert adapter.pushes == adapter.creates == 1
+    with pytest.raises(PublicationError, match="immutable"):
+        publisher.store.save(intent, "validated", evidence=[evidence[-1]])
+
+
+def test_validation_infrastructure_retries_are_bounded(result, tmp_path):
+    repo, intent, collected = result
+
+    class UnavailableRunner:
+        calls = 0
+
+        def run(self, *args, **kwargs):
+            self.calls += 1
+            raise OSError("unavailable")
+
+    runner = UnavailableRunner()
+    publisher = DraftPublisher(
+        PublicationStore(tmp_path / "state.db"),
+        Adapter(),
+        TrustedFinalizer(runner),
+        maximum_validation_attempts=2,
+    )
+    for _ in range(2):
+        with pytest.raises(PublicationPending, match="infrastructure unavailable"):
+            publisher.publish(intent, collected, repo)
+    with pytest.raises(PublicationPending, match="retry limit"):
+        publisher.publish(intent, collected, repo)
+    assert runner.calls == 2
+    assert len(publisher.store.get(intent.job_id)["evidence"]) == 2

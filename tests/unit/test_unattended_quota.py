@@ -29,20 +29,29 @@ def _snapshot(**changes):
 
 
 @pytest.mark.parametrize(
-    ("snapshot", "reason"),
+    ("changes", "reason"),
     [
         (None, "quota_unknown"),
-        (replace(_snapshot(), primary_used_percent=None), "quota_unknown"),
-        (replace(_snapshot(), confidence=0), "quota_unknown"),
-        (_snapshot(observed_at=utc_now() - timedelta(minutes=6)), "quota_stale"),
-        (_snapshot(observed_at=utc_now() + timedelta(minutes=1)), "quota_stale"),
-        (replace(_snapshot(), primary_used_percent=75), "quota_provider_pressure"),
-        (replace(_snapshot(), reached=True), "quota_provider_pressure"),
-        (_snapshot(), None),
+        ({"primary_used_percent": None}, "quota_unknown"),
+        ({"confidence": 0}, "quota_unknown"),
+        ({"age": timedelta(minutes=-6)}, "quota_stale"),
+        ({"age": timedelta(minutes=1)}, "quota_stale"),
+        ({"primary_used_percent": 75}, "quota_provider_pressure"),
+        ({"reached": True}, "quota_provider_pressure"),
+        ({}, None),
     ],
 )
-def test_unattended_provider_gate(snapshot, reason):
-    assert unattended_provider_wait_reason(snapshot) == reason
+def test_unattended_provider_gate(changes, reason):
+    # Build relative observations when this test runs, not at collection time.
+    now = utc_now()
+    values = dict(changes or {})
+    observed_at = now + values.pop("age", timedelta())
+    snapshot = (
+        replace(_snapshot(observed_at=observed_at), **values)
+        if changes is not None
+        else None
+    )
+    assert unattended_provider_wait_reason(snapshot, at=now) == reason
 
 
 def test_unknown_quota_cannot_reserve_and_reason_survives_restart(make_job, tmp_path):

@@ -1,0 +1,28 @@
+[Unit]
+Description=agentd reviewed self host release supervisor
+Documentation=file:///home/bened/.local/share/agentd-selfhost/coding-current/docs/40-operations/selfhost-releases.md
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/home/bened/.local/share/agentd-selfhost/coding-current
+ConditionPathExists=/home/bened/.local/state/agentd-selfhost/coding-config/release-watcher.json
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30s
+TimeoutStartSec=infinity
+TimeoutStopSec=2min
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=AGENTD_PROFILE=selfhost
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+UMask=0077
+ExecStart=/usr/bin/python3 /home/bened/.local/share/agentd-selfhost/coding-current/tools/watch_selfhost_release.py --config /home/bened/.local/state/agentd-selfhost/coding-config/release-watcher.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/bened/agentd /home/bened/.local/state/agentd-selfhost /home/bened/.local/share/agentd-selfhost /home/bened/.config/systemd/user
+
+[Install]
+WantedBy=default.target

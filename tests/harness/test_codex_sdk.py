@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from agentd.domain.enums import QuotaUnit, RunOutcome, RunState
 from agentd.domain.models import (
     DriverSession,
@@ -13,6 +15,7 @@ from agentd.domain.models import (
     RunCommand,
     RunCommandAck,
     RunObservation,
+    TokenUsage,
     UsageApplication,
     UsageSample,
 )
@@ -22,6 +25,7 @@ from agentd.harness.app_server import (
     OpenAICodexClient,
 )
 from agentd.harness.codex_sdk import CodexSdkDriver
+from agentd.harness.native_record import NativeTerminalUsage
 from agentd.harness.supervisor import RunSupervisor
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
@@ -785,3 +789,190 @@ def test_supervisor_rejects_workspace_or_read_root_overlapping_codex_state(
 
     asyncio.run(scenario())
     assert not client.started
+
+
+@pytest.mark.parametrize(
+    "saved_final,terminal_status",
+    [
+        (False, "completed"),
+        (True, "completed"),
+        (True, "failed"),
+        (True, "interrupted"),
+    ],
+)
+def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
+    execution_contract, saved_final, terminal_status
+):
+    execution = replace(
+        execution_contract,
+        allowed_filesystem_scope=(execution_contract.working_directory,),
+    )
+    reads = []
+
+    class ReadOnlyClient(ScriptedAppServerClient):
+        async def read_thread(self, thread_id):
+            reads.append(thread_id)
+            return {
+                "id": thread_id,
+                "cwd": execution.working_directory,
+                "cliVersion": "0.144.4",
+                "status": {"type": "notLoaded"},
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": terminal_status,
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": _structured_response(),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    client = ReadOnlyClient("turn-1", ())
+    partial = TokenUsage(input_tokens=5, output_tokens=3)
+    final = TokenUsage(input_tokens=12, output_tokens=8)
+    store = MemorySupervisorStore(
+        sessions={
+            "run-1": DriverSession(
+                "run-1",
+                "codex",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                observation_cursor="2",
+                metadata={"sdk_version": "0.144.4", "runtime_version": "0.144.4"},
+            )
+        },
+        runs={"run-1": StoredRun(execution)},
+        samples=[
+            UsageSample(
+                "run-1", "thread-1", "turn-1", 1, 8, QuotaUnit.TOKENS, tokens=partial
+            )
+        ],
+    )
+    if saved_final:
+        store.samples.append(
+            UsageSample(
+                "run-1",
+                "thread-1",
+                "turn-1",
+                3,
+                20,
+                QuotaUnit.TOKENS,
+                tokens=final,
+                final=True,
+            )
+        )
+    supervisor = RunSupervisor(store, client_factory=lambda _execution: client)
+
+    async def scenario():
+        def proof(*_args):
+            if saved_final:
+                raise AssertionError(
+                    "Persisted final SDK usage must not require native proof"
+                )
+            return NativeTerminalUsage(final, "a" * 64)
+
+        result = await supervisor.recover_terminal_readonly(
+            "run-1", terminal_usage_reader=proof
+        )
+        assert result is not None and result.terminal and result.telemetry_valid
+        assert (
+            result.result.outcome
+            is {
+                "completed": RunOutcome.COMPLETED,
+                "failed": RunOutcome.FAILED,
+                "interrupted": RunOutcome.CANCELLED,
+            }[terminal_status]
+        )
+        assert result.result.usage == final
+        assert result.result.summary == "implementation ready for review"
+        assert result.thread_id == "thread-1" and result.turn_id == "turn-1"
+        assert await supervisor.recover_terminal_readonly("run-1") == result
+
+    asyncio.run(scenario())
+    assert reads == ["thread-1"]
+    assert client.closed and client.started
+    assert not client.turn_calls and not client.resumed and not client.steers
+    assert len(store.samples) == 2
+    assert store.samples[-1].final
+    assert not store.sessions["run-1"].active
+
+
+@pytest.mark.parametrize(
+    "fault", ["unknown-usage", "unknown-turn", "other-turn", "active", "backwards"]
+)
+def test_readonly_recovery_blocks_unknown_ownership_and_usage(
+    execution_contract, fault
+):
+    execution = replace(
+        execution_contract,
+        allowed_filesystem_scope=(execution_contract.working_directory,),
+    )
+
+    class ReadOnlyClient(ScriptedAppServerClient):
+        async def read_thread(self, thread_id):
+            return {
+                "id": thread_id,
+                "cwd": execution.working_directory,
+                "cliVersion": "0.144.4",
+                "status": {"type": "active" if fault == "active" else "notLoaded"},
+                "turns": [
+                    {
+                        "id": "other" if fault == "other-turn" else "turn-1",
+                        "status": "completed",
+                        "items": [],
+                    }
+                ],
+            }
+
+    client = ReadOnlyClient("turn-1", ())
+    store = MemorySupervisorStore(
+        sessions={
+            "run-1": DriverSession(
+                "run-1",
+                "codex",
+                thread_id="thread-1",
+                turn_id=None if fault == "unknown-turn" else "turn-1",
+                observation_cursor="2",
+                metadata={"sdk_version": "0.144.4", "runtime_version": "0.144.4"},
+            )
+        },
+        runs={"run-1": StoredRun(execution)},
+        samples=[
+            UsageSample(
+                "run-1",
+                "thread-1",
+                "turn-1",
+                1,
+                8,
+                QuotaUnit.TOKENS,
+                tokens=TokenUsage(input_tokens=5, output_tokens=3),
+            )
+        ],
+    )
+    supervisor = RunSupervisor(store, client_factory=lambda _execution: client)
+
+    def proof(*_args):
+        if fault == "backwards":
+            raise ValueError("native counters moved backwards")
+        return NativeTerminalUsage(
+            TokenUsage(input_tokens=12, output_tokens=8), "a" * 64
+        )
+
+    async def scenario():
+        if fault in {"unknown-usage", "unknown-turn"}:
+            assert await supervisor.recover_terminal_readonly("run-1") is None
+        else:
+            with pytest.raises(ValueError):
+                await supervisor.recover_terminal_readonly(
+                    "run-1", terminal_usage_reader=proof
+                )
+
+    asyncio.run(scenario())
+    assert len(store.samples) == 1
+    assert store.sessions["run-1"].active
+    assert not client.turn_calls and not client.resumed

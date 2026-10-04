@@ -1,5 +1,5 @@
 {
-  "name": "agentd",
+  "name": "${AGENTD_COMPOSE_PROJECT:-agentd}",
   "services": {
     "agentd": {
       "image": "${AGENTD_IMAGE:?set AGENTD_IMAGE to a SHA-versioned image}",
@@ -9,6 +9,7 @@
       "read_only": true,
       "privileged": false,
       "init": true,
+      "command": ["serve"],
       "entrypoint": [
         "/bin/sh",
         "-ec",

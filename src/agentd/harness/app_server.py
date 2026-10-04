@@ -96,6 +96,8 @@ class AppServerClient(Protocol):
 
     async def account_rate_limits(self) -> dict[str, JsonValue]: ...
 
+    async def read_thread(self, thread_id: str) -> dict[str, JsonValue]: ...
+
 
 class OpenAICodexClient:
     """Adapter for ``openai-codex==0.144.4`` and its pinned App Server."""
@@ -275,6 +277,11 @@ class OpenAICodexClient:
             dict[str, JsonValue],
             response.model_dump(by_alias=True, exclude_none=True, mode="json"),
         )
+
+    async def read_thread(self, thread_id: str) -> dict[str, JsonValue]:
+        """Inspect saved history without loading, resuming, or starting a turn."""
+        response = await self._client.thread_read(thread_id, include_turns=True)
+        return _payload_to_json(response.thread)
 
 
 def _payload_to_json(payload: object) -> dict[str, JsonValue]:

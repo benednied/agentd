@@ -41,9 +41,20 @@ def parser(*, include_lifetime: bool = True) -> argparse.ArgumentParser:
     result.add_argument("--node-id", required=True)
     result.add_argument("--session-epoch", required=True)
     result.add_argument("--model", default="gpt-5.6-luna")
-    result.add_argument("--dependency-venv", type=Path)
-    result.add_argument("--dependency-profile-id")
-    result.add_argument("--dependency-python-root", type=Path)
+    result.add_argument(
+        "--dependency-venv",
+        type=Path,
+        default=os.environ.get("AGENTD_DEPENDENCY_VENV") or None,
+    )
+    result.add_argument(
+        "--dependency-profile-id",
+        default=os.environ.get("AGENTD_DEPENDENCY_PROFILE") or None,
+    )
+    result.add_argument(
+        "--dependency-python-root",
+        type=Path,
+        default=os.environ.get("AGENTD_DEPENDENCY_PYTHON_ROOT") or None,
+    )
     result.add_argument("--host", default="127.0.0.1")
     result.add_argument("--tls-cert", type=Path)
     result.add_argument("--tls-key", type=Path)
@@ -79,11 +90,11 @@ def load_secret(path: Path) -> bytes:
 async def run(args: argparse.Namespace) -> None:
     # Retained SQLite claims are not a process lock. Fence both normal serving
     # and administrative capture against another owner of this worker journal.
-    with ControllerLock(args.state_root.resolve() / "worker.sqlite"):
-        await _run_locked(args)
+    with ControllerLock(args.state_root.resolve() / "worker.sqlite") as owner:
+        await _run_locked(args, owner)
 
 
-async def _run_locked(args: argparse.Namespace) -> None:
+async def _run_locked(args: argparse.Namespace, owner: ControllerLock) -> None:
     if args.lifetime_seconds is not None and not 0 < args.lifetime_seconds <= 86_400:
         raise ValueError("worker lifetime must be positive and at most one day")
     state_root = args.state_root.resolve()
@@ -128,6 +139,7 @@ async def _run_locked(args: argparse.Namespace) -> None:
         dependency_venv=args.dependency_venv,
         dependency_profile_id=args.dependency_profile_id,
         dependency_python_root=args.dependency_python_root,
+        worker_owner=owner,
     )
     coding = CodingHarnessDriver(
         workspace_root,

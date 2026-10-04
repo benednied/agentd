@@ -120,7 +120,97 @@ def test_approve_status_and_restart_preserve_one_job_and_accounting(
     assert output[0]["job_id"] == approved["job_id"]
     assert output[0]["state"] == "READY"
     assert output[0]["authorized"]
+    assert output[0]["attempt_budget"] == {
+        "coding_attempts": 0,
+        "preparation_attempts": 0,
+        "total_attempts": 0,
+        "maximum_coding_attempts": 3,
+        "maximum_preparation_attempts": 3,
+        "maximum_total_attempts": 6,
+    }
     assert "Intent" not in json.dumps(output)
+
+
+def test_status_cli_reports_configured_separate_attempt_limits(
+    controller_config, capsys
+):
+    path, _ = controller_config
+    config = json.loads(path.read_text())
+    config.update(
+        {
+            "maximum_automatic_attempts": 5,
+            "maximum_preparation_attempts": 2,
+            "maximum_total_attempts": 6,
+        }
+    )
+    path.write_text(json.dumps(config))
+    arguments = ["github", "--config", str(path)]
+    assert main([*arguments, "approve", "1", "--actor", "operator"]) == 0
+    capsys.readouterr()
+    assert main([*arguments, "status"]) == 0
+    budget = json.loads(capsys.readouterr().out)[0]["attempt_budget"]
+    assert budget["maximum_coding_attempts"] == 5
+    assert budget["maximum_preparation_attempts"] == 2
+    assert budget["maximum_total_attempts"] == 6
+
+
+@pytest.mark.parametrize("prior_attempts, blocked", [(1, False), (2, True)])
+def test_configured_github_resume_cli_enforces_attempt_limits(
+    controller_config, monkeypatch, capsys, prior_attempts, blocked
+):
+    from types import SimpleNamespace
+
+    from agentd.coordinator import LifecycleError
+    from agentd.domain.enums import JobState
+    from agentd.domain.transitions import transition_job
+
+    path, _source = controller_config
+    config = json.loads(path.read_text())
+    config["maximum_automatic_attempts"] = 2
+    path.write_text(json.dumps(config))
+    arguments = ["github", "--config", str(path)]
+    assert main([*arguments, "approve", "1", "--actor", "operator"]) == 0
+    job_id = json.loads(capsys.readouterr().out)["job_id"]
+    config = load_config(path)
+    with SQLiteStateStore(config["database"]) as store:
+        job = store.get_job(job_id)
+        for state in (JobState.ADMITTED, JobState.RUNNING, JobState.SUSPENDED):
+            updated, event = transition_job(job, state, "Retained execution")
+            store.save_job(updated, event, expected=job)
+            job = updated
+        runs = tuple(
+            SimpleNamespace(
+                id=f"prior-{index}",
+                result=None,
+                contract=SimpleNamespace(operation=None),
+            )
+            for index in range(prior_attempts)
+        )
+        store.list_runs = lambda _job_id: runs
+        store.latest_run = lambda _job_id: runs[-1]
+        resumed = []
+
+        async def resume(job_id, **_kwargs):
+            resumed.append(job_id)
+            return job
+
+        async def close():
+            pass
+
+        runtime = SimpleNamespace(
+            store=store, coordinator=SimpleNamespace(resume=resume), aclose=close
+        )
+        monkeypatch.setattr(
+            "agentd.coding.controller.create_controller", lambda _config: runtime
+        )
+        command = [*arguments, "resume", job_id, "--actor", "operator"]
+        if blocked:
+            with pytest.raises(LifecycleError, match="provider attempt limit"):
+                main(command)
+            assert resumed == []
+        else:
+            assert main(command) == 0
+            assert resumed == [job_id]
 
 
 def test_controller_discovers_but_never_approves_issues(controller_config):
@@ -196,3 +286,110 @@ def test_publication_refresh_rejects_changed_authority(controller_config, change
         source.current = replace(approved, **change)
         with pytest.raises(ValueError):
             intake.refresh_authorization(approved)
+
+
+def test_standing_owner_policy_wires_automatic_intake_without_a_label_or_cli(
+    controller_config, monkeypatch
+):
+    path, source = controller_config
+    source.current = replace(
+        source.current,
+        labels=(),
+        author_login="owner",
+        author_id=123,
+        created_at="2026-09-20T12:00:00Z",
+        material_updated_at="2026-09-20T12:00:00Z",
+    )
+    source.issue_authority = lambda issue: (issue, (("owner", 123), ("owner", 123)))
+    source.comments = lambda *_args, **_kwargs: ()
+    source.reviews = lambda *_args, **_kwargs: ()
+    monkeypatch.setattr("agentd.coding.controller.GitHubWorkflowSource", lambda: source)
+    config = load_config(path)
+    config.update(
+        {
+            "eligibility_label": None,
+            "standing_github_policy": {
+                "trusted_actors": {"owner": 123},
+                "activated_at": "2026-09-20T11:00:00Z",
+            },
+        }
+    )
+
+    async def scenario():
+        runtime = create_controller(config)
+        try:
+            assert runtime.workflow is not None
+            assert runtime.intake.source is source
+            await runtime.intake.poll()
+            jobs = runtime.store.list_jobs()
+            assert len(jobs) == 1
+            assert jobs[0].quota_budget.maximum == 200
+            assert runtime.store.github_source_for_job(jobs[0].id)[
+                "approved_by"
+            ].startswith("github-policy:")
+            assert not runtime.store.list_runs()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_controller_liveness_survives_expected_quota_wait_but_stale_polling_is_dead(
+    controller_config, monkeypatch
+):
+    from datetime import timedelta
+
+    from agentd.coding.controller import health
+    from agentd.domain.models import (
+        ResourceVector,
+        WorkerHeartbeat,
+        WorkerNode,
+        utc_now,
+    )
+    from agentd.runtime.health import RuntimeHealthStore
+
+    path, _source = controller_config
+    config = load_config(path)
+    config["standing_github_policy"] = {
+        "trusted_actors": {"owner": 123},
+        "activated_at": "2026-09-20T11:00:00Z",
+    }
+    monkeypatch.setattr(
+        "agentd.coding.controller.ControllerLock.held", lambda _self: True
+    )
+    now = utc_now()
+    monkeypatch.setattr("agentd.coding.controller.utc_now", lambda: now)
+    with SQLiteStateStore(config["database"]) as store:
+        store.register_quota_pool(QuotaPool("account", "codex", 200))
+        store.register_node(
+            WorkerNode(
+                "worker",
+                labels={},
+                capacity=ResourceVector(1, 1),
+                harnesses=frozenset({"remote-coding"}),
+                heartbeat=WorkerHeartbeat(
+                    "epoch", frozenset({"remote-coding"}), 0, observed_at=now
+                ),
+            )
+        )
+        store.append_provider_quota_snapshot(
+            ProviderQuotaSnapshot(
+                "account", "pool", primary_used_percent=80, observed_at=now
+            )
+        )
+        with RuntimeHealthStore(config["database"]) as pulses:
+            pulses.pulse("controller", state="waiting_quota", at=now)
+            pulses.pulse("publisher", state="waiting_review", at=now)
+            pulses.pulse("source", at=now)
+        blocked = health(config, store)
+        assert blocked["controller_live"]
+        assert blocked["liveness"]["controller"]["expected_wait"]
+        assert blocked["source_fresh"]
+        assert blocked["workers"][0]["fresh"]
+        assert not blocked["admission_telemetry_ready"]
+        assert blocked["provider_wait_reason"] == "quota_provider_pressure"
+        later = now + timedelta(seconds=601)
+        monkeypatch.setattr("agentd.coding.controller.utc_now", lambda: later)
+        stale = health(config, store)
+        assert not stale["controller_live"]
+        assert stale["liveness"]["controller"]["reason"] == "heartbeat_stale"

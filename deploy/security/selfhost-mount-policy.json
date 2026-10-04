@@ -1,0 +1,10 @@
+{
+  "mounts": {
+    "/home/bened/.local/state/agentd": "/home/bened/.local/state/agentd-selfhost",
+    "/home/bened/.local/share/agentd/workspaces": "/home/bened/.local/share/agentd-selfhost/workspaces",
+    "/home/bened/.local/share/agentd/codex-home": "/home/bened/.local/share/agentd-selfhost/codex-home",
+    "/home/bened/.local/share/agentd/codex-home/config.toml": "/home/bened/.local/share/agentd-selfhost/codex-home/config.toml",
+    "/home/bened/.cache/uv": "/home/bened/.cache/agentd-selfhost/uv",
+    "/home/bened/goldenage": "/home/bened/agentd"
+  }
+}

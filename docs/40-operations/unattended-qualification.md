@@ -11,7 +11,7 @@ backlog approval, and publication credentials have been checked. Record the
 UTC start and end timestamps, release SHA, image digest, controller config
 digest, worker session epoch, and database paths.
 
-During the window, use the native backlog flow. Keep the controller and worker
+During the window, use standing GitHub intake or the native backlog flow. Keep the controller and worker
 units enabled with infinite process lifetime and let systemd restart only after
 a process failure. Do not use qualification lifetime flags in the production
 worker. Preserve all databases, journals, workspaces, checkpoints, bundle
@@ -41,8 +41,9 @@ quota snapshots, backlog snapshot and approval revision, job/run history,
 validation reports, bundle manifests, and publication URLs or blocked reasons.
 Include negative evidence for incomplete reads, changed issues, missing worker
 heartbeats, stale quota, ambiguous pull requests, and lost publication
-responses. The repository dependency runtime still needs preparation; its
-current Goldenage-specific monkeypatch is not a productized deployment step.
-There has been no live migration or completed 24-hour qualification yet. Do
-not claim the gate passed until an operator has reviewed this bundle against
-every threshold.
+responses. The self-host profile builds an immutable locked dependency runtime,
+then independently checks the source, wheel, fresh installation, and CLI inside
+the publication sandbox. Record the actual deployment and qualification results
+on the configured GitHub operations issue. A successful package gate or first
+issue-to-PR trial does not establish a completed 24-hour qualification. Do not
+claim the gate passed until its evidence has been reviewed against every threshold.

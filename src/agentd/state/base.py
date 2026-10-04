@@ -1,7 +1,7 @@
 """Persistence interface for control-plane execution state."""
 
 from collections.abc import Iterable
-from typing import Protocol
+from typing import Any, Protocol
 
 from agentd.domain.enums import JobState
 from agentd.domain.models import (
@@ -155,6 +155,8 @@ class StateStore(Protocol):
 
     def apply_reset_event(self, event: QuotaResetEvent) -> QuotaPool: ...
 
+    def apply_local_allowance(self, event: QuotaResetEvent) -> QuotaPool: ...
+
     def get_reset_event(self, event_id: str) -> QuotaResetEvent: ...
 
     def list_reset_events(
@@ -249,6 +251,19 @@ class StateStore(Protocol):
     def latest_run(self, job_id: str) -> RunRecord | None: ...
 
     def list_runs(self, job_id: str | None = None) -> list[RunRecord]: ...
+
+    def get_run_quarantine(self, run_id: str) -> dict[str, Any] | None: ...
+
+    def quarantine_run(
+        self,
+        job: Job,
+        transition: StateTransition | None,
+        run: RunRecord,
+        evidence: dict[str, Any],
+        *,
+        expected_job: Job,
+        expected_run: RunRecord,
+    ) -> dict[str, Any]: ...
 
     def save_driver_session(
         self,

@@ -9,9 +9,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from agentd.coding.attempts import CodingAttemptLimits, is_proven_preparation_failure
 from agentd.coding.models import RepositoryProfile
+from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.domain.enums import JobState, RunOutcome, RunState
-from agentd.domain.models import CodingOperation
+from agentd.domain.models import CodingOperation, Job, RunRecord
 from agentd.intake.models import SourceIssue
 from agentd.publication import (
     CollectedCodingResult,
@@ -47,13 +49,21 @@ class CodingPublicationReconciler:
         for job in self.store.list_jobs(frozenset({JobState.REVIEW})):
             if not isinstance(job.operation, CodingOperation):
                 continue
+            if job.operation.work_order.repository not in self.repositories:
+                continue
             # A published ledger row is terminal.  It may outlive the profile
             # that produced it (for example after a Mac-to-Linux deployment
             # change), so do not reconstruct the old intent or revalidate it.
             # The publication store is the durable source of the PR summary;
             # returning it also keeps restart reconciliation observable.
             publication = self.publisher.store.get(job.id)
-            if publication is not None and publication["stage"] == "published":
+            latest = self.store.latest_run(job.id)
+            if (
+                publication is not None
+                and publication["stage"] == "published"
+                and latest is not None
+                and publication["intent"]["run_id"] == latest.id
+            ):
                 results.append(
                     {
                         "job_id": job.id,
@@ -65,14 +75,37 @@ class CodingPublicationReconciler:
             try:
                 results.append(await asyncio.to_thread(self.publish_job, job.id))
             except Exception as error:
+                preflight = (
+                    self.publisher.store.preflight_for(job.id, latest.id)
+                    if latest is not None
+                    else None
+                )
                 results.append(
-                    {"job_id": job.id, "publication_error": type(error).__name__}
+                    {
+                        "job_id": job.id,
+                        "publication_error": preflight["error_class"]
+                        if preflight
+                        else "PublicationError"
+                        if isinstance(error, PublicationError)
+                        else "PublicationFailure",
+                        "preflight": preflight,
+                    }
                 )
         return tuple(results)
 
     def publish_job(self, job_id: str) -> dict[str, Any]:
-        job = self.store.get_job(job_id)
         run = self.store.latest_run(job_id)
+        try:
+            result = self._publish_job(self.store.get_job(job_id), run)
+        except Exception as error:
+            if run is not None:
+                self.publisher.store.record_preflight_error(job_id, run.id, error)
+            raise
+        if run is not None:
+            self.publisher.store.clear_preflight_error(job_id, run.id)
+        return result
+
+    def _publish_job(self, job: Job, run: RunRecord | None) -> dict[str, Any]:
         if (
             job.state is not JobState.REVIEW
             or run is None
@@ -85,7 +118,12 @@ class CodingPublicationReconciler:
             raise PublicationError("Coding job has no completed review handoff")
         order = run.contract.operation.work_order
         if (
-            replace(order, resume_from_run_id=None, prior_consumed_quota=0)
+            replace(
+                order,
+                resume_from_run_id=None,
+                prior_consumed_quota=0,
+                repair_context=(),
+            )
             != job.operation.work_order
         ):
             raise PublicationError(
@@ -96,6 +134,7 @@ class CodingPublicationReconciler:
         source = self.store.github_source_for_job(job.id)
         if (
             source is None
+            or self.store.github_job_held(job.id)
             or source["revoked"]
             or not source["eligible"]
             or source["approved_revision"] != order.source_revision
@@ -153,6 +192,7 @@ class CodingPublicationReconciler:
             current = self.store.github_source_for_job(job.id)
             if (
                 self.store.get_job(job.id) != job
+                or self.store.github_job_held(job.id)
                 or self.store.latest_run(job.id) != run
                 or current is None
                 or current["revoked"]
@@ -167,3 +207,211 @@ class CodingPublicationReconciler:
         return self.publisher.publish(
             intent, collected, cache, authorization_check=authorized
         )
+
+
+class CodingRepairReconciler:
+    """Controller-owned feedback loop; publication itself never starts coding."""
+
+    def __init__(
+        self,
+        store: SQLiteStateStore,
+        publications: CodingPublicationReconciler,
+        coordinator: SchedulerCoordinator,
+        *,
+        maximum_attempts: int = 3,
+        maximum_preparation_attempts: int = 3,
+        maximum_total_attempts: int | None = None,
+    ) -> None:
+        limits = CodingAttemptLimits(
+            maximum_attempts, maximum_preparation_attempts, maximum_total_attempts
+        )
+        self.store, self.publications, self.coordinator = (
+            store,
+            publications,
+            coordinator,
+        )
+        self.maximum_attempts = maximum_attempts
+        self.maximum_preparation_attempts = limits.maximum_preparation_attempts
+        self.maximum_total_attempts = limits.maximum_total_attempts
+        self.ledger = publications.publisher.store
+
+    async def reconcile(self) -> tuple[dict[str, Any], ...]:
+        results = []
+        for job in self.store.list_jobs(frozenset({JobState.FAILED})):
+            if (
+                not isinstance(job.operation, CodingOperation)
+                or job.operation.work_order.repository
+                not in self.publications.repositories
+            ):
+                continue
+            run = self.store.latest_run(job.id)
+            if run is None or not is_proven_preparation_failure(run):
+                continue
+            try:
+                result = await self._request(
+                    job.id,
+                    ("Retry the proven pre-provider preparation failure",),
+                    actor="trusted-recovery",
+                    event_id=f"preparation:{run.id}",
+                )
+            except Exception:
+                result = {
+                    "job_id": job.id,
+                    "repair": self.ledger.repair_for(job.id, run.id),
+                }
+            results.append(result)
+        for job in self.store.list_jobs(frozenset({JobState.REVIEW})):
+            if (
+                not isinstance(job.operation, CodingOperation)
+                or job.operation.work_order.repository
+                not in self.publications.repositories
+            ):
+                continue
+            publication = self.ledger.get(job.id)
+            run = self.store.latest_run(job.id)
+            if (
+                not isinstance(job.operation, CodingOperation)
+                or publication is None
+                or publication["stage"] != "validation_failed"
+                or run is None
+                or publication["intent"]["run_id"] != run.id
+            ):
+                continue
+            evidence = publication["evidence"] or []
+            latest_attempt = max(
+                (item.get("validation_attempt", 1) for item in evidence), default=1
+            )
+            diagnostics = tuple(
+                json.dumps(
+                    {
+                        **{
+                            key: value
+                            for key, value in item.items()
+                            if key not in {"stdout", "stderr"}
+                        },
+                        "stdout": item.get("stdout", "")[-2048:],
+                        "stderr": item.get("stderr", "")[-4096:],
+                    },
+                    sort_keys=True,
+                )[:8192]
+                for item in evidence
+                if item.get("validation_attempt", 1) == latest_attempt
+                and item.get("returncode") != 0
+            )[:16]
+            try:
+                result = await self._request(
+                    job.id,
+                    diagnostics or ("Independent trusted validation failed",),
+                    actor="trusted-validation",
+                    event_id=f"validation:{run.id}",
+                )
+            except Exception:
+                result = {
+                    "job_id": job.id,
+                    "repair": self.ledger.repair_for(job.id, run.id),
+                }
+            results.append(result)
+        return tuple(results)
+
+    async def request_feedback(
+        self,
+        job_id: str,
+        instruction: str,
+        *,
+        actor: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        """Only called after the GitHub workflow authenticates actor and event."""
+        if not instruction.strip() or "\0" in instruction or len(instruction) > 8192:
+            raise LifecycleError("GitHub feedback must be nonempty and bounded")
+        return await self._request(
+            job_id, (instruction,), actor=actor, event_id=event_id
+        )
+
+    async def _request(
+        self,
+        job_id: str,
+        diagnostics: tuple[str, ...],
+        *,
+        actor: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        reason = f"Bounded coding repair requested by {actor}; event {event_id}"
+        job = self.store.get_job(job_id)
+        if (
+            not isinstance(job.operation, CodingOperation)
+            or job.operation.work_order.repository not in self.publications.repositories
+        ):
+            raise LifecycleError(
+                "Coding feedback repository is outside the current policy"
+            )
+        if any(
+            transition.to_state is JobState.READY and transition.reason == reason
+            for transition in self.store.list_transitions(job_id)
+        ):
+            # The transition and its event are committed with the job. A
+            # controller crash before acknowledging the GitHub event must not
+            # queue another coding run or authorize another publication update.
+            return {
+                "job_id": job_id,
+                "state": self.store.get_job(job_id).state.value,
+                "repair_status": "queued",
+            }
+        run = self.store.latest_run(job_id)
+        if run is None:
+            raise LifecycleError("Coding feedback has no prior execution")
+        try:
+            if getattr(self.store, "github_job_held", lambda _: False)(job_id):
+                raise LifecycleError("Coding repair source is held or unauthorized")
+            source = self.store.github_source_for_job(job_id)
+            if source is None:
+                raise LifecycleError("Coding feedback has no source authorization")
+            if self.publications.source_refresh is not None:
+                await asyncio.to_thread(
+                    self.publications.source_refresh,
+                    SourceIssue.from_dict(json.loads(source["payload"])),
+                )
+            publication = self.ledger.get(job_id)
+            if publication is not None and publication["stage"] == "published":
+                self.ledger.authorize_update(
+                    job_id,
+                    publication["intent"]["run_id"],
+                    event_id=event_id,
+                )
+            elif (
+                publication is not None and publication["stage"] != "validation_failed"
+            ):
+                raise PublicationError(
+                    "Prior publication or validation must reconcile before feedback"
+                )
+            queued = await self.coordinator.queue_coding_repair(
+                job_id,
+                diagnostics=diagnostics,
+                maximum_attempts=self.maximum_attempts,
+                maximum_preparation_attempts=self.maximum_preparation_attempts,
+                maximum_total_attempts=self.maximum_total_attempts,
+                actor=actor,
+                event_id=event_id,
+            )
+            self.ledger.record_repair(
+                job_id,
+                run.id,
+                "queued",
+                f"Feedback {event_id} queued under unchanged cumulative limits",
+            )
+            return {
+                "job_id": job_id,
+                "state": queued.state.value,
+                "repair_status": "queued",
+            }
+        except Exception as error:
+            reason = (
+                str(error)
+                if isinstance(error, (LifecycleError, PublicationError))
+                else type(error).__name__
+            )
+            outcome = (
+                "exhausted" if "limit" in reason or "exhausted" in reason else "blocked"
+            )
+            self.ledger.record_repair(job_id, run.id, outcome, reason)
+            raise

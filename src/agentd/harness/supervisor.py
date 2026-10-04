@@ -36,6 +36,7 @@ from agentd.harness.app_server import (
 )
 from agentd.harness.codex import render_execution_contract
 from agentd.harness.errors import RunNotActiveError, UnknownRunError
+from agentd.harness.native_record import NativeTerminalUsage
 from agentd.observability import event_logger
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
@@ -427,6 +428,174 @@ class RunSupervisor:
             return None
         self._validate_session(session)
         return session.last_observation
+
+    async def recover_terminal_readonly(
+        self,
+        run_id: str,
+        *,
+        terminal_usage_reader: Callable[
+            [Mapping[str, JsonValue], str, str], NativeTerminalUsage
+        ]
+        | None = None,
+    ) -> RunObservation | None:
+        """Recover an exact saved terminal turn and independently final usage.
+
+        The caller must fence the old provider process before calling. Reading
+        thread history alone does not prove final usage: either our original
+        final usage marker or a trusted protected native record is required.
+        No resume/start/steer RPC is issued by this method.
+        """
+        self._require_open()
+        if run_id in self._live:
+            return None
+        session = self._session(run_id)
+        self._validate_session(session)
+        if session.last_observation is not None and (
+            session.last_observation.terminal
+            and session.last_observation.telemetry_valid
+        ):
+            return session.last_observation
+        if not session.thread_id or not session.turn_id:
+            return None
+        execution = self._store.get_run(run_id).contract
+        workspace = _validate_execution_scope(execution)
+        samples = self._store.list_usage_samples(run_id)
+        current = [
+            item
+            for item in samples
+            if item.thread_id == session.thread_id and item.turn_id == session.turn_id
+        ]
+        final = max(current, key=lambda item: item.sequence) if current else None
+        if final is not None and (not final.final or final.tokens is None):
+            final = None
+        if final is None and terminal_usage_reader is None:
+            return None
+        client = self._client_factory(execution)
+        read = getattr(client, "read_thread", None)
+        if read is None:
+            return None
+        await client.start()
+        try:
+            if (
+                session.metadata.get("sdk_version") != client.metadata.sdk_version
+                or session.metadata.get("runtime_version")
+                != client.metadata.runtime_version
+            ):
+                raise ValueError("Saved Codex runtime identity changed")
+            thread = await asyncio.wait_for(read(session.thread_id), timeout=15)
+            if (
+                thread.get("id") != session.thread_id
+                or thread.get("cwd") != str(workspace)
+                or thread.get("cliVersion") != client.metadata.runtime_version
+                or _mapping(thread.get("status")).get("type") == "active"
+            ):
+                raise ValueError("Saved Codex thread identity or ownership changed")
+            turns = thread.get("turns")
+            if not isinstance(turns, list) or not turns:
+                return None
+            turn = _mapping(turns[-1])
+            if (
+                turn.get("id") != session.turn_id
+                or sum(
+                    isinstance(item, dict) and item.get("id") == session.turn_id
+                    for item in turns
+                )
+                != 1
+            ):
+                raise ValueError("Saved Codex turn identity changed")
+            if turn.get("status") not in {"completed", "failed", "interrupted"}:
+                return None
+            baseline = _thread_usage_total(
+                samples, session.thread_id, excluding_turn_id=session.turn_id
+            )
+            usage = final.tokens if final is not None else None
+            native_proof = None
+            # A final SDK marker was persisted only after the definitive
+            # terminal event. It is already sufficient for failed/interrupted
+            # turns, whose native history need not have a task_complete row.
+            if final is None and terminal_usage_reader is not None:
+                native_proof = terminal_usage_reader(
+                    thread, session.thread_id, session.turn_id
+                )
+                usage = _subtract_usage(native_proof.total, baseline)
+            if usage is None:
+                return None
+            sequence = (
+                max(
+                    _cursor_sequence(session.observation_cursor),
+                    max((item.sequence for item in current), default=0),
+                )
+                + 1
+            )
+            if final is None:
+                self._store.apply_usage_sample(
+                    UsageSample(
+                        run_id=run_id,
+                        thread_id=session.thread_id,
+                        turn_id=session.turn_id,
+                        sequence=sequence,
+                        cumulative_quota=float(usage.total_tokens),
+                        unit=QuotaUnit.TOKENS,
+                        source="codex-app-server",
+                        tokens=usage,
+                        provider_epoch=f"{session.thread_id}:{session.turn_id}",
+                        final=True,
+                        metadata={
+                            "terminal_recovery": "protected-native-record",
+                            "native_record_sha256": native_proof.record_sha256,
+                        },
+                    )
+                )
+            live = _LiveRun(
+                execution=execution,
+                client=client,
+                thread_id=session.thread_id,
+                turn_id=session.turn_id,
+                sequence=sequence,
+                result_future=asyncio.get_running_loop().create_future(),
+                thread_usage_baseline=baseline,
+                current_turn_usage=usage,
+            )
+            items = turn.get("items")
+            if isinstance(items, list):
+                messages = [
+                    item["text"]
+                    for item in items
+                    if isinstance(item, dict)
+                    and item.get("type") == "agentMessage"
+                    and item.get("phase") in {None, "final_answer"}
+                    and isinstance(item.get("text"), str)
+                ]
+                live.final_response = messages[-1] if messages else ""
+            result = self._terminal_result(
+                run_id, live, "turn/completed", {"turn": dict(turn)}
+            )
+            result = replace(
+                result,
+                metadata={
+                    **result.metadata,
+                    "terminal_recovery": "read-only",
+                    **(
+                        {"native_record_sha256": native_proof.record_sha256}
+                        if native_proof is not None
+                        else {}
+                    ),
+                },
+            )
+            observation = self._observation(
+                run_id,
+                live,
+                "thread/read",
+                terminal=True,
+                result=result,
+                run_state=_outcome_state(result.outcome),
+            )
+            self._store.update_observation_cursor(
+                run_id, session.observation_cursor, observation.cursor, observation
+            )
+            return observation
+        finally:
+            await client.close()
 
     def active(self) -> tuple[RunObservation, ...]:
         """List durable active observations in deterministic run order."""
