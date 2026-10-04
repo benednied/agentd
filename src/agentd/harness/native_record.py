@@ -18,6 +18,8 @@ from pathlib import Path
 from agentd.domain.models import JsonValue, TokenUsage
 from agentd.harness.app_server import PINNED_OPENAI_CODEX_VERSION
 
+SUPPORTED_NATIVE_RUNTIME_VERSIONS = frozenset({"0.144.4", PINNED_OPENAI_CODEX_VERSION})
+
 _MAX_RECORD_BYTES = 64 * 1024 * 1024
 _MAX_LINE_BYTES = 4 * 1024 * 1024
 
@@ -37,8 +39,8 @@ def read_native_terminal_usage(
     runtime_version: str,
 ) -> NativeTerminalUsage:
     """Require exact terminal turn, native identity, and complete final counters."""
-    if runtime_version != PINNED_OPENAI_CODEX_VERSION:
-        raise ValueError("Native recovery format requires the pinned Codex runtime")
+    if runtime_version not in SUPPORTED_NATIVE_RUNTIME_VERSIONS:
+        raise ValueError("Native recovery format requires a reviewed Codex runtime")
     raw_path = thread.get("path")
     if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
         raise ValueError("Saved Codex thread has no native record path")

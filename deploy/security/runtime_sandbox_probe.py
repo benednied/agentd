@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import secrets
 import shutil
@@ -17,10 +18,14 @@ from openai_codex import __version__ as installed_sdk_version
 from openai_codex.client import CodexClient, CodexConfig
 from openai_codex.generated.v2_all import (
     CommandExecResponse,
+    ModelListResponse,
     PermissionProfileListResponse,
 )
 
-EXPECTED_SDK_VERSION = "0.144.4"
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
+from agentd.harness.app_server import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT
+
+EXPECTED_SDK_VERSION = PINNED_OPENAI_CODEX_VERSION
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
 CONFIG_FILE = Path("/home/bened/.local/share/agentd/codex-home/config.toml")
 STATE_DATABASE = Path("/home/bened/.local/state/agentd/state.sqlite")
@@ -321,7 +326,36 @@ def _create_toolchain_launcher(token: str) -> Path:
     return launcher
 
 
-def _run_codex_generated_command_probe(worktree: Path) -> None:
+def _require_model(client: CodexClient, model: str) -> None:
+    cursor = None
+    seen = set()
+    while True:
+        page = client.request(
+            "model/list",
+            {"includeHidden": True, "cursor": cursor},
+            response_model=ModelListResponse,
+        )
+        for candidate in page.data:
+            if candidate.model == model:
+                if DEFAULT_REASONING_EFFORT not in {
+                    option.reasoning_effort
+                    for option in candidate.supported_reasoning_efforts
+                }:
+                    raise RuntimeError(
+                        f"model {model!r} lacks required reasoning effort"
+                    )
+                return
+        cursor = page.next_cursor
+        if cursor is None:
+            raise RuntimeError(f"model {model!r} is unavailable in the bundled runtime")
+        if cursor in seen:
+            raise RuntimeError("model catalog repeated a pagination cursor")
+        seen.add(cursor)
+
+
+def _run_codex_generated_command_probe(
+    worktree: Path, model: str = DEFAULT_CODEX_MODEL
+) -> None:
     runtime = bundled_codex_path()
     if not runtime.is_file():
         raise RuntimeError(f"pinned Codex runtime is missing: {runtime}")
@@ -355,6 +389,7 @@ def _run_codex_generated_command_probe(worktree: Path) -> None:
         }
         with CodexClient(config) as client:
             client.initialize()
+            _require_model(client, model)
             profiles = client.request(
                 "permissionProfile/list",
                 {"cwd": str(worktree)},
@@ -388,12 +423,15 @@ def _run_codex_generated_command_probe(worktree: Path) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=DEFAULT_CODEX_MODEL)
+    args = parser.parse_args()
     _require_runtime_layout()
     worktree = Path(tempfile.mkdtemp(prefix=".security-lease.", dir=WORKSPACE_ROOT))
     try:
         _run_shim_rejection_probes()
         _run_direct_bwrap_probe(worktree)
-        _run_codex_generated_command_probe(worktree)
+        _run_codex_generated_command_probe(worktree, args.model)
     finally:
         _reset_bwrap_audit()
         shutil.rmtree(worktree)

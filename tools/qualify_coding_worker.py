@@ -19,6 +19,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentd.coding.models import RepositoryProfile
+from agentd.harness.app_server import DEFAULT_CODEX_MODEL
 from agentd.lifecycle import ControllerLock
 from agentd.state.sqlite import SQLiteStateStore
 from agentd.workers.coding import CodingHarnessDriver
@@ -40,7 +41,7 @@ def parser(*, include_lifetime: bool = True) -> argparse.ArgumentParser:
     result.add_argument("--ready-file", type=Path, required=True)
     result.add_argument("--node-id", required=True)
     result.add_argument("--session-epoch", required=True)
-    result.add_argument("--model", default="gpt-5.6-luna")
+    result.add_argument("--model", default=DEFAULT_CODEX_MODEL)
     result.add_argument(
         "--dependency-venv",
         type=Path,

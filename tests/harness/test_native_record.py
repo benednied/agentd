@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from agentd.harness.app_server import PINNED_OPENAI_CODEX_VERSION
 from agentd.harness.native_record import read_native_terminal_usage
 
 
@@ -20,8 +21,8 @@ def _row(kind, **payload):
     return {"type": "event_msg", "payload": {"type": kind, **payload}}
 
 
-@pytest.fixture
-def native_record(tmp_path):
+@pytest.fixture(params=["0.144.4", PINNED_OPENAI_CODEX_VERSION])
+def native_record(tmp_path, request):
     home = tmp_path / "codex-home"
     root = home / "sessions" / "2026" / "10" / "03"
     root.mkdir(parents=True)
@@ -38,7 +39,7 @@ def native_record(tmp_path):
             "payload": {
                 "id": "thread",
                 "cwd": "/workspace",
-                "cli_version": "0.144.4",
+                "cli_version": request.param,
             },
         },
         _row("task_started", turn_id="prior"),
@@ -59,9 +60,17 @@ def native_record(tmp_path):
 
 
 def _read(record):
-    home, _path, thread, _rows, _write = record
+    home, _path, thread, rows, _write = record
     return read_native_terminal_usage(
-        thread, "thread", "turn", codex_home=home, runtime_version="0.144.4"
+        thread,
+        "thread",
+        "turn",
+        codex_home=home,
+        runtime_version=(
+            rows[0]["payload"]["cli_version"]
+            if rows[0]["payload"]["cli_version"] != "unknown"
+            else PINNED_OPENAI_CODEX_VERSION
+        ),
     )
 
 

@@ -100,3 +100,12 @@ def test_example_quota_commands_use_the_controller_database_mount():
             if m["source"].startswith("${AGENTD_CONTROLLER_STATE_ROOT:")
         )
         assert Path(args.db).is_relative_to(mount["target"])
+
+
+def test_coding_compose_model_default_matches_harness():
+    from agentd.harness.app_server import DEFAULT_CODEX_MODEL
+
+    command = _compose()["services"]["coding-worker"]["command"]
+    assert command[command.index("--model") + 1] == (
+        "${AGENTD_CODING_MODEL:-" + DEFAULT_CODEX_MODEL + "}"
+    )

@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
 from agentd.domain.models import JsonValue, ProviderQuotaSnapshot
 from agentd.harness.app_server import AppServerEvent, AppServerMetadata
 from agentd.runtime.codex_oracle import CodexAccountOracle
@@ -17,8 +18,8 @@ class ScriptedAccountClient:
     @property
     def metadata(self) -> AppServerMetadata:
         return AppServerMetadata(
-            sdk_version="0.144.4",
-            runtime_version="0.144.4",
+            sdk_version=PINNED_OPENAI_CODEX_VERSION,
+            runtime_version=PINNED_OPENAI_CODEX_VERSION,
             server_name="codex-app-server",
         )
 
@@ -134,8 +135,8 @@ def test_codex_oracle_preserves_rate_limit_windows_and_opaque_credits() -> None:
         "credits": None,
     }
     assert snapshot.metadata == {
-        "sdk_version": "0.144.4",
-        "runtime_version": "0.144.4",
+        "sdk_version": PINNED_OPENAI_CODEX_VERSION,
+        "runtime_version": PINNED_OPENAI_CODEX_VERSION,
         "reported_bucket_id": "codex",
         "reported_windows": ["primary", "secondary"],
     }

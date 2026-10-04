@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
 from agentd.domain.enums import QuotaUnit, RunOutcome, RunState
 from agentd.domain.models import (
     DriverSession,
@@ -169,8 +170,8 @@ class ScriptedAppServerClient:
     @property
     def metadata(self) -> AppServerMetadata:
         return AppServerMetadata(
-            sdk_version="0.144.4",
-            runtime_version="0.144.4",
+            sdk_version=PINNED_OPENAI_CODEX_VERSION,
+            runtime_version=PINNED_OPENAI_CODEX_VERSION,
             server_name="codex-app-server",
             platform_family="unix",
             platform_os="linux",
@@ -815,7 +816,7 @@ def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
             return {
                 "id": thread_id,
                 "cwd": execution.working_directory,
-                "cliVersion": "0.144.4",
+                "cliVersion": PINNED_OPENAI_CODEX_VERSION,
                 "status": {"type": "notLoaded"},
                 "turns": [
                     {
@@ -843,7 +844,10 @@ def test_readonly_recovery_preserves_turn_and_charges_native_final_usage_once(
                 thread_id="thread-1",
                 turn_id="turn-1",
                 observation_cursor="2",
-                metadata={"sdk_version": "0.144.4", "runtime_version": "0.144.4"},
+                metadata={
+                    "sdk_version": PINNED_OPENAI_CODEX_VERSION,
+                    "runtime_version": PINNED_OPENAI_CODEX_VERSION,
+                },
             )
         },
         runs={"run-1": StoredRun(execution)},
@@ -918,7 +922,7 @@ def test_readonly_recovery_blocks_unknown_ownership_and_usage(
             return {
                 "id": thread_id,
                 "cwd": execution.working_directory,
-                "cliVersion": "0.144.4",
+                "cliVersion": PINNED_OPENAI_CODEX_VERSION,
                 "status": {"type": "active" if fault == "active" else "notLoaded"},
                 "turns": [
                     {
@@ -938,7 +942,10 @@ def test_readonly_recovery_blocks_unknown_ownership_and_usage(
                 thread_id="thread-1",
                 turn_id=None if fault == "unknown-turn" else "turn-1",
                 observation_cursor="2",
-                metadata={"sdk_version": "0.144.4", "runtime_version": "0.144.4"},
+                metadata={
+                    "sdk_version": PINNED_OPENAI_CODEX_VERSION,
+                    "runtime_version": PINNED_OPENAI_CODEX_VERSION,
+                },
             )
         },
         runs={"run-1": StoredRun(execution)},

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [master]
@@ -25,3 +26,11 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run python tools/check_docs.py
       - run: uv run pytest
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned production image
+        run: docker build --tag agentd-ci .

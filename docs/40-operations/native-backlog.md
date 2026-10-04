@@ -155,7 +155,7 @@ preserves current databases, quota accounting and checkpoints; only use a
 release compatible with that state. Migration from the older laptop-controlled
 Goldenage worker is a separate handoff and is not performed by this script.
 
-The persistent worker accepts an explicit `--model` (default `gpt-5.6-luna`).
+The persistent worker accepts an explicit `--model` (default `gpt-6-luna`).
 For a prebuilt Python environment, specify `--dependency-venv`,
 `--dependency-profile-id`, and `--dependency-python-root`. Preparation applies
 only to that profile, copies the environment into the fresh lease, relocates
