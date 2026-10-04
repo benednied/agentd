@@ -9,7 +9,8 @@ from agentd.workers import coding_runtime
 from agentd.workers.operations import OperationError
 
 
-def test_verified_factory_cannot_skip_runtime_proof(tmp_path, monkeypatch):
+@pytest.mark.parametrize("model", ["gpt-6-luna", "custom-model"])
+def test_verified_factory_cannot_skip_runtime_proof(tmp_path, monkeypatch, model):
     calls = []
 
     async def rejected(self, argv, **kwargs):
@@ -21,6 +22,7 @@ def test_verified_factory_cannot_skip_runtime_proof(tmp_path, monkeypatch):
         asyncio.run(
             coding_runtime.create_verified_coding_sdk(
                 Path("/home/bened/.local/state/agentd/test.sqlite"),
+                model=model,
                 environment={
                     "CODEX_HOME": "/home/bened/.local/share/agentd/codex-home"
                 },
@@ -30,6 +32,8 @@ def test_verified_factory_cannot_skip_runtime_proof(tmp_path, monkeypatch):
     assert calls[0][0] == (
         "/opt/agentd/venv/bin/python",
         "/opt/agentd/security/runtime_sandbox_probe.py",
+        "--model",
+        model,
     )
 
 

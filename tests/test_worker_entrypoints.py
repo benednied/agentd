@@ -30,3 +30,4 @@ def test_persistent_parser_exposes_unbounded_lifetime_default():
         ]
     )
     assert args.lifetime_seconds is None
+    assert args.model == "gpt-6-luna"

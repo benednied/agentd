@@ -166,7 +166,7 @@
         "--tls-key",
         "/home/bened/.local/state/agentd/transport/worker.key",
         "--model",
-        "${AGENTD_CODING_MODEL:-gpt-5.6-luna}"
+        "${AGENTD_CODING_MODEL:-gpt-6-luna}"
       ],
       "environment": {
         "HOME": "/home/bened",

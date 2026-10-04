@@ -13,6 +13,40 @@ GitHub workflow, allowance and health modules, trusted validator, and self host
 service units. A merged commit missing those components cannot replace the
 bootstrap release.
 
+## Codex runtime and model updates
+
+The coding worker uses the executable bundled with the exact `openai-codex`
+Python dependency in `pyproject.toml` and `uv.lock`. The Dockerfile's
+`CODEX_VERSION` pins a separate npm CLI; changing that CLI does not change the
+worker runtime. Neither executable upgrades itself at worker startup.
+
+`Prepare Codex updates` runs weekly on Monday at 07:17 UTC or on manual dispatch.
+It reads stable releases from PyPI and npm, synchronizes the SDK dependency and
+its two version guards, resolves `uv.lock`, runs the full CI checks, and builds
+the container before opening or refreshing `codex/dependency-updates`. Invalid
+versions, downgrades, inconsistent pins, resolution failures, test failures, or
+build failures stop PR publication. Enable GitHub Actions' permission to create
+pull requests in repository settings. The workflow explicitly dispatches `CI`
+on the candidate branch because PRs created with `GITHUB_TOKEN` do not trigger
+`pull_request` workflows. It does not merge or deploy candidates.
+
+Review SDK and CLI changes independently even when they share a PR. Approval
+and merge through the existing release process let the HP supervisor qualify
+and activate the immutable release. The container build and CI do not prove
+live provider execution, sandbox compatibility on the HP, or an unattended soak.
+
+The coding worker defaults to `gpt-6-luna`, sharing the harness default.
+`AGENTD_CODING_MODEL` overrides the Compose launch argument independently of
+`AGENTD_CODEX_MODEL`. Existing host environment overrides must also be reviewed
+when deploying a model change. Before readiness, the sandbox preflight uses the
+SDK's bundled App Server to enumerate the model catalog, including hidden models
+and pagination, and requires the exact selected model and `xhigh` reasoning
+support. Missing support fails startup. This checks runtime advertisement;
+an authenticated representative coding turn is still required to establish
+provider compatibility for that release and account. Native terminal recovery
+retains support for records from the previous reviewed `0.144.4` deployment;
+version checks and exact session identity still reject unknown runtimes.
+
 ## Package validation
 
 The image prepares `/opt/agentd/validation-venv` from frozen development and

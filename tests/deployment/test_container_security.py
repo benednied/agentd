@@ -605,7 +605,9 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     )
     payload = (DEPLOY / "security" / "sandbox_payload.py").read_text(encoding="utf-8")
 
-    assert 'EXPECTED_SDK_VERSION = "0.144.4"' in preflight
+    from agentd.harness.app_server import PINNED_OPENAI_CODEX_VERSION
+
+    assert f'EXPECTED_SDK_VERSION = "{PINNED_OPENAI_CODEX_VERSION}"' in preflight
     assert "bundled_codex_path" in preflight
     assert "launch_args_override" not in preflight
     assert "CommandExecParams" not in preflight
@@ -632,7 +634,7 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert 'b"#!/opt/agentd/venv/bin/python"' in preflight
     assert 'b"#!/opt/agentd/venv/bin/python3"' in preflight
     assert "secrets.token_hex(16)" in preflight
-    assert "_run_codex_generated_command_probe(worktree)" in preflight
+    assert "_run_codex_generated_command_probe(worktree, args.model)" in preflight
     assert "shutil.copyfile(PAYLOAD, workspace_payload)" in preflight
     assert "_create_toolchain_launcher(token)" in preflight
     assert "toolchain_launcher.unlink(missing_ok=True)" in preflight

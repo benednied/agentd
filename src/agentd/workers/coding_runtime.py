@@ -508,7 +508,7 @@ async def create_verified_coding_sdk(
     ):
         raise OperationError("worker SDK must use the dedicated protected Codex home")
     await SubprocessCommandRunner().run(
-        (_RUNTIME_PYTHON, _RUNTIME_PROBE),
+        (_RUNTIME_PYTHON, _RUNTIME_PROBE, "--model", model),
         environment=runtime_environment,
         timeout=120,
     )

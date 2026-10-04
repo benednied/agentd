@@ -1,0 +1,70 @@
+name: Prepare Codex updates
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: codex-dependency-updates
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare stable SDK and separate CLI pins
+        run: python tools/prepare_codex_update.py
+      - name: Resolve and test candidate dependencies
+        run: |
+          uv lock
+          uv sync --locked --dev
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run python tools/check_docs.py
+          uv run pytest
+      - name: Build candidate container
+        run: docker build --tag agentd-codex-candidate .
+      - name: Open or update reviewed dependency PR
+        id: pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: codex/dependency-updates
+          commit-message: "Update pinned Codex SDK and standalone CLI"
+          title: "Update pinned Codex runtimes"
+          body: |
+            Updates stable Codex pins and uv.lock after lint, formatting,
+            documentation checks, tests, and a container build pass.
+
+            The Python SDK supplies the coding worker's bundled runtime.
+            The npm CLI is a separate executable; updating it does not update
+            the worker. Model selection remains a separate control.
+
+            Requires human review and the existing supervisor's HP runtime
+            and sandbox qualification before deployment. No automatic merge.
+          add-paths: |
+            pyproject.toml
+            uv.lock
+            src/agentd/harness/app_server.py
+            deploy/security/runtime_sandbox_probe.py
+            Dockerfile
+      # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
+      # Dispatch CI at the candidate branch so quality is bound to its head SHA.
+      - name: Request CI for the exact candidate head
+        if: steps.pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref codex/dependency-updates

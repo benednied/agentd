@@ -19,7 +19,7 @@ from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
 
 from agentd.domain.models import JsonValue
 
-PINNED_OPENAI_CODEX_VERSION = "0.144.4"
+PINNED_OPENAI_CODEX_VERSION = "0.160.0"
 DEFAULT_CODEX_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_PERMISSION_PROFILE = "agentd-workspace"
@@ -100,7 +100,7 @@ class AppServerClient(Protocol):
 
 
 class OpenAICodexClient:
-    """Adapter for ``openai-codex==0.144.4`` and its pinned App Server."""
+    """Adapter for the reviewed ``openai-codex`` pin and its bundled App Server."""
 
     def __init__(
         self,
@@ -125,7 +125,7 @@ class OpenAICodexClient:
                 for key, value in explicit_environment.items()
             ):
                 raise ValueError("isolated SDK environment is invalid")
-            # SDK 0.144.4 normally overlays env on os.environ. Start through env
+            # The SDK normally overlays env on os.environ. Start through env
             # -i so model subprocesses cannot inherit controller/worker secrets.
             launch_args = (
                 "/usr/bin/env",
