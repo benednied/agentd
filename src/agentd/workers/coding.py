@@ -68,6 +68,7 @@ class _CodingRun:
     lease: WorkspaceLease
     manager: GitWorkspaceManager
     task: asyncio.Task[RunResult] | None = None
+    quota_basis: str = "total-v1"
 
 
 class CodingHarnessDriver:
@@ -256,7 +257,14 @@ class CodingHarnessDriver:
                 ).to_dict(),
             )
             return RunHandle(run_id, CODING_DRIVER)
-        state = _CodingRun(driver, handle, workspace, coding_lease, manager)
+        state = _CodingRun(
+            driver,
+            handle,
+            workspace,
+            coding_lease,
+            manager,
+            quota_basis=order.quota_basis,
+        )
         self._runs[run_id] = state
         state.task = asyncio.create_task(self._finish(run_id, state, execution))
         return RunHandle(run_id, CODING_DRIVER, handle.external_id)
@@ -267,6 +275,7 @@ class CodingHarnessDriver:
         assert isinstance(execution.operation, CodingOperation)
         order = execution.operation.work_order
         result: RunResult | None = None
+        token_limit = False
         try:
             async with asyncio.timeout(order.max_runtime_seconds):
                 collection = asyncio.create_task(state.driver.collect(state.handle))
@@ -279,12 +288,16 @@ class CodingHarnessDriver:
                         if (
                             observation is not None
                             and observation.usage is not None
-                            and observation.usage.total_tokens
-                            >= order.maximum_quota - order.prior_consumed_quota
+                            and observation.usage.quota_tokens(order.quota_basis)
+                            >= min(
+                                order.maximum_quota - order.prior_consumed_quota,
+                                order.maximum_run_quota or order.maximum_quota,
+                            )
                         ):
                             if observation.terminal:
                                 break
                             if await self._cancel_active(run_id, state):
+                                token_limit = True
                                 raise TimeoutError("Coding token ceiling reached")
                             break
                     result = await collection
@@ -299,7 +312,9 @@ class CodingHarnessDriver:
                 run_id,
                 state,
                 RunOutcome.CANCELLED,
-                "Coding execution limit reached",
+                "Coding token ceiling reached"
+                if token_limit
+                else "Coding runtime limit reached",
                 result,
             )
         except asyncio.CancelledError:
@@ -317,7 +332,26 @@ class CodingHarnessDriver:
                 "Trusted coding collection failed",
                 result,
             )
-        self._write(self._lease(run_id) / "result.json", result.to_dict())
+        root = self._lease(run_id)
+        retain = token_limit and order.maximum_run_quota is not None
+        if retain:
+            self._write(root / "checkpoint-request.json", {"run_id": run_id})
+        self._write(root / "result.json", result.to_dict())
+        if (
+            retain
+            and result.metadata.get("telemetry_valid") is True
+            and result.usage is not None
+        ):
+            evidence = await self._evidence(run_id, state, execution, allow_empty=True)
+            self._write(
+                root / "checkpoint.json",
+                {
+                    **evidence,
+                    "cumulative_quota": order.prior_consumed_quota
+                    + result.usage.quota_tokens(order.quota_basis),
+                },
+            )
+            result = self.load_terminal_result(run_id) or result
         return result
 
     async def _cancel_active(self, run_id: str, state: _CodingRun) -> bool:
@@ -361,14 +395,21 @@ class CodingHarnessDriver:
             # scalar to avoid double charging there. Across transport this is a
             # cumulative final reading; controller release uses max(previous,
             # final) and must retain it even if the last observation was lost.
-            consumed = float(result.usage.total_tokens)
+            consumed = float(
+                result.usage.quota_tokens(execution.operation.work_order.quota_basis)
+            )
             result = replace(
                 result,
-                consumed_quota=max(result.consumed_quota, consumed),
+                consumed_quota=consumed,
                 metadata={
                     **result.metadata,
                     "quota_ceiling_exceeded": consumed
-                    > execution.operation.work_order.maximum_quota,
+                    > min(
+                        execution.operation.work_order.maximum_quota
+                        - execution.operation.work_order.prior_consumed_quota,
+                        execution.operation.work_order.maximum_run_quota
+                        or execution.operation.work_order.maximum_quota,
+                    ),
                 },
             )
         if result.outcome is RunOutcome.COMPLETED:
@@ -381,7 +422,13 @@ class CodingHarnessDriver:
             usage = result.usage
             evidence["quota_ceiling_exceeded"] = bool(
                 usage is not None
-                and usage.total_tokens > execution.operation.work_order.maximum_quota
+                and usage.quota_tokens(execution.operation.work_order.quota_basis)
+                > min(
+                    execution.operation.work_order.maximum_quota
+                    - execution.operation.work_order.prior_consumed_quota,
+                    execution.operation.work_order.maximum_run_quota
+                    or execution.operation.work_order.maximum_quota,
+                )
             )
             result = replace(
                 result,
@@ -652,12 +699,11 @@ class CodingHarnessDriver:
                 summary=summary,
                 commit=None,
                 produced_artifacts=(),
-                consumed_quota=max(
-                    collected.consumed_quota,
-                    float(collected.usage.total_tokens)
+                consumed_quota=(
+                    float(collected.usage.quota_tokens(state.quota_basis))
                     if collected.metadata.get("telemetry_valid") is True
                     and collected.usage is not None
-                    else 0,
+                    else collected.consumed_quota
                 ),
             )
         observation = state.driver.observe(run_id)
@@ -667,8 +713,10 @@ class CodingHarnessDriver:
             outcome,
             summary,
             usage=usage,
-            consumed_quota=float(usage.total_tokens) if usage is not None else 0,
-            metadata={"telemetry_valid": bool(valid)},
+            consumed_quota=float(usage.quota_tokens(state.quota_basis))
+            if usage is not None
+            else 0,
+            metadata={"telemetry_valid": bool(valid), "quota_basis": state.quota_basis},
         )
 
     async def _evidence(
@@ -829,7 +877,14 @@ class CodingHarnessDriver:
 
     def observe(self, run_id: str) -> RunObservation | None:
         state = self._runs.get(run_id)
-        return state.driver.observe(run_id) if state is not None else None
+        observation = state.driver.observe(run_id) if state is not None else None
+        if state is None or observation is None or observation.usage is None:
+            return observation
+        return replace(
+            observation,
+            cumulative_quota=float(observation.usage.quota_tokens(state.quota_basis)),
+            metadata={**observation.metadata, "quota_basis": state.quota_basis},
+        )
 
     def status(self, run: RunHandle) -> dict[str, Any]:
         result = self.load_terminal_result(run.id)
@@ -887,7 +942,10 @@ class CodingHarnessDriver:
                 raise OperationError("checkpoint belongs to different work")
         if checkpoint["run_id"] != run_id or checkpoint["job_id"] != order.job_id:
             raise OperationError("checkpoint identity mismatch")
-        if order.prior_consumed_quota < checkpoint["cumulative_quota"]:
+        if (
+            run_id not in order.retired_run_ids
+            and order.prior_consumed_quota < checkpoint["cumulative_quota"]
+        ):
             raise OperationError("continuation would erase prior usage")
         if self.load_terminal_result(run_id) is None:
             raise OperationError("checkpoint ownership remains unresolved")
@@ -973,7 +1031,8 @@ class CodingHarnessDriver:
         evidence = await self._evidence(run_id, state, execution, allow_empty=True)
         checkpoint = {
             **evidence,
-            "cumulative_quota": order.prior_consumed_quota + result.usage.total_tokens,
+            "cumulative_quota": order.prior_consumed_quota
+            + result.usage.quota_tokens(order.quota_basis),
         }
         self._write(path, checkpoint)
         return checkpoint

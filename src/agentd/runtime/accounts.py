@@ -7,6 +7,8 @@ from math import isfinite
 
 from agentd.domain.enums import QoSClass, QuotaMode, ReservationState
 from agentd.domain.models import (
+    CodingOperation,
+    ExecutionContract,
     ProviderQuotaSnapshot,
     QuotaReservation,
     RunCommand,
@@ -72,6 +74,16 @@ class JobUsagePolicy:
 
 DEFAULT_ACCOUNT_POLICY = AccountPolicyThresholds()
 DEFAULT_JOB_USAGE_POLICY = JobUsagePolicy()
+
+
+def execution_quota_basis(execution: ExecutionContract) -> str:
+    if isinstance(execution.operation, CodingOperation):
+        return execution.operation.work_order.quota_basis
+    return "total-v1"
+
+
+def execution_token_quota(usage: TokenUsage, execution: ExecutionContract) -> float:
+    return float(usage.quota_tokens(execution_quota_basis(execution)))
 
 
 def codex_cumulative_quota(usage: TokenUsage) -> float:

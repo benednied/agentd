@@ -503,3 +503,65 @@ def test_usage_sessions_snapshots_and_commands_survive_store_restart(
         assert reopened.latest_provider_quota_snapshot("default", "codex") == snapshot
         assert reopened.list_run_commands(run.id) == [command]
         assert reopened.get_run_command_ack(command.id) == acknowledgement
+
+
+@pytest.mark.parametrize(
+    ("usage", "raw", "budget"),
+    [
+        (TokenUsage(894899, 814336, 31355, 11209), 926254, 111918),
+        (TokenUsage(942087, 849664, 16226, 5519), 958313, 108649),
+        (TokenUsage(594649, 526080, 3586, 1342), 598235, 72155),
+        (TokenUsage(100, 100), 100, 0),
+    ],
+)
+def test_uncached_budget_preserves_raw_provider_usage(usage, raw, budget):
+    assert usage.total_tokens == raw
+    assert usage.uncached_tokens == budget
+    assert TokenUsage.from_dict(usage.to_dict()) == usage
+    legacy = UsageSample(
+        run_id="run",
+        thread_id="thread",
+        turn_id="turn",
+        sequence=1,
+        cumulative_quota=raw,
+        unit=QuotaUnit.TOKENS,
+        tokens=usage,
+    )
+    current = replace(
+        legacy, cumulative_quota=budget, metadata={"quota_basis": "uncached-v1"}
+    )
+    assert UsageSample.from_dict(legacy.to_dict()) == legacy
+    assert UsageSample.from_dict(current.to_dict()) == current
+    with pytest.raises(ValueError, match="cumulative token quota"):
+        replace(current, cumulative_quota=budget + 1)
+
+
+def test_uncached_ledger_records_cache_only_progress_without_charging(make_job):
+    store, _, run = _runtime(make_job)
+
+    def reading(sequence, inputs, cached, final=False):
+        usage = TokenUsage(input_tokens=inputs, cached_input_tokens=cached)
+        return UsageSample(
+            run_id=run.id,
+            thread_id="thread",
+            turn_id="turn",
+            sequence=sequence,
+            cumulative_quota=usage.uncached_tokens,
+            unit=QuotaUnit.TOKENS,
+            tokens=usage,
+            final=final,
+            metadata={"quota_basis": "uncached-v1"},
+        )
+
+    first = store.apply_usage_sample(reading(1, 100, 100))
+    assert first.delta == 0
+    charged = store.apply_usage_sample(reading(2, 105, 100))
+    assert charged.delta == 5
+    cached = store.apply_usage_sample(reading(3, 205, 200))
+    assert cached.delta == 0
+    final = reading(4, 205, 200, final=True)
+    assert store.apply_usage_sample(final).delta == 0
+    assert store.apply_usage_sample(final).delta == 0
+    assert store.get_reservation(run.reservation_id).consumed == 5
+    assert store.get_quota_pool("default").remaining == 95
+    assert store.list_usage_samples(run.id)[-1].tokens.total_tokens == 205

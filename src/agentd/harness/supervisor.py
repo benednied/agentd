@@ -38,6 +38,7 @@ from agentd.harness.codex import render_execution_contract
 from agentd.harness.errors import RunNotActiveError, UnknownRunError
 from agentd.harness.native_record import NativeTerminalUsage
 from agentd.observability import event_logger
+from agentd.runtime.accounts import execution_quota_basis, execution_token_quota
 from agentd.state.base import ConcurrentStateError, EntityNotFoundError
 
 CODEX_DRIVER_NAME = "codex"
@@ -534,13 +535,14 @@ class RunSupervisor:
                         thread_id=session.thread_id,
                         turn_id=session.turn_id,
                         sequence=sequence,
-                        cumulative_quota=float(usage.total_tokens),
+                        cumulative_quota=execution_token_quota(usage, execution),
                         unit=QuotaUnit.TOKENS,
                         source="codex-app-server",
                         tokens=usage,
                         provider_epoch=f"{session.thread_id}:{session.turn_id}",
                         final=True,
                         metadata={
+                            "quota_basis": execution_quota_basis(execution),
                             "terminal_recovery": "protected-native-record",
                             "native_record_sha256": native_proof.record_sha256,
                         },
@@ -854,12 +856,13 @@ class RunSupervisor:
                 thread_id=live.thread_id,
                 turn_id=live.turn_id,
                 sequence=live.sequence,
-                cumulative_quota=float(usage.total_tokens),
+                cumulative_quota=execution_token_quota(usage, live.execution),
                 unit=QuotaUnit.TOKENS,
                 source="codex-app-server",
                 tokens=usage,
                 provider_epoch=f"{live.thread_id}:{live.turn_id}",
                 metadata={
+                    "quota_basis": execution_quota_basis(live.execution),
                     "model": self._model,
                     "effort": self._effort,
                     "sdk_version": live.client.metadata.sdk_version,
@@ -884,13 +887,14 @@ class RunSupervisor:
                     thread_id=live.thread_id,
                     turn_id=live.turn_id,
                     sequence=live.sequence,
-                    cumulative_quota=float(usage.total_tokens),
+                    cumulative_quota=execution_token_quota(usage, live.execution),
                     unit=QuotaUnit.TOKENS,
                     source="codex-app-server",
                     tokens=usage,
                     provider_epoch=f"{live.thread_id}:{live.turn_id}",
                     final=True,
                     metadata={
+                        "quota_basis": execution_quota_basis(live.execution),
                         "model": self._model,
                         "effort": self._effort,
                         "sdk_version": live.client.metadata.sdk_version,
@@ -955,6 +959,7 @@ class RunSupervisor:
         metadata: dict[str, JsonValue] = {
             "thread_id": live.thread_id,
             "turn_id": live.turn_id,
+            "quota_basis": execution_quota_basis(live.execution),
             "model": self._model,
             "effort": self._effort,
             "sdk_version": live.client.metadata.sdk_version,
@@ -1005,6 +1010,7 @@ class RunSupervisor:
             metadata={
                 "thread_id": live.thread_id,
                 "turn_id": live.turn_id,
+                "quota_basis": execution_quota_basis(live.execution),
                 "model": self._model,
                 "effort": self._effort,
                 "sdk_version": live.client.metadata.sdk_version,
@@ -1031,6 +1037,7 @@ class RunSupervisor:
         run_state: RunState,
     ) -> RunObservation:
         metadata = _observation_metadata(live.client, method)
+        metadata["quota_basis"] = execution_quota_basis(live.execution)
         if live.telemetry_error is not None:
             metadata["telemetry_error"] = live.telemetry_error
         return RunObservation(
@@ -1042,7 +1049,7 @@ class RunSupervisor:
             telemetry_valid=live.telemetry_valid,
             usage=live.current_turn_usage,
             cumulative_quota=(
-                float(live.current_turn_usage.total_tokens)
+                execution_token_quota(live.current_turn_usage, live.execution)
                 if live.current_turn_usage is not None
                 else None
             ),

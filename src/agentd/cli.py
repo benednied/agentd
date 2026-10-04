@@ -109,6 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     resume_coding.add_argument("job_id")
     resume_coding.add_argument("--actor", required=True)
     resume_coding.add_argument("--maximum-tokens", type=float)
+    reset_coding = github_commands.add_parser(
+        "reset-budget", help="reset a stopped coding allowance, retaining history"
+    )
+    reset_coding.add_argument("job_id")
+    reset_target = reset_coding.add_mutually_exclusive_group(required=True)
+    reset_target.add_argument("--expected-run-id")
+    reset_target.add_argument("--unstarted", action="store_true")
+    reset_coding.add_argument("--actor", required=True)
+    reset_coding.add_argument("--maximum-tokens", type=float, required=True)
+    reset_coding.add_argument("--maximum-run-tokens", type=float, required=True)
     recover_coding = github_commands.add_parser(
         "recover", help="import a trusted worker checkpoint for a stopped legacy run"
     )
@@ -346,7 +356,7 @@ async def _github_command(args: argparse.Namespace) -> int:
 
         await serve_publisher(config)
         return 0
-    if args.github_command in {"resume", "recover", "quarantine"}:
+    if args.github_command in {"resume", "recover", "quarantine", "reset-budget"}:
         runtime = create_controller(config)
         try:
             coordinator = runtime.coordinator
@@ -363,6 +373,14 @@ async def _github_command(args: argparse.Namespace) -> int:
                     actor=args.actor,
                     event_id=args.event_id,
                     stop_proof=proof,
+                )
+            elif args.github_command == "reset-budget":
+                job = await coordinator.reset_coding_budget(
+                    args.job_id,
+                    expected_run_id=args.expected_run_id,
+                    actor=args.actor,
+                    maximum_tokens=args.maximum_tokens,
+                    maximum_run_tokens=args.maximum_run_tokens,
                 )
             elif args.github_command == "recover":
                 job = coordinator.restore_coding_checkpoint(

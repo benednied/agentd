@@ -24,6 +24,8 @@ class CodingJobCompiler:
     harness: str = "codex"
     model_class: str = "standard"
     acceptance_criteria: tuple[str, ...] = ()
+    quota_basis: str = "total-v1"
+    maximum_run_quota: float | None = None
 
     def __post_init__(self) -> None:
         exact_commit(self.base_commit)
@@ -49,6 +51,8 @@ class CodingJobCompiler:
             account_pool_id=self.budget.pool_id,
             expected_quota=self.budget.expected_path,
             maximum_quota=self.budget.maximum,
+            quota_basis=self.quota_basis,
+            maximum_run_quota=self.maximum_run_quota,
             max_runtime_seconds=self.profile.max_runtime_seconds,
             acceptance_criteria=self.acceptance_criteria,
             required_capabilities=self.profile.required_capabilities,

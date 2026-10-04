@@ -983,3 +983,51 @@ def test_readonly_recovery_blocks_unknown_ownership_and_usage(
     assert len(store.samples) == 1
     assert store.sessions["run-1"].active
     assert not client.turn_calls and not client.resumed
+
+
+def test_sdk_uncached_usage_keeps_provider_counters(execution_contract):
+    from agentd.coding.models import CodingWorkOrder
+    from agentd.domain.models import CodingOperation
+
+    execution = replace(
+        execution_contract,
+        allowed_filesystem_scope=(execution_contract.working_directory,),
+        operation=CodingOperation(
+            CodingWorkOrder(
+                job_id=execution_contract.job_id,
+                repository="test/repo",
+                profile_id="test",
+                profile_version="1",
+                profile_digest="a" * 64,
+                base_commit="b" * 40,
+                source_revision="c" * 64,
+                objective="test",
+                harness="codex",
+                account_pool_id="account",
+                expected_quota=100,
+                maximum_quota=900,
+                max_runtime_seconds=60,
+                quota_basis="uncached-v1",
+                maximum_run_quota=300,
+            )
+        ),
+    )
+
+    async def scenario():
+        client = ScriptedAppServerClient("turn-1", _completed_events("turn-1"))
+        store = MemorySupervisorStore()
+        supervisor = RunSupervisor(store, client_factory=lambda _: client)
+        driver = CodexSdkDriver(supervisor)
+        handle = await driver.start_managed("uncached-sdk", execution)
+        result = await driver.collect(handle)
+        assert result.metadata["telemetry_valid"] is True
+        assert result.usage.cached_input_tokens > 0
+        for sample in store.samples:
+            assert sample.metadata["quota_basis"] == "uncached-v1"
+            assert sample.cumulative_quota == sample.tokens.uncached_tokens
+            assert sample.tokens.total_tokens > sample.cumulative_quota
+        observation = driver.observe(handle.id)
+        assert observation.normalized_cumulative_quota == result.usage.uncached_tokens
+        await supervisor.close()
+
+    asyncio.run(scenario())

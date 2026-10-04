@@ -114,8 +114,26 @@ class CodingWorkOrder:
     resume_from_run_id: str | None = None
     prior_consumed_quota: float = 0
     repair_context: tuple[str, ...] = ()
+    quota_basis: str = "total-v1"
+    maximum_run_quota: float | None = None
+    retired_run_ids: tuple[str, ...] = ()
+    retired_reservation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for identities in (self.retired_run_ids, self.retired_reservation_ids):
+            if len(set(identities)) != len(identities) or any(
+                not isinstance(item, str) or not item or "\0" in item
+                for item in identities
+            ):
+                raise ValueError("reset history requires unique opaque identities")
+        if self.quota_basis not in {"total-v1", "uncached-v1"}:
+            raise ValueError("unsupported coding quota basis")
+        if self.maximum_run_quota is not None and (
+            isinstance(self.maximum_run_quota, bool)
+            or not isfinite(self.maximum_run_quota)
+            or self.maximum_run_quota <= 0
+        ):
+            raise ValueError("per-run quota must be finite and positive")
         if self.resume_from_run_id is not None and (
             not self.resume_from_run_id or "\0" in self.resume_from_run_id
         ):
@@ -176,6 +194,13 @@ class CodingWorkOrder:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        if self.quota_basis == "total-v1":
+            data.pop("quota_basis")
+        if self.maximum_run_quota is None:
+            data.pop("maximum_run_quota")
+        for key in ("retired_run_ids", "retired_reservation_ids"):
+            if not data[key]:
+                data.pop(key)
         # Preserve existing claim fingerprints for pre-continuation work orders.
         if self.resume_from_run_id is None:
             data.pop("resume_from_run_id")
@@ -189,6 +214,8 @@ class CodingWorkOrder:
     def from_dict(cls, data: dict[str, Any]) -> CodingWorkOrder:
         values: dict[str, Any] = {
             **data,
+            "retired_run_ids": tuple(data.get("retired_run_ids", ())),
+            "retired_reservation_ids": tuple(data.get("retired_reservation_ids", ())),
             "acceptance_criteria": tuple(data.get("acceptance_criteria", ())),
             "required_capabilities": tuple(
                 data.get("required_capabilities", ("remote-coding",))

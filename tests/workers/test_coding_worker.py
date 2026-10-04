@@ -933,3 +933,39 @@ def test_pre_provider_setup_error_is_terminal_without_provider_ambiguity(tmp_pat
         assert provider.starts == 0
 
     asyncio.run(scenario())
+
+
+def test_uncached_run_ceiling_ignores_cache_and_preserves_raw_usage(tmp_path):
+    from agentd.domain.models import RunObservation, TokenUsage
+
+    async def scenario():
+        worker, provider, contract = setup(tmp_path, block=True)
+        order = replace(
+            contract.operation.work_order,
+            quota_basis="uncached-v1",
+            maximum_run_quota=50,
+        )
+        contract = replace(contract, operation=CodingOperation(order))
+        usage = [TokenUsage(input_tokens=1000, cached_input_tokens=990)]
+        provider.observe = lambda run_id: RunObservation(
+            run_id,
+            "thread",
+            "turn",
+            "1",
+            usage=usage[0],
+            metadata={"quota_basis": "uncached-v1"},
+        )
+        handle = await worker.start_managed("uncached", contract)
+        await asyncio.sleep(0.25)
+        assert not provider.cancelled
+        usage[0] = TokenUsage(input_tokens=1041, cached_input_tokens=990)
+        result = await asyncio.wait_for(worker.collect(handle), timeout=5)
+        assert provider.cancelled
+        assert result.outcome is RunOutcome.CANCELLED
+        assert result.consumed_quota == 51
+        assert result.usage.total_tokens == 1041
+        assert result.usage.cached_input_tokens == 990
+        assert result.metadata["coding_checkpoint"]["cumulative_quota"] == 51
+        assert result.summary == "Coding token ceiling reached"
+
+    asyncio.run(scenario())

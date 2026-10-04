@@ -252,3 +252,63 @@ The token maximum is an observed-usage stopping threshold, not a provider-enforc
 spend cap: one provider batch can cross it before telemetry arrives. Record all
 actual consumption and the overshoot flag. See [quotas](../20-using-agentd/quotas.md)
 and the [remote coding decision](../70-decisions/0005-capability-limited-remote-coding.md).
+
+### Uncached budgets and audited resets
+
+Set these trusted controller settings for three attempts, a 9-million-token job
+allowance, and a 3-million-token allowance per run:
+
+```json
+{
+  "token_quota_basis": "uncached-v1",
+  "maximum_tokens": 9000000,
+  "maximum_run_tokens": 3000000,
+  "maximum_automatic_attempts": 3,
+  "maximum_preparation_attempts": 3,
+  "maximum_total_attempts": 3
+}
+```
+
+The three-attempt total includes preparation failures. Apply the same attempt
+settings to the publisher. Keep automatic budget expansion disabled, or bounded
+at 9 million, when using this fixed allowance. `expected_tokens` remains the
+initial reservation size and must not exceed the job maximum.
+
+`uncached-v1` charges `input_tokens - cached_input_tokens + output_tokens` to the
+local ledger. Reasoning tokens are already included in output. Raw provider
+counters remain in every usage record; provider quota percentages and reserve
+checks are unchanged. Cache-only progress is recorded with zero charge.
+Omitting `token_quota_basis` preserves the legacy `total-v1` policy. Existing
+work orders retain their original policy until explicitly reset; never change
+the accounting basis of a live run.
+
+The controller requests a checkpoint at 90% of either limit. A worker that
+observes the run cap first stops and retains a checkpoint for ordinary bounded
+continuation. Token reports arrive in batches, so a final report can overshoot
+the cap; its full measured charge is retained. Runtime timeouts and token stops
+have distinct result summaries.
+
+To reset a failed, cancelled, or suspended job after reconciling ownership and
+usage, use the exact latest run identity reported by `github status`:
+
+```sh
+agentd github --config controller.json reset-budget JOB_ID \
+  --expected-run-id RUN_ID --actor OPERATOR \
+  --maximum-tokens 9000000 --maximum-run-tokens 3000000
+```
+
+This administrative command obtains an authenticated worker checkpoint, retains
+all prior runs and account charges, and queues a fresh job allowance. Old run
+and reservation identities are retained in the new work order and excluded
+only from the new cycle's attempt count and cumulative job usage. Repeating the
+same run identity is a no-op, including after a new attempt starts. Active jobs,
+unknown usage, outstanding ownership, held or revoked sources, and review or
+completed work cannot be reset this way. Ordinary admission still checks source
+authorization, integration gates, provider reserves, and local capacity.
+
+For a ready job that has never run, use `--unstarted` instead of
+`--expected-run-id`; this updates its policy without discarding any attempts.
+Both forms record the operator and allowance in the lifecycle audit. Status
+reports current-cycle `job_consumed`, the accounting basis, and
+`historical_consumed` (all retained reservation charges, potentially spanning
+both accounting policies). No reset refunds account capacity.

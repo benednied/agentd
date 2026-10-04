@@ -14,7 +14,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agentd.coding.attempts import CodingAttemptLimits
+from agentd.coding.attempts import (
+    CodingAttemptLimits,
+    current_attempts,
+    current_consumed,
+)
 from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.descriptor import RemoteCodingDescriptor
 from agentd.coding.integration import GitHubIntegrationReconciler, integration_status
@@ -145,7 +149,9 @@ def guard_coding_resume(
     store: SQLiteStateStore, job_id: str, attempt_limits: CodingAttemptLimits
 ) -> None:
     """Keep GitHub resume controls within the same retained attempt limits."""
-    reason = attempt_limits.blocked_reason(store.list_runs(job_id))
+    reason = attempt_limits.blocked_reason(
+        current_attempts(store.get_job(job_id), store.list_runs(job_id))
+    )
     if reason is None:
         return
     run = store.latest_run(job_id)
@@ -198,6 +204,8 @@ def create_intake(config: dict[str, Any], store: SQLiteStateStore) -> GitHubInta
             config.get("effort_p90_minutes", profile.max_runtime_seconds / 60),
         ),
         acceptance_criteria=tuple(config.get("acceptance_criteria", ())),
+        quota_basis=config.get("token_quota_basis", "total-v1"),
+        maximum_run_quota=config.get("maximum_run_tokens"),
     )
     return GitHubIntake(
         store,
@@ -508,7 +516,9 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                             continue
                         if store.github_job_held(job.id):
                             continue
-                        if attempt_limits.blocked_reason(store.list_runs(job.id)):
+                        if attempt_limits.blocked_reason(
+                            current_attempts(job, store.list_runs(job.id))
+                        ):
                             continue
                         if store.latest_checkpoint(job.id) is None:
                             continue
@@ -520,9 +530,8 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                                 (backlog or intake).refresh_authorization,
                                 SourceIssue.from_dict(json.loads(source["payload"])),
                             )
-                            consumed = sum(
-                                item.consumed
-                                for item in store.list_reservations(job.id)
+                            consumed = current_consumed(
+                                job, store.list_reservations(job.id)
                             )
                             maximum = (
                                 budget_policy.replanned_maximum(
@@ -709,7 +718,7 @@ def status(
         ):
             continue
         run = store.latest_run(job.id)
-        runs = store.list_runs(job.id)
+        runs = current_attempts(job, store.list_runs(job.id))
         counts = limits.count(runs)
         repair = publication_store.repair_for(job.id, run.id) if run else None
         if job.state is JobState.SUSPENDED:
@@ -747,6 +756,7 @@ def status(
                 if job.state not in {JobState.COMPLETED, JobState.CANCELLED}
                 else None,
                 "attempts": counts.total,
+                "historical_attempts": len(store.list_runs(job.id)),
                 "attempt_budget": {
                     "coding_attempts": counts.coding,
                     "preparation_attempts": counts.preparation,
@@ -762,7 +772,16 @@ def status(
                     "unit": job.quota_budget.unit.value,
                     "local_available": local_capacity,
                     "job_maximum": job.quota_budget.maximum,
-                    "job_consumed": sum(
+                    "run_maximum": job.operation.work_order.maximum_run_quota
+                    if isinstance(job.operation, CodingOperation)
+                    else None,
+                    "job_consumed": current_consumed(
+                        job, store.list_reservations(job.id)
+                    ),
+                    "quota_basis": job.operation.work_order.quota_basis
+                    if isinstance(job.operation, CodingOperation)
+                    else "total-v1",
+                    "historical_consumed": sum(
                         r.consumed for r in store.list_reservations(job.id)
                     ),
                     "provider_wait_reason": unattended_provider_wait_reason(

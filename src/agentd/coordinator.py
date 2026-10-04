@@ -9,7 +9,12 @@ from datetime import datetime, timedelta
 from inspect import isawaitable
 from typing import Any
 
-from agentd.coding.attempts import CodingAttemptLimits, is_proven_preparation_failure
+from agentd.coding.attempts import (
+    CodingAttemptLimits,
+    current_attempts,
+    current_consumed,
+    is_proven_preparation_failure,
+)
 from agentd.domain.enums import (
     ArtifactKind,
     JobState,
@@ -1266,7 +1271,14 @@ class SchedulerCoordinator:
             and result.metadata.get("telemetry_valid") is True
             and result.usage is not None
         ):
-            return replace(result, consumed_quota=float(result.usage.total_tokens))
+            return replace(
+                result,
+                consumed_quota=float(
+                    result.usage.quota_tokens(
+                        run.contract.operation.work_order.quota_basis
+                    )
+                ),
+            )
         return result
 
     async def checkpoint(
@@ -1444,6 +1456,136 @@ class SchedulerCoordinator:
         self._store.save_job(resumed, event, expected=original)
         return resumed
 
+    async def reset_coding_budget(
+        self,
+        job_id: str,
+        *,
+        expected_run_id: str | None,
+        actor: str,
+        maximum_tokens: float,
+        maximum_run_tokens: float,
+        quota_basis: str = "uncached-v1",
+    ) -> Job:
+        """Authorize a fresh allowance, preserving stopped work and old charges.
+
+        The exact latest run is the idempotency key. Unknown usage or physical
+        ownership cannot be cleared by this administrative operation.
+        """
+        job = self._store.get_job(job_id)
+        if not actor.strip() or not isinstance(job.operation, CodingOperation):
+            raise LifecycleError("Coding reset requires an identified operator")
+        order = job.operation.work_order
+        if expected_run_id is None:
+            if job.state is not JobState.READY or self._store.list_runs(job_id):
+                raise LifecycleError(
+                    "Unstarted budget changes require a ready job without runs"
+                )
+            updated = replace(
+                job,
+                updated_at=utc_now(),
+                quota_budget=replace(job.quota_budget, maximum=maximum_tokens),
+                operation=CodingOperation(
+                    replace(
+                        order,
+                        maximum_quota=maximum_tokens,
+                        maximum_run_quota=maximum_run_tokens,
+                        quota_basis=quota_basis,
+                    )
+                ),
+            )
+            held, event = transition_job(
+                job, JobState.BACKLOG, f"Budget configuration requested by {actor}"
+            )
+            self._store.save_job(held, event, expected=job)
+            updated, event = transition_job(
+                replace(updated, state=JobState.BACKLOG),
+                JobState.READY,
+                f"Budget configured by {actor}; maximum {maximum_tokens}, "
+                f"per-run {maximum_run_tokens}, basis {quota_basis}",
+            )
+            self._store.save_job(updated, event, expected=held)
+            return updated
+        if expected_run_id in order.retired_run_ids:
+            return job
+        run = self._require_latest_run(job_id)
+        if (
+            run.id != expected_run_id
+            or job.state
+            not in {JobState.SUSPENDED, JobState.FAILED, JobState.CANCELLED}
+            or run.state
+            not in {RunState.SUSPENDED, RunState.FAILED, RunState.CANCELLED}
+            or run.result is None
+            or run.result.metadata.get("telemetry_valid") is not True
+            or run.result.usage is None
+            or not isinstance(run.contract.operation, CodingOperation)
+            or not self._is_remote_run(run)
+        ):
+            raise LifecycleError("Reset requires the exact stopped, metered coding run")
+        if (
+            self._store.find_active_run(job_id) is not None
+            or self._store.find_active_reservation(job_id) is not None
+            or self._store.find_active_allocation(job_id) is not None
+        ):
+            raise LifecycleError("Reset ownership or accounting is unresolved")
+        source = self._store.github_source_for_job(job_id)
+        if (
+            self._store.github_job_held(job_id)
+            or source is None
+            or source["revoked"]
+            or not source["eligible"]
+            or source["revision"] != order.source_revision
+            or source["approved_revision"] != source["revision"]
+        ):
+            raise LifecycleError("Reset source is held or unauthorized")
+        # Validate the complete replacement before checkpoint capture has effects.
+        replacement = replace(
+            order,
+            maximum_quota=maximum_tokens,
+            maximum_run_quota=maximum_run_tokens,
+            quota_basis=quota_basis,
+            prior_consumed_quota=0,
+            retired_run_ids=tuple(item.id for item in self._store.list_runs(job_id)),
+            retired_reservation_ids=tuple(
+                item.id for item in self._store.list_reservations(job_id)
+            ),
+        )
+        budget = replace(job.quota_budget, maximum=maximum_tokens)
+        backend = self._backend_for_run(run)
+        capture = getattr(backend, "capture_coding_checkpoint", None)
+        if capture is None:
+            raise LifecycleError("Worker lacks authenticated coding checkpoint capture")
+        evidence = await capture(run.id)
+        old_order = run.contract.operation.work_order
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("cumulative_quota")
+            != old_order.prior_consumed_quota
+            + run.result.usage.quota_tokens(old_order.quota_basis)
+            or (
+                run.result.commit is not None
+                and evidence.get("result_commit") != run.result.commit
+            )
+        ):
+            raise LifecycleError("Reset lacks an authenticated metered checkpoint")
+        self._save_coding_checkpoint(job, run, evidence)
+        if job.state is not JobState.SUSPENDED:
+            suspended, event = transition_job(
+                job,
+                JobState.SUSPENDED,
+                f"Reset by {actor} retained stopped run {run.id}",
+            )
+            self._store.save_job(suspended, event, expected=job)
+            job = suspended
+        queued, event = transition_job(
+            replace(job, operation=CodingOperation(replacement), quota_budget=budget),
+            JobState.READY,
+            f"Budget reset by {actor}; through run {run.id}; "
+            f"fresh maximum {maximum_tokens}, per-run {maximum_run_tokens}, "
+            f"basis {quota_basis}; historical runs and account charges retained",
+        )
+        self._store.save_job(queued, event, expected=job)
+        return queued
+
     async def request_review(self, job_id: str) -> Job:
         job = self._store.get_job(job_id)
         if job.state is JobState.REVIEW:
@@ -1544,7 +1686,7 @@ class SchedulerCoordinator:
                 "Coding repair attempt limits must be bounded"
             ) from error
         blocked = attempts.blocked_reason(
-            self._store.list_runs(job.id),
+            current_attempts(job, self._store.list_runs(job.id)),
             preparation_retry=is_proven_preparation_failure(run),
         )
         if blocked is not None:
@@ -1588,7 +1730,9 @@ class SchedulerCoordinator:
             )
             or evidence.get("cumulative_quota")
             != run.contract.operation.work_order.prior_consumed_quota
-            + run.result.usage.total_tokens
+            + run.result.usage.quota_tokens(
+                run.contract.operation.work_order.quota_basis
+            )
         ):
             raise LifecycleError("Coding repair lacks an authenticated checkpoint")
         self._save_coding_checkpoint(job, run, evidence)
@@ -2088,7 +2232,10 @@ class SchedulerCoordinator:
             return
         if observation.telemetry_valid:
             cumulative = observation.normalized_cumulative_quota
-            if cumulative is not None and cumulative > 0:
+            if cumulative is not None and (
+                cumulative > 0
+                or observation.metadata.get("quota_basis") == "uncached-v1"
+            ):
                 prior = self._store.list_usage_samples(run.id)
                 matching = [
                     sample
@@ -2111,7 +2258,14 @@ class SchedulerCoordinator:
                     raise LifecycleError("Remote token counters moved backwards")
                 # Progress events can advance the stream cursor without spending
                 # tokens. Reconcile a charge committed before its cursor too.
-                if not repeated or (observation.terminal and not previous.final):
+                if (
+                    not repeated
+                    or (observation.terminal and not previous.final)
+                    or (
+                        observation.metadata.get("quota_basis") == "uncached-v1"
+                        and observation.usage != previous.tokens
+                    )
+                ):
                     sequence = (
                         max((sample.sequence for sample in prior), default=-1) + 1
                     )
@@ -2479,9 +2633,8 @@ class SchedulerCoordinator:
         return job.base_ref
 
     def _job_consumed(self, job_id: str) -> float:
-        return sum(
-            reservation.consumed
-            for reservation in self._store.list_reservations(job_id)
+        return current_consumed(
+            self._store.get_job(job_id), self._store.list_reservations(job_id)
         )
 
     def _job_for_next_reservation(self, job: Job) -> Job:
@@ -2495,6 +2648,10 @@ class SchedulerCoordinator:
             raise QuotaAdmissionError(
                 f"Job {job.id} exhausted its cumulative quota maximum"
             )
+        if isinstance(job.operation, CodingOperation):
+            run_maximum = job.operation.work_order.maximum_run_quota
+            if run_maximum is not None:
+                remaining = min(remaining, run_maximum)
         amount = min(job.quota_budget.expected_path, remaining)
         attempt_budget = replace(
             job.quota_budget,
@@ -2788,7 +2945,7 @@ class SchedulerCoordinator:
         maximum = job.quota_budget.maximum
         if maximum is None:
             raise LifecycleError("A Codex repair requires a cumulative maximum")
-        consumed = sum(item.consumed for item in self._store.list_reservations(job.id))
+        consumed = self._job_consumed(job.id)
         remaining = maximum - consumed
         if remaining <= 0:
             raise LifecycleError("The cumulative job maximum has been reached")
@@ -2933,7 +3090,7 @@ class SchedulerCoordinator:
         observation: RunObservation | None = None,
     ) -> None:
         reservation = self._store.get_reservation(run.reservation_id)
-        consumed = sum(item.consumed for item in self._store.list_reservations(job.id))
+        consumed = self._job_consumed(job.id)
         used_percent = provider_used_percent(snapshot) if snapshot is not None else None
         provider_has_capacity = (
             snapshot is None and not self._enforce_codex_account_policy
@@ -2968,6 +3125,10 @@ class SchedulerCoordinator:
                 if job.quota_budget.maximum is not None
                 else reservation.amount + self._usage_policy.top_up_chunk
             )
+            if isinstance(run.contract.operation, CodingOperation):
+                run_maximum = run.contract.operation.work_order.maximum_run_quota
+                if run_maximum is not None:
+                    maximum_for_attempt = min(maximum_for_attempt, run_maximum)
             top_up = min(
                 self._usage_policy.top_up_chunk,
                 max(0, maximum_for_attempt - reservation.amount),
@@ -2986,6 +3147,28 @@ class SchedulerCoordinator:
             at=at,
             policy=self._usage_policy,
         )
+        if maximum_command is None and isinstance(
+            run.contract.operation, CodingOperation
+        ):
+            run_maximum = run.contract.operation.work_order.maximum_run_quota
+            if run_maximum is not None:
+                maximum_command = maximum_checkpoint_command(
+                    job_id=job.id,
+                    run_id=run.id,
+                    consumed=reservation.consumed,
+                    maximum=run_maximum,
+                    at=at,
+                    policy=self._usage_policy,
+                )
+                if maximum_command is not None:
+                    maximum_command = replace(
+                        maximum_command,
+                        payload={
+                            **maximum_command.payload,
+                            "reason": "quota reached the per-run checkpoint threshold",
+                            "scope": "run",
+                        },
+                    )
         if maximum_command is not None:
             maximum_command = replace(
                 maximum_command,
@@ -3056,7 +3239,7 @@ class SchedulerCoordinator:
         samples = sorted(
             (
                 sample
-                for run in self._store.list_runs(job.id)
+                for run in current_attempts(job, self._store.list_runs(job.id))
                 for sample in self._store.list_usage_samples(run.id)
             ),
             key=lambda sample: (sample.observed_at, sample.id),
