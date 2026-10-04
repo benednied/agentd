@@ -438,3 +438,47 @@ def test_bootstrap_evidence_binds_qualified_source_to_every_running_service(
     else:
         with pytest.raises(ReleaseBlocked):
             watcher.require_bootstrap_evidence(sha)
+
+
+def test_replacement_acknowledges_restart_when_systemctl_kills_old_process(
+    tmp_path, monkeypatch
+):
+    import watch_selfhost_release as module
+
+    watcher = ReleaseWatcher(config(tmp_path))
+    sha = "a" * 40
+    release = watcher.root / sha
+    release.mkdir(parents=True)
+    (watcher.root.parent / "coding-current").symlink_to(release)
+    watcher.record("current", deployed_commit=sha, restart_pending=True)
+
+    def killed(*args, **kwargs):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(watcher, "command", killed)
+    with pytest.raises(SystemExit):
+        watcher.restart_supervisor()
+    assert json.loads(watcher.status_file.read_text())["restart_pending"] is True
+    replacement = ReleaseWatcher(config(tmp_path))
+    monkeypatch.setattr(module, "_LOADED_RELEASE", release)
+    replacement.acknowledge_supervisor_start()
+    assert replacement.status["restart_pending"] is False
+    assert replacement.status["supervisor_commit"] == sha
+    # No second self-restart, including after another process crash.
+    restarted = ReleaseWatcher(config(tmp_path))
+    monkeypatch.setattr(restarted, "command", killed)
+    restarted.restart_supervisor()
+
+
+def test_old_supervisor_cannot_acknowledge_new_release(tmp_path, monkeypatch):
+    import watch_selfhost_release as module
+
+    watcher = ReleaseWatcher(config(tmp_path))
+    sha = "a" * 40
+    release = watcher.root / sha
+    release.mkdir(parents=True)
+    (watcher.root.parent / "coding-current").symlink_to(release)
+    watcher.record("current", deployed_commit=sha, restart_pending=True)
+    monkeypatch.setattr(module, "_LOADED_RELEASE", watcher.root / ("b" * 40))
+    watcher.acknowledge_supervisor_start()
+    assert watcher.status["restart_pending"] is True

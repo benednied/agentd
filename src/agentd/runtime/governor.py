@@ -26,6 +26,7 @@ from agentd.runtime.accounts import (
     provider_quota_reached,
     provider_remaining_fraction,
     snapshot_is_stale,
+    unattended_provider_wait_reason,
 )
 from agentd.scheduling.tail import TailDecision, evaluate_tail
 
@@ -34,13 +35,17 @@ PROVIDER_STOP_REMAINING_FRACTION = 0.02
 
 @dataclass(frozen=True, slots=True)
 class ProviderStopPolicy:
-    """Hard-stop active work at the fixed two-percent provider boundary."""
+    """Hard-stop active work at an operator-selected provider reserve."""
 
     remaining_fraction: float = PROVIDER_STOP_REMAINING_FRACTION
 
     def __post_init__(self) -> None:
-        if self.remaining_fraction != PROVIDER_STOP_REMAINING_FRACTION:
-            raise ValueError("Provider stop fraction must be exactly 0.02")
+        if (
+            isinstance(self.remaining_fraction, bool)
+            or not isfinite(self.remaining_fraction)
+            or not PROVIDER_STOP_REMAINING_FRACTION <= self.remaining_fraction < 1
+        ):
+            raise ValueError("Provider stop fraction must be finite and in [0.02, 1)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,17 +68,27 @@ def evaluate_provider_stop(
 ) -> ProviderStopDecision:
     """Evaluate a provider hard stop without fabricating an absolute balance.
 
-    Stale telemetry cannot prove that the two-percent boundary has been crossed.
-    Existing admission policy already treats stale snapshots conservatively; it
-    would be unsafe to interrupt active work based on an old percentage.
+    Legacy policy ignores stale telemetry. Explicit reserve policies require
+    both windows and stop when telemetry cannot establish remaining capacity;
+    this is an unavailable-telemetry stop, not a claim that quota was consumed.
     """
 
-    if snapshot_is_stale(snapshot, at=at, policy=account_policy):
+    telemetry_unavailable = account_policy.require_both_windows and (
+        unattended_provider_wait_reason(snapshot, at=at, policy=account_policy)
+        in {"quota_unknown", "quota_stale"}
+    )
+    if not telemetry_unavailable and snapshot_is_stale(
+        snapshot, at=at, policy=account_policy
+    ):
         return ProviderStopDecision(False, None, None)
 
     remaining = provider_remaining_fraction(snapshot)
     reached = provider_quota_reached(snapshot)
-    stop = reached or (remaining is not None and remaining <= policy.remaining_fraction)
+    stop = (
+        telemetry_unavailable
+        or reached
+        or (remaining is not None and remaining <= policy.remaining_fraction)
+    )
     if not stop:
         return ProviderStopDecision(False, remaining, None)
 
@@ -87,6 +102,10 @@ def evaluate_provider_stop(
         )
     )
     episode = sha256(window_key.encode()).hexdigest()[:20]
+    if telemetry_unavailable:
+        return ProviderStopDecision(
+            True, remaining, episode, "provider reserve telemetry is unavailable"
+        )
     reason = (
         "provider reported the quota limit as reached"
         if reached

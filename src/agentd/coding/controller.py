@@ -54,11 +54,13 @@ from agentd.publication import (
     TrustedFinalizer,
 )
 from agentd.runtime.accounts import (
+    DEFAULT_ACCOUNT_POLICY,
     AccountPolicyThresholds,
     JobUsagePolicy,
     unattended_provider_wait_reason,
 )
 from agentd.runtime.allowance import CheckpointBudgetPolicy, LocalAllowancePolicy
+from agentd.runtime.governor import ProviderStopPolicy
 from agentd.runtime.health import (
     RuntimeHealthStore,
     runtime_liveness,
@@ -95,6 +97,39 @@ def load_config(path: Path) -> dict[str, Any]:
         if config["worker"].get(key):
             config["worker"][key] = resolve(config["worker"][key])
     return config
+
+
+def coding_provider_policies(
+    config: dict[str, Any],
+) -> tuple[AccountPolicyThresholds, ProviderStopPolicy]:
+    """Apply one reserve to admission, continuation and both provider windows.
+
+    Percentages remain provider percentages; the local token allowance is a
+    separate bound. Existing deployments keep their policy until opting in.
+    """
+    reserve = config.get("provider_reserve_percent")
+    if reserve is None:
+        return (
+            AccountPolicyThresholds(
+                background_block_used_percent=config.get(
+                    "background_block_used_percent", 75
+                ),
+                urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
+            ),
+            ProviderStopPolicy(),
+        )
+    if isinstance(reserve, bool) or not isinstance(reserve, int | float):
+        raise ValueError("provider_reserve_percent must be a number")
+    stop = ProviderStopPolicy(reserve / 100)
+    ceiling = 100 - reserve
+    return (
+        AccountPolicyThresholds(
+            background_block_used_percent=ceiling,
+            urgent_only_used_percent=ceiling,
+            require_both_windows=True,
+        ),
+        stop,
+    )
 
 
 def coding_attempt_limits(config: dict[str, Any]) -> CodingAttemptLimits:
@@ -313,6 +348,7 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                             store,
                             repository=config["profile"]["repository"],
                             attempt_limits=attempt_limits,
+                            account_policy=coding_provider_policies(config)[0],
                         )
                     )
                     await reporter.publish_pending()
@@ -374,12 +410,8 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 ]
             ),
             backends=BackendRegistry([backend]),
-            account_policy=AccountPolicyThresholds(
-                background_block_used_percent=config.get(
-                    "background_block_used_percent", 75
-                ),
-                urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
-            ),
+            account_policy=coding_provider_policies(config)[0],
+            provider_stop_policy=coding_provider_policies(config)[1],
             usage_policy=JobUsagePolicy(
                 top_up_at_fraction=config.get("top_up_at_fraction", 0.8),
                 checkpoint_at_fraction=config.get("checkpoint_at_fraction", 0.9),
@@ -466,12 +498,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 ).exists()
             ):
                 snapshot = store.latest_provider_quota_snapshot(config["account_pool"])
-                policy = AccountPolicyThresholds(
-                    background_block_used_percent=config.get(
-                        "background_block_used_percent", 75
-                    ),
-                    urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
-                )
+                policy = coding_provider_policies(config)[0]
                 if unattended_provider_wait_reason(snapshot, policy=policy) is None:
                     for job in store.list_jobs(frozenset({JobState.SUSPENDED})):
                         if (
@@ -534,10 +561,14 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                         store,
                         repository=profile.repository,
                         attempt_limits=attempt_limits,
+                        account_policy=coding_provider_policies(config)[0],
                     )
                 )
             for item in status(
-                store, repository=profile.repository, attempt_limits=attempt_limits
+                store,
+                repository=profile.repository,
+                attempt_limits=attempt_limits,
+                account_policy=coding_provider_policies(config)[0],
             ):
                 item["quota_wait_reason"] = coordinator.quota_wait_reason(
                     item["job_id"]
@@ -552,7 +583,10 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 state="source_unavailable"
                 if daemon.source_refresh_failed
                 else "waiting_quota"
-                if unattended_provider_wait_reason(snapshot) is not None
+                if unattended_provider_wait_reason(
+                    snapshot, policy=coding_provider_policies(config)[0]
+                )
+                is not None
                 else "polling",
             )
 
@@ -574,7 +608,10 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             runtime_health.pulse("controller", state="ownership_blocked")
             if workflow is not None:
                 reports = status(
-                    store, repository=profile.repository, attempt_limits=attempt_limits
+                    store,
+                    repository=profile.repository,
+                    attempt_limits=attempt_limits,
+                    account_policy=coding_provider_policies(config)[0],
                 )
                 for report in reports:
                     report["blocked_reason"] = "Execution ownership is unresolved"
@@ -584,7 +621,10 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             runtime_health.pulse("controller", state="retrying")
             if workflow is not None:
                 reports = status(
-                    store, repository=profile.repository, attempt_limits=attempt_limits
+                    store,
+                    repository=profile.repository,
+                    attempt_limits=attempt_limits,
+                    account_policy=coding_provider_policies(config)[0],
                 )
                 for report in reports:
                     report["blocked_reason"] = (
@@ -642,6 +682,7 @@ def status(
     *,
     repository: str | None = None,
     attempt_limits: CodingAttemptLimits | None = None,
+    account_policy: AccountPolicyThresholds = DEFAULT_ACCOUNT_POLICY,
 ) -> list[dict[str, Any]]:
     """Safe identities and outcomes, without raw issue text or credentials."""
     result = []
@@ -724,7 +765,9 @@ def status(
                     "job_consumed": sum(
                         r.consumed for r in store.list_reservations(job.id)
                     ),
-                    "provider_wait_reason": unattended_provider_wait_reason(snapshot),
+                    "provider_wait_reason": unattended_provider_wait_reason(
+                        snapshot, policy=account_policy
+                    ),
                     "provider_observed_at": snapshot.observed_at.isoformat()
                     if snapshot
                     else None,
@@ -793,10 +836,7 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
     )
     draining = Path(config.get("drain_file", config["database"] + ".drain")).exists()
     snapshot = store.latest_provider_quota_snapshot(config["account_pool"])
-    policy = AccountPolicyThresholds(
-        background_block_used_percent=config.get("background_block_used_percent", 75),
-        urgent_only_used_percent=config.get("urgent_only_used_percent", 90),
-    )
+    policy = coding_provider_policies(config)[0]
     provider_reason = unattended_provider_wait_reason(snapshot, policy=policy)
     workers = [
         {

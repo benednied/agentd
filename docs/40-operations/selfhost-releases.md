@@ -115,6 +115,10 @@ draining, dependency waits, and a normal active job are distinct from stale
 polling or unresolved provider ownership. This monitor reports failures without
 killing an active worker. After successful activation it records the deployed
 SHA and queues its own restart to load the reviewed supervisor implementation.
+The replacement process acknowledges the restart under the ownership lock only
+when its loaded source path matches the activated release. The outgoing process
+does not clear the intent after `systemctl`, which may terminate it before that
+write; this prevents a successful update from causing an endless restart loop.
 
 ## Activation and recovery
 

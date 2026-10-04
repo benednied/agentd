@@ -84,10 +84,10 @@ def _run(*, started_at: datetime = NOW - timedelta(minutes=11)) -> RunRecord:
 
 @pytest.mark.parametrize(
     "value",
-    [0, -0.1, 0.01, 0.03, 1.1, float("inf")],
+    [0, -0.1, 0.01, 1, 1.1, float("inf"), float("nan"), True],
 )
 def test_provider_stop_policy_rejects_invalid_fractions(value: float) -> None:
-    with pytest.raises(ValueError, match=r"exactly 0\.02"):
+    with pytest.raises(ValueError, match="Provider stop fraction"):
         ProviderStopPolicy(value)
 
 
@@ -172,3 +172,23 @@ def test_continue_and_unknown_effort_do_not_emit_commands() -> None:
     assert decision is not None and decision.action is TailAction.CONTINUE
     assert command is None
     assert tail_governor_command(_job(unit="story-points"), _run(), at=NOW) is None
+
+
+@pytest.mark.parametrize("primary,secondary", [(90, 20), (20, 90), (90, 90)])
+def test_configured_reserve_interrupts_either_provider_window(primary, secondary):
+    snapshot = _snapshot(primary, secondary_used_percent=secondary)
+    command = provider_stop_command(
+        snapshot, run_id="run-1", at=NOW, policy=ProviderStopPolicy(0.10)
+    )
+    assert command is not None
+    assert command.action == "interrupt"
+    assert command.payload["threshold_fraction"] == 0.10
+    assert (
+        provider_stop_command(
+            _snapshot(89.99, secondary_used_percent=89.99),
+            run_id="run-1",
+            at=NOW,
+            policy=ProviderStopPolicy(0.10),
+        )
+        is None
+    )
