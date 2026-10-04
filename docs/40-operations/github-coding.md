@@ -297,7 +297,21 @@ agentd github --config controller.json reset-budget JOB_ID \
   --maximum-tokens 9000000 --maximum-run-tokens 3000000
 ```
 
-This administrative command obtains an authenticated worker checkpoint, retains
+The CLI queues a durable local operator request and returns its `request_id`.
+The running controller executes it under its existing lifecycle lock; no second
+controller or service stop is needed. Inspect the outcome with:
+
+```sh
+agentd github --config controller.json reset-budget-status REQUEST_ID
+```
+
+`queued` is not confirmation of a completed reset. A finished request contains
+`result.ok` and either the resulting job state or the rejection reason. Identical
+requests reuse their identity. If the controller crashes after applying a reset
+but before acknowledging it, replay cannot grant another allowance. Requests
+remain queued while the controller is stopped.
+
+The controller obtains an authenticated worker checkpoint, retains
 all prior runs and account charges, and queues a fresh job allowance. Old run
 and reservation identities are retained in the new work order and excluded
 only from the new cycle's attempt count and cumulative job usage. Repeating the

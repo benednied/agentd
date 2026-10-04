@@ -1476,6 +1476,15 @@ class SchedulerCoordinator:
             raise LifecycleError("Coding reset requires an identified operator")
         order = job.operation.work_order
         if expected_run_id is None:
+            if (
+                order.maximum_quota == maximum_tokens
+                and order.maximum_run_quota == maximum_run_tokens
+                and order.quota_basis == quota_basis
+                and job.quota_budget.maximum == maximum_tokens
+            ):
+                # The daemon may have admitted this job after applying the
+                # request but before acknowledging it. Never reset its history.
+                return job
             if job.state is not JobState.READY or self._store.list_runs(job_id):
                 raise LifecycleError(
                     "Unstarted budget changes require a ready job without runs"

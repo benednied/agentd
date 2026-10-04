@@ -667,6 +667,42 @@ def test_unstarted_budget_configuration_cannot_change_started_work(tmp_path):
             run = await rig.plane.dispatch_next()
             assert run.contract.operation.work_order.maximum_run_quota == 300
             with pytest.raises(LifecycleError, match="without runs"):
-                await rig.coordinator.reset_coding_budget(rig.job.id, **args)
+                await rig.coordinator.reset_coding_budget(
+                    rig.job.id, **{**args, "maximum_tokens": 901}
+                )
+
+    asyncio.run(scenario())
+
+
+def test_admin_queue_replays_reset_after_lost_ack_without_new_allowance(tmp_path):
+    from agentd.coding.admin import CodingAdminStore
+
+    async def scenario():
+        async with coding_rig(tmp_path) as rig:
+            queue = CodingAdminStore(rig.store.path)
+            payload = dict(
+                job_id=rig.job.id,
+                expected_run_id=None,
+                actor="operator",
+                maximum_tokens=900,
+                maximum_run_tokens=300,
+            )
+            request = queue.enqueue(payload)
+            # Reset committed, then the process lost its request acknowledgement.
+            await rig.coordinator.reset_coding_budget(**payload)
+            rig.quota()
+            run = await rig.plane.dispatch_next()
+            assert run is not None
+            await queue.apply_pending(rig.coordinator)
+            assert queue.get(request["request_id"])["result"]["ok"] is True
+            assert len(rig.store.list_runs(rig.job.id)) == 1
+            assert rig.store.get_job(rig.job.id).state is JobState.RUNNING
+            assert (
+                rig.store.get_job(rig.job.id).operation.work_order.retired_run_ids == ()
+            )
+            bad = queue.enqueue({**payload, "maximum_tokens": 901})
+            await queue.apply_pending(rig.coordinator)
+            assert queue.get(bad["request_id"])["result"]["ok"] is False
+            assert rig.store.get_job(rig.job.id).quota_budget.maximum == 900
 
     asyncio.run(scenario())

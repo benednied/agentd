@@ -272,3 +272,58 @@ def test_serve_service_composes_remote_workers_and_scrubs_transport_psk(
     assert observed["secret_at_composition"] is None
     assert observed["served"] is True
     assert observed["closed"] is True
+
+
+def test_reset_budget_queues_while_controller_lock_is_held(
+    tmp_path, monkeypatch, capsys
+):
+    from agentd.coding import controller
+    from agentd.lifecycle import ControllerLock
+
+    database = tmp_path / "state.sqlite"
+    monkeypatch.setattr(
+        controller, "load_config", lambda _: {"database": str(database)}
+    )
+
+    def forbidden(_):
+        raise AssertionError("CLI must not construct a second controller")
+
+    monkeypatch.setattr(controller, "create_controller", forbidden)
+    owner = ControllerLock(database)
+    owner.acquire()
+    try:
+        args = build_parser().parse_args(
+            [
+                "github",
+                "--config",
+                "config.json",
+                "reset-budget",
+                "job-1",
+                "--expected-run-id",
+                "run-1",
+                "--actor",
+                "owner",
+                "--maximum-tokens",
+                "9000000",
+                "--maximum-run-tokens",
+                "3000000",
+            ]
+        )
+        assert asyncio.run(cli._github_command(args)) == 0
+        queued = json.loads(capsys.readouterr().out)
+        assert queued["status"] == "queued"
+        assert asyncio.run(cli._github_command(args)) == 0
+        assert json.loads(capsys.readouterr().out) == queued
+        args = build_parser().parse_args(
+            [
+                "github",
+                "--config",
+                "config.json",
+                "reset-budget-status",
+                queued["request_id"],
+            ]
+        )
+        assert asyncio.run(cli._github_command(args)) == 0
+        assert json.loads(capsys.readouterr().out) == queued
+    finally:
+        owner.release()
