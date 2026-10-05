@@ -103,7 +103,7 @@ class Provider:
         raise AssertionError
 
 
-def setup(tmp_path, *, contained=True, block=False):
+def setup(tmp_path, *, contained=True, block=False, validation_commands=()):
     source = tmp_path / "source"
     source.mkdir()
     git(source, "init")
@@ -121,7 +121,11 @@ def setup(tmp_path, *, contained=True, block=False):
     )
     base = git(source, "rev-parse", "HEAD")
     profile = RepositoryProfile(
-        "repo", "v1", "test/repo", "https://github.com/test/repo.git"
+        "repo",
+        "v1",
+        "test/repo",
+        "https://github.com/test/repo.git",
+        validation_commands=validation_commands,
     )
     order = CodingWorkOrder(
         "job",
@@ -163,6 +167,22 @@ def setup(tmp_path, *, contained=True, block=False):
         account_pools={"codex": "account"},
     )
     return worker, provider, contract
+
+
+def test_worker_receives_trusted_validation_tool_paths(tmp_path):
+    async def scenario():
+        command = ("/opt/agentd/repository-runtime/venv/bin/python", "-m", "pytest")
+        worker, provider, contract = setup(tmp_path, validation_commands=(command,))
+        handle = await worker.start_managed("validation-guidance", contract)
+        assert command[0] in provider.execution.completion_protocol
+        assert (
+            "do not commit, push or publish" in provider.execution.completion_protocol
+        )
+        assert "publisher checks" in provider.execution.completion_protocol
+        assert provider.execution.environment == {}
+        await worker.collect(handle)
+
+    asyncio.run(scenario())
 
 
 def test_real_git_result_survives_restart_and_retention(tmp_path):

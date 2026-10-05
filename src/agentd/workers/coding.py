@@ -228,6 +228,22 @@ class CodingHarnessDriver:
                 "do not commit, push or publish."
             ),
         )
+        if profile.validation_commands:
+            local = replace(
+                local,
+                completion_protocol=(
+                    local.completion_protocol
+                    + "\nThe trusted repository profile supplies these validation "
+                    "commands as JSON argv arrays. Use their explicit interpreter "
+                    "and tool paths; do not assume the default Python or a new "
+                    "dependency download is required. Run applicable checks from "
+                    "the workspace. Checks requiring a clean committed tree are "
+                    "publisher checks after trusted commit capture; leave your "
+                    "edits uncommitted. Report unavailable checks accurately. "
+                    "Do not weaken validation or bypass network restrictions.\n"
+                    + json.dumps(profile.validation_commands)
+                ),
+            )
         if order.repair_context:
             local = replace(
                 local,
