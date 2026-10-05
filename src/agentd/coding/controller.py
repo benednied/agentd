@@ -700,6 +700,7 @@ def status(
 ) -> list[dict[str, Any]]:
     """Safe identities and outcomes, without raw issue text or credentials."""
     result = []
+    snapshots: dict[str, ProviderQuotaSnapshot | None] = {}
     limits = attempt_limits or CodingAttemptLimits()
     publication_store = PublicationStore(store.path)
     with RuntimeHealthStore(store.path) as health_store:
@@ -739,7 +740,10 @@ def status(
             local_capacity = pool.remaining - pool.reserved
         except LookupError:
             local_capacity = None
-        snapshot = store.latest_provider_quota_snapshot(job.quota_budget.pool_id)
+        pool_id = job.quota_budget.pool_id
+        if pool_id not in snapshots:
+            snapshots[pool_id] = store.latest_provider_quota_snapshot(pool_id)
+        snapshot = snapshots[pool_id]
         result.append(
             {
                 "job_id": job.id,
