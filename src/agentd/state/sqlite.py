@@ -189,6 +189,8 @@ CREATE TABLE IF NOT EXISTS provider_quota_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_provider_snapshots_pool
     ON provider_quota_snapshots(pool_id, observed_at, id);
+CREATE INDEX IF NOT EXISTS idx_provider_snapshots_pool_bucket
+    ON provider_quota_snapshots(pool_id, bucket_id, observed_at, id);
 
 CREATE TABLE IF NOT EXISTS run_commands (
     id TEXT PRIMARY KEY,
@@ -2674,8 +2676,19 @@ class SQLiteStateStore(IntakeStoreMixin):
         pool_id: str,
         bucket_id: str | None = None,
     ) -> ProviderQuotaSnapshot | None:
-        snapshots = self.list_provider_quota_snapshots(pool_id, bucket_id)
-        return snapshots[-1] if snapshots else None
+        query = "SELECT payload FROM provider_quota_snapshots WHERE pool_id = ?"
+        args: tuple[object, ...] = (pool_id,)
+        if bucket_id is not None:
+            query += " AND bucket_id = ?"
+            args = (pool_id, bucket_id)
+        query += " ORDER BY observed_at DESC, id DESC LIMIT 1"
+        with self._lock:
+            row = self._connection.execute(query, args).fetchone()
+        return (
+            _load(row["payload"], ProviderQuotaSnapshot.from_dict)
+            if row is not None
+            else None
+        )
 
     def list_provider_quota_snapshots(
         self,

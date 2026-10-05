@@ -475,3 +475,56 @@ def test_reserve_policy_stops_when_telemetry_cannot_protect_both_windows(changes
     )
     assert command.action == "interrupt"
     assert command.payload["reason"] == "provider reserve telemetry is unavailable"
+
+
+def test_status_reuses_snapshots_per_pool_only_within_each_pass(
+    controller_config, monkeypatch
+):
+    from datetime import UTC, datetime
+
+    path, source = controller_config
+    config = load_config(path)
+
+    async def scenario():
+        runtime = create_controller(config)
+        try:
+            monkeypatch.setattr(
+                source, "get", lambda repository, number: source.current
+            )
+            for number in range(1, 31):
+                source.current = replace(
+                    source.current, number=number, node_id=f"I_{number}"
+                )
+                runtime.intake.approve("test/repo", number, actor="operator")
+                await runtime.intake.poll()
+            store = runtime.store
+            assert len(store.list_jobs()) == 30
+            calls = []
+            original = store.latest_provider_quota_snapshot
+
+            def counted_latest(pool_id, bucket_id=None):
+                calls.append((pool_id, bucket_id))
+                return original(pool_id, bucket_id)
+
+            monkeypatch.setattr(store, "latest_provider_quota_snapshot", counted_latest)
+            reports = status(store)
+            assert len(reports) == 30
+            assert calls == [("account", None)]
+            assert all(r["quota"]["provider_observed_at"] is None for r in reports)
+            snapshot = ProviderQuotaSnapshot(
+                id="fresh",
+                pool_id="account",
+                bucket_id="codex",
+                observed_at=datetime.now(UTC),
+            )
+            store.append_provider_quota_snapshot(snapshot)
+            reports = status(store)
+            assert calls == [("account", None), ("account", None)]
+            assert all(
+                r["quota"]["provider_observed_at"] == snapshot.observed_at.isoformat()
+                for r in reports
+            )
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())

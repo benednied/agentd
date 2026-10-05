@@ -565,3 +565,50 @@ def test_uncached_ledger_records_cache_only_progress_without_charging(make_job):
     assert store.get_reservation(run.reservation_id).consumed == 5
     assert store.get_quota_pool("default").remaining == 95
     assert store.list_usage_samples(run.id)[-1].tokens.total_tokens == 205
+
+
+@pytest.mark.parametrize("bucket_id", [None, "codex", "missing"])
+def test_latest_provider_snapshot_reads_at_most_one_payload(
+    make_job, monkeypatch, bucket_id
+):
+    from agentd.state import sqlite
+
+    store, _, _ = _runtime(make_job)
+    snapshots = [
+        ProviderQuotaSnapshot(
+            id=f"snapshot-{i:04d}",
+            pool_id="default",
+            bucket_id="codex" if i % 2 else "other",
+            observed_at=NOW + timedelta(seconds=i // 2),
+        )
+        for i in range(2818)
+    ]
+    # Reverse insertion order verifies chronological ordering and ID tie-breaking.
+    for snapshot in reversed(snapshots):
+        store.append_provider_quota_snapshot(snapshot)
+    expected = store.list_provider_quota_snapshots("default", bucket_id)
+    loads = []
+    original_load = sqlite._load
+
+    def counted_load(payload, factory):
+        loads.append(payload)
+        return original_load(payload, factory)
+
+    monkeypatch.setattr(sqlite, "_load", counted_load)
+    assert store.latest_provider_quota_snapshot("default", bucket_id) == (
+        expected[-1] if expected else None
+    )
+    assert len(loads) == (1 if expected else 0)
+    assert store.latest_provider_quota_snapshot("missing", bucket_id) is None
+    assert len(loads) == (1 if expected else 0)
+    query = "SELECT payload FROM provider_quota_snapshots WHERE pool_id = ?"
+    args = ("default",)
+    index = "idx_provider_snapshots_pool"
+    if bucket_id is not None:
+        query += " AND bucket_id = ?"
+        args += (bucket_id,)
+        index += "_bucket"
+    query += " ORDER BY observed_at DESC, id DESC LIMIT 1"
+    plan = store._all("EXPLAIN QUERY PLAN " + query, args)
+    assert any(index in row["detail"] for row in plan)
+    assert all("TEMP B-TREE" not in row["detail"] for row in plan)
