@@ -240,6 +240,9 @@ class AgentDaemon:
             return None
         if self._admission_enabled is not None and not self._admission_enabled():
             return None
+        # Source, quota, and publication I/O may outlive the worker freshness
+        # window. Recheck liveness at admission, retaining the normal poll limit.
+        await self._refresh_worker_heartbeats(self._clock())
         try:
             dispatched = await self._control_plane.dispatch_next()
         except Exception:
