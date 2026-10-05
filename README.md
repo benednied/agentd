@@ -50,6 +50,19 @@ The deterministic fake path creates real SQLite state and Git worktrees without
 starting Codex or contacting an LLM. See [Getting started](docs/10-start-here/getting-started.md)
 for the complete CLI and Python examples.
 
+## Package smoke test
+
+From the repository checkout, build both distributables, install the wheel into
+a fresh Python 3.12 environment, and run the installed command from elsewhere:
+
+```bash
+uv build --wheel --sdist
+smoke_dir="$(mktemp -d)"
+uv venv --python 3.12 "$smoke_dir/.venv"
+uv pip install --python "$smoke_dir/.venv/bin/python" dist/*.whl
+(cd "$smoke_dir" && "$smoke_dir/.venv/bin/agentd" --help)
+```
+
 ## What it provides
 
 - deterministic readiness, QoS, dependency, capability, and best-fit placement;
