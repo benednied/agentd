@@ -978,3 +978,97 @@ def test_validation_infrastructure_retries_are_bounded(result, tmp_path):
         publisher.publish(intent, collected, repo)
     assert runner.calls == 2
     assert len(publisher.store.get(intent.job_id)["evidence"]) == 2
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_candidate_preparation_failure_is_retained_without_recoding(
+    result, tmp_path, changed
+):
+    from types import SimpleNamespace
+
+    from agentd.candidate_runtime import CandidatePreparationError
+
+    repo, intent, collected = result
+
+    class Unavailable(TrustedFinalizer):
+        calls = 0
+        preparation = SimpleNamespace(prerequisite="cache-v1")
+
+        def __init__(self):
+            pass
+
+        def validate(self, *args):
+            self.calls += 1
+            raise CandidatePreparationError("missing wheel")
+
+    validator = Unavailable()
+    store = PublicationStore(tmp_path / "publication.sqlite")
+    publisher = DraftPublisher(store, Adapter(), validator)
+    for _ in range(3):
+        with pytest.raises(PublicationPending, match="preparation blocked"):
+            publisher.publish(intent, collected, repo)
+    assert validator.calls == 1
+    assert store.get(intent.job_id)["stage"] == "preparation_blocked"
+    assert store.get(intent.job_id)["evidence"][0]["returncode"] is None
+    if changed:
+        validator.preparation = SimpleNamespace(prerequisite="cache-v2")
+        with pytest.raises(PublicationPending):
+            publisher.publish(intent, collected, repo)
+        assert validator.calls == 2
+
+
+@pytest.mark.parametrize("wrong_digest", [False, True])
+def test_candidate_runtime_reaches_independent_validation(
+    result, tmp_path, monkeypatch, wrong_digest
+):
+    from agentd.candidate_runtime import (
+        CandidatePreparationError,
+        CandidateRuntime,
+        lock_digest,
+    )
+    from agentd.publication import BubblewrapValidationRunner
+
+    repo, intent, collected = result
+    (repo / "uv.lock").write_text("version = 1\n# new dependency set\n")
+    git(repo, "add", "uv.lock")
+    git(repo, "commit", "-m", "Change dependencies")
+    commit = git(repo, "rev-parse", "HEAD")
+    digest = lock_digest(repo)
+    intent = replace(
+        intent,
+        result_commit=commit,
+        validation_commands=(
+            ("{candidate_python}", "--lock", "{candidate_lock_sha256}"),
+        ),
+    )
+    collected = replace(collected, result_commit=commit)
+    calls = []
+
+    class Preparation:
+        def prepare(self, checkout, destination):
+            assert lock_digest(checkout) == digest
+            destination.mkdir()
+            (destination / "lock.sha256").write_text(digest)
+            return CandidateRuntime(destination, "wrong" if wrong_digest else digest)
+
+    def validate(self, command, *, cwd, env, timeout):
+        calls.append(command)
+        assert command == (
+            str(self.runtime_mounts[-1] / "venv/bin/python"),
+            "--lock",
+            digest,
+        )
+        assert lock_digest(cwd) == digest
+        assert self.runtime_mounts[-1].name == "runtime"
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(BubblewrapValidationRunner, "run", validate)
+    validator = TrustedFinalizer(BubblewrapValidationRunner(), Preparation())
+    if wrong_digest:
+        with pytest.raises(CandidatePreparationError):
+            validator.validate(intent, collected, repo)
+        assert calls == []
+    else:
+        evidence = validator.validate(intent, collected, repo)
+        assert evidence[0]["returncode"] == 0
+        assert len(calls) == 1

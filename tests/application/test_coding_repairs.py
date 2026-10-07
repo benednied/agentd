@@ -526,3 +526,45 @@ def test_github_retry_of_failed_feedback_keeps_original_delivery_and_one_pr(tmp_
             )
 
     asyncio.run(scenario())
+
+
+def test_candidate_preparation_block_does_not_launch_another_coding_attempt(tmp_path):
+    from types import SimpleNamespace
+
+    from agentd.candidate_runtime import CandidatePreparationError
+
+    class MissingRuntime(TrustedFinalizer):
+        calls = 0
+
+        def __init__(self):
+            self.preparation = SimpleNamespace(prerequisite="cache-v1")
+
+        def validate(self, *args):
+            self.calls += 1
+            raise CandidatePreparationError("missing wheel")
+
+    async def scenario():
+        provider = CompletingProvider(values=("verified",))
+        async with coding_rig(
+            tmp_path, provider=provider, validation_commands=VALIDATION
+        ) as rig:
+            rig.quota()
+            original = await complete_attempt(rig)
+            github, publications, repairs = pipeline(rig)
+            validator = MissingRuntime()
+            publications.publisher.finalizer = validator
+            for _ in range(3):
+                await publications.reconcile()
+                assert await repairs.reconcile() == ()
+                assert await rig.plane.dispatch_next() is None
+            assert validator.calls == provider.starts == 1
+            assert github.pushes == 0
+            assert rig.store.get_run(original.id) == original
+            assert len(rig.store.list_runs(rig.job.id)) == 1
+            assert rig.store.get_quota_pool("account").remaining == 988
+            assert (
+                publications.publisher.store.get(rig.job.id)["stage"]
+                == "preparation_blocked"
+            )
+
+    asyncio.run(scenario())

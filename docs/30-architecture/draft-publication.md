@@ -123,3 +123,58 @@ could hide source edits. Trusted Git invocations disable fsmonitor, and the
 post-check disables external diff/text conversion and submodule traversal.
 Regression tests exercise both attacks and the real sandbox probe now verifies
 Git metadata writes are denied.
+
+### Candidate-specific Python dependencies
+
+The optional Linux `candidate_runtime` publisher setting extends the existing
+`DependencyRuntimePreparation` materializer. After importing and verifying the
+exact candidate commit, the finalizer copies only `pyproject.toml` and `uv.lock`
+into a private preparation directory. A separate Bubblewrap invocation runs
+frozen, offline `uv sync` with a pinned interpreter, no project/workspace install,
+no builds, no editable installs and no Python downloads. It has no publisher
+credentials, candidate source code or network access.
+
+This initial policy accepts PyPI registry dependencies and hashed wheels hosted
+on `files.pythonhosted.org`, using only an administrator-populated uv cache.
+Direct URL, Git and additional local/workspace dependencies are rejected. Missing
+cached dependencies require an administrator to populate a new cache snapshot
+outside the coding and validation sandboxes. There is deliberately no automatic
+network downloader in this extension. The cache is copied into private preparation
+scratch so uv can maintain its metadata without modifying the approved snapshot.
+Budget disk space for that copy and keep the configured cache repository-specific.
+
+For example, add this to the publisher configuration, with actual immutable paths:
+
+```json
+"candidate_runtime": {
+  "cache": "/opt/agentd/dependency-cache/goldenage-v2",
+  "python": "/opt/agentd/python/bin/python3.14",
+  "uv": "/usr/local/bin/uv",
+  "revision": "goldenage-dependencies-v2",
+  "timeout_seconds": 900
+}
+```
+
+The interpreter and uv must be visible in `validation_runtime_mounts` or standard
+system mounts. Do not add the dependency cache to validation mounts. Configure
+validation commands to use `{candidate_python}` (normally with `-I -m pytest`,
+`-I -m ruff`, or an absolute trusted validation script). Existing trusted scripts
+that check the expected lock digest can receive `{candidate_lock_sha256}`. These
+placeholders are expanded only after successful preparation and digest checks;
+no hash in the recorded profile or candidate is rewritten. At least one validation
+command must use the prepared interpreter. The default uv dependency groups apply;
+projects requiring optional extras need a separately reviewed profile extension.
+
+The existing materializer copies and relocates the prepared venv, then the
+publisher removes write permissions. Validation gets only this completed artifact
+as an additional read-only mount, with a receipt bound to the exact candidate
+`uv.lock` SHA-256. It never receives the preparation cache. The receipt and candidate
+lock are checked before each validation command.
+
+Preparation failures are retained as `preparation_blocked`, distinct from
+`validation_failed`; the coding repair reconciler therefore cannot schedule a new
+coding attempt. Repeated polls and process restarts do not rerun preparation for
+that prerequisite. After repairing the cache/toolchain, change the administrative
+`revision` (or configured paths) to retry the same retained candidate. Existing
+bounded publication attempt limits still apply, and prior evidence is preserved.
+A fresh candidate is not requested to work around a missing dependency artifact.

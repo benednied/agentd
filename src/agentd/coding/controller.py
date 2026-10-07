@@ -274,12 +274,39 @@ def create_publications(
         else BubblewrapValidationRunner
     )
     runner = runner_type(runtime_mounts=mounts) if mounts else runner_type()
+    preparation = None
+    if settings := config.get("candidate_runtime"):
+        from agentd.candidate_runtime import CandidateRuntimePreparation
+
+        if platform.system() != "Linux":
+            raise ValueError("Candidate runtime preparation requires Linux")
+        if not any(
+            "{candidate_python}" in part
+            for command in profile.validation_commands
+            for part in command
+        ):
+            raise ValueError("Candidate runtime requires a candidate_python command")
+        preparation = CandidateRuntimePreparation(
+            cache=Path(settings["cache"]),
+            python=Path(settings["python"]),
+            uv=Path(settings["uv"]),
+            runtime_roots=(
+                Path("/usr"),
+                Path("/bin"),
+                Path("/lib"),
+                Path("/lib64"),
+                *mounts,
+            ),
+            runner=runner_type(runtime_mounts=mounts),
+            revision=settings["revision"],
+            timeout=settings.get("timeout_seconds", 900),
+        )
     return CodingPublicationReconciler(
         store,
         DraftPublisher(
             PublicationStore(store.path),
             GitHubPublicationAdapter(),
-            TrustedFinalizer(runner),
+            TrustedFinalizer(runner, preparation),
             maximum_validation_attempts=config.get("maximum_validation_attempts", 3),
             allow_ready_pr_updates=config.get("allow_ready_pr_updates", False),
         ),
