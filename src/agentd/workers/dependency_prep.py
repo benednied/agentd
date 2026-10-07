@@ -17,6 +17,7 @@ class DependencyPreparationError(RuntimeError):
 class PreparationMount:
     source: Path
     destination: str
+    relocation_source: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,8 @@ class DependencyRuntimePreparation:
                 shutil.copy2(source, destination)
             self._make_copy_writable(destination)
             self._relocate(destination, source)
+            if mount.relocation_source is not None:
+                self._relocate(destination, mount.relocation_source)
             prepared.append(destination)
         return tuple(prepared)
 
