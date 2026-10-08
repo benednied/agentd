@@ -116,10 +116,10 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
     assert "CODEX_HOME" not in install_environment
     assert "OPENAI_API_KEY" not in install_environment
     assert isinstance(sync_environment, dict)
-    assert sync_install_environment["HOME"] == str(workspace / ".uv-provision-home")
-    assert sync_install_environment["UV_CACHE_DIR"] == str(workspace / ".uv-cache")
-    assert sync_install_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
-    assert sync_install_environment["UV_PYTHON_PREFERENCE"] == "only-managed"
+    assert sync_environment["HOME"] == str(workspace / ".uv-provision-home")
+    assert sync_environment["UV_CACHE_DIR"] == str(workspace / ".uv-cache")
+    assert sync_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
+    assert sync_environment["UV_PYTHON_PREFERENCE"] == "only-managed"
     assert sync_environment["UV_PYTHON_DOWNLOADS"] == "never"
     assert "CODEX_HOME" not in sync_environment
     assert "OPENAI_API_KEY" not in sync_environment
