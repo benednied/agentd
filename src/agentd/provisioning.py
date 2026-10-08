@@ -162,7 +162,7 @@ class TrustedUvProvisioner:
         codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        sandbox_prefix = (
+        sandbox_common = (
             self.bubblewrap_executable,
             "--die-with-parent",
             "--new-session",
@@ -180,6 +180,8 @@ class TrustedUvProvisioner:
             "--bind",
             str(workspace),
             str(workspace),
+        )
+        sandbox_tail = (
             "--tmpfs",
             str(codex_home),
             "--tmpfs",
@@ -189,19 +191,20 @@ class TrustedUvProvisioner:
             "--",
         )
         install_arguments = (
-            *sandbox_prefix[:-8],
+            *sandbox_common,
             "--bind",
             str(cache),
             str(cache),
             "--bind",
             str(provision_home),
             str(provision_home),
-            *sandbox_prefix[-8:],
+            *sandbox_tail,
             self.uv_executable,
             "python",
             "install",
             python_version,
         )
+        sync_sandbox_prefix = (*sandbox_common, *sandbox_tail)
         sync_arguments = [self.uv_executable, "sync", "--frozen"]
         for extra in self.extras:
             sync_arguments.extend(("--extra", extra))
@@ -236,7 +239,7 @@ class TrustedUvProvisioner:
         )
         sync_environment["UV_PYTHON_DOWNLOADS"] = "never"
         await self._run_trusted_step(
-            (*sandbox_prefix, *sync_arguments),
+            (*sync_sandbox_prefix, *sync_arguments),
             workspace,
             sync_environment,
             description="Locked dependency provisioning",
