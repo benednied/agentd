@@ -351,8 +351,7 @@ def test_repository_build_state_is_private_per_lease(tmp_path: Path) -> None:
         str(second_workspace / ".uv-cache" / "home"),
     ]
     assert all(
-        env["UV_PYTHON_INSTALL_DIR"] == str(python_install)
-        for env in sync_environments
+        env["UV_PYTHON_INSTALL_DIR"] == str(python_install) for env in sync_environments
     )
     assert all(env["UV_PYTHON_DOWNLOADS"] == "never" for env in sync_environments)
 
