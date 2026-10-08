@@ -108,7 +108,7 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
     assert str(cache) not in sync_arguments
     assert str(provision_home) not in sync_arguments
     assert all(call["cwd"] == workspace for call in observed)
-    assert isinstance(environment, dict)
+    assert isinstance(install_environment, dict)
     assert install_environment["HOME"] == str(provision_home)
     assert install_environment["UV_CACHE_DIR"] == str(cache)
     assert install_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
