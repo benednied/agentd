@@ -65,11 +65,13 @@ async def _run_command(
 class TrustedUvProvisioner:
     """Run locked ``uv sync`` before a model receives the workspace.
 
-    Bubblewrap sees the container filesystem read-only, with only the leased
-    worktree, uv cache, and an empty provisioning home writable. The service
-    ``CODEX_HOME`` is replaced by an empty tmpfs for the duration, so package
-    build hooks cannot read ChatGPT authentication even though provisioning is
-    allowed network access.
+    Bubblewrap sees the container filesystem read-only. Managed Python
+    installation runs as a trusted step with the shared uv toolchain cache
+    writable; repository dependency sync gets only a lease-local uv cache and
+    home writable. The service ``CODEX_HOME`` is replaced by an empty tmpfs
+    for the duration, so package build hooks cannot read ChatGPT authentication
+    or mutate state reused by later leases even though provisioning is allowed
+    network access.
     """
 
     codex_home: Path
@@ -102,6 +104,8 @@ class TrustedUvProvisioner:
         python_install = (
             (self.python_install_directory or cache / "python").expanduser().resolve()
         )
+        private_cache = workspace / ".uv-cache"
+        private_home = workspace / ".uv-provision-home"
         if not workspace.is_dir():
             raise RepositoryProvisioningError(
                 f"Workspace does not exist for provisioning: {workspace}"
@@ -136,6 +140,22 @@ class TrustedUvProvisioner:
                 "cache subdirectory"
             )
 
+        for private_path, label in (
+            (private_cache, "lease-local uv cache"),
+            (private_home, "lease-local provisioning home"),
+        ):
+            if private_path.is_symlink():
+                raise RepositoryProvisioningError(
+                    f"The {label} cannot be a symbolic link"
+                )
+            private_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                private_path.resolve().relative_to(workspace)
+            except ValueError as error:
+                raise RepositoryProvisioningError(
+                    f"The {label} must remain inside the leased worktree"
+                ) from error
+
         cache.mkdir(parents=True, exist_ok=True, mode=0o700)
         python_install.mkdir(parents=True, exist_ok=True, mode=0o700)
         provision_home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -160,12 +180,6 @@ class TrustedUvProvisioner:
             "--bind",
             str(workspace),
             str(workspace),
-            "--bind",
-            str(cache),
-            str(cache),
-            "--bind",
-            str(provision_home),
-            str(provision_home),
             "--tmpfs",
             str(codex_home),
             "--tmpfs",
@@ -175,7 +189,14 @@ class TrustedUvProvisioner:
             "--",
         )
         install_arguments = (
-            *sandbox_prefix,
+            *sandbox_prefix[:-8],
+            "--bind",
+            str(cache),
+            str(cache),
+            "--bind",
+            str(provision_home),
+            str(provision_home),
+            *sandbox_prefix[-8:],
             self.uv_executable,
             "python",
             "install",
@@ -197,17 +218,27 @@ class TrustedUvProvisioner:
             elif "dev" in metadata.get("project", {}).get("optional-dependencies", {}):
                 sync_arguments.extend(("--extra", "dev"))
         sync_arguments.extend(("--python", python_version))
-        environment = self._environment(cache, provision_home, python_install)
+        install_environment = self._environment(
+            cache,
+            provision_home,
+            python_install,
+        )
         await self._run_trusted_step(
             install_arguments,
             workspace,
-            environment,
+            install_environment,
             description=f"Managed Python {python_version} installation",
         )
+        sync_environment = self._environment(
+            private_cache,
+            private_home,
+            python_install,
+        )
+        sync_environment["UV_PYTHON_DOWNLOADS"] = "never"
         await self._run_trusted_step(
             (*sandbox_prefix, *sync_arguments),
             workspace,
-            environment,
+            sync_environment,
             description="Locked dependency provisioning",
         )
 
