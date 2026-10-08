@@ -66,8 +66,8 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
     assert len(observed) == 2
     install_arguments = observed[0]["arguments"]
     sync_arguments = observed[1]["arguments"]
-    environment = observed[0]["environment"]
-    assert observed[1]["environment"] == environment
+    install_environment = observed[0]["environment"]
+    sync_environment = observed[1]["environment"]
     assert isinstance(install_arguments, tuple)
     assert isinstance(sync_arguments, tuple)
     assert install_arguments[:3] == (
@@ -103,14 +103,26 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
         "--python",
         "3.14",
     )
+    assert str(cache) in install_arguments
+    assert str(provision_home) in install_arguments
+    assert str(cache) not in sync_arguments
+    assert str(provision_home) not in sync_arguments
     assert all(call["cwd"] == workspace for call in observed)
-    assert isinstance(environment, dict)
-    assert environment["HOME"] == str(provision_home)
-    assert environment["UV_CACHE_DIR"] == str(cache)
-    assert environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
-    assert environment["UV_PYTHON_PREFERENCE"] == "only-managed"
-    assert "CODEX_HOME" not in environment
-    assert "OPENAI_API_KEY" not in environment
+    assert isinstance(install_environment, dict)
+    assert install_environment["HOME"] == str(provision_home)
+    assert install_environment["UV_CACHE_DIR"] == str(cache)
+    assert install_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
+    assert install_environment["UV_PYTHON_PREFERENCE"] == "only-managed"
+    assert "CODEX_HOME" not in install_environment
+    assert "OPENAI_API_KEY" not in install_environment
+    assert isinstance(sync_environment, dict)
+    assert sync_environment["HOME"] == str(workspace / ".uv-cache" / "home")
+    assert sync_environment["UV_CACHE_DIR"] == str(workspace / ".uv-cache")
+    assert sync_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
+    assert sync_environment["UV_PYTHON_PREFERENCE"] == "only-managed"
+    assert sync_environment["UV_PYTHON_DOWNLOADS"] == "never"
+    assert "CODEX_HOME" not in sync_environment
+    assert "OPENAI_API_KEY" not in sync_environment
 
 
 def test_provisioner_surfaces_failure_without_secret_output(tmp_path: Path) -> None:
@@ -302,3 +314,60 @@ def test_command_runner_kills_and_reaps_process_group_when_cancelled(
         assert process.waited
 
     asyncio.run(scenario())
+
+
+def test_repository_build_state_is_private_per_lease(tmp_path: Path) -> None:
+    cache = tmp_path / "shared-uv-cache"
+    python_install = cache / "python"
+    sync_environments: list[dict[str, str]] = []
+
+    async def runner(arguments, _cwd, environment):
+        if "sync" in arguments:
+            sync_environments.append(dict(environment))
+        return 0, b"", b""
+
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=cache,
+        provisioning_home=tmp_path / "provision-home",
+        python_install_directory=python_install,
+        runner=runner,
+    )
+    first_workspace = tmp_path / "worktree-1"
+    second_workspace = tmp_path / "worktree-2"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+
+    asyncio.run(provisioner.prepare(_lease(first_workspace)))
+    asyncio.run(provisioner.prepare(_lease(second_workspace)))
+
+    assert [env["UV_CACHE_DIR"] for env in sync_environments] == [
+        str(first_workspace / ".uv-cache"),
+        str(second_workspace / ".uv-cache"),
+    ]
+    assert [env["HOME"] for env in sync_environments] == [
+        str(first_workspace / ".uv-cache" / "home"),
+        str(second_workspace / ".uv-cache" / "home"),
+    ]
+    assert all(
+        env["UV_PYTHON_INSTALL_DIR"] == str(python_install) for env in sync_environments
+    )
+    assert all(env["UV_PYTHON_DOWNLOADS"] == "never" for env in sync_environments)
+
+
+def test_provisioner_rejects_symlinked_private_cache(tmp_path: Path) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    target = tmp_path / "outside"
+    target.mkdir()
+    (workspace / ".uv-cache").symlink_to(target, target_is_directory=True)
+    provisioner = TrustedUvProvisioner(
+        codex_home=tmp_path / "codex-home",
+        state_directory=tmp_path / "state",
+        cache_directory=tmp_path / "cache",
+        provisioning_home=tmp_path / "home",
+    )
+
+    with pytest.raises(RepositoryProvisioningError, match="cannot be a symbolic link"):
+        asyncio.run(provisioner.prepare(_lease(workspace)))
