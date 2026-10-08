@@ -116,7 +116,7 @@ def test_provisioner_hides_codex_home_and_scrubs_environment(
     assert "CODEX_HOME" not in install_environment
     assert "OPENAI_API_KEY" not in install_environment
     assert isinstance(sync_environment, dict)
-    assert sync_environment["HOME"] == str(workspace / ".uv-provision-home")
+    assert sync_environment["HOME"] == str(workspace / ".uv-cache" / "home")
     assert sync_environment["UV_CACHE_DIR"] == str(workspace / ".uv-cache")
     assert sync_environment["UV_PYTHON_INSTALL_DIR"] == str(python_install)
     assert sync_environment["UV_PYTHON_PREFERENCE"] == "only-managed"
@@ -347,8 +347,8 @@ def test_repository_build_state_is_private_per_lease(tmp_path: Path) -> None:
         str(second_workspace / ".uv-cache"),
     ]
     assert [env["HOME"] for env in sync_environments] == [
-        str(first_workspace / ".uv-provision-home"),
-        str(second_workspace / ".uv-provision-home"),
+        str(first_workspace / ".uv-cache" / "home"),
+        str(second_workspace / ".uv-cache" / "home"),
     ]
     assert all(
         env["UV_PYTHON_INSTALL_DIR"] == str(python_install)
