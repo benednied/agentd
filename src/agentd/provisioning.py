@@ -105,7 +105,7 @@ class TrustedUvProvisioner:
             (self.python_install_directory or cache / "python").expanduser().resolve()
         )
         private_cache = workspace / ".uv-cache"
-        private_home = workspace / ".uv-provision-home"
+        private_home = private_cache / "home"
         if not workspace.is_dir():
             raise RepositoryProvisioningError(
                 f"Workspace does not exist for provisioning: {workspace}"
@@ -127,6 +127,14 @@ class TrustedUvProvisioner:
             raise RepositoryProvisioningError(
                 "The leased worktree cannot contain the service Codex home"
             )
+        for shared_path, label in (
+            (cache, "shared uv cache"),
+            (provision_home, "shared provisioning home"),
+        ):
+            if shared_path == workspace or workspace in shared_path.parents:
+                raise RepositoryProvisioningError(
+                    f"The {label} cannot be inside the leased worktree"
+                )
         try:
             python_install.relative_to(cache)
         except ValueError as error:
