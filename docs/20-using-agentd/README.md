@@ -12,3 +12,5 @@ requiring knowledge of the internal implementation.
 
 For exact command syntax, see the [CLI reference](../80-reference/cli.md). For
 implementation ownership, see [architecture](../30-architecture/).
+
+Generated draft pull requests require human review before merge. Draft publication does not authorize agentd to merge a change.
