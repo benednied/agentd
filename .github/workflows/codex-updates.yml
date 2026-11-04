@@ -42,6 +42,7 @@ jobs:
         id: pr
         uses: peter-evans/create-pull-request@v7
         with:
+          sign-commits: true
           branch: codex/dependency-updates
           commit-message: "Update pinned Codex SDK and standalone CLI"
           title: "Update pinned Codex runtimes"
