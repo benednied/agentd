@@ -29,6 +29,7 @@
 #endif
 #define CODEX_HOME_PREFIX "/home/bened/.local/share/agentd/codex-home/"
 #define CODEX_ARG0_PREFIX CODEX_HOME_PREFIX "tmp/arg0/codex-arg0"
+#define CODEX_ARG0_LINUX_PREFIX CODEX_HOME_PREFIX "tmp/arg0-linux/codex-arg0"
 #define CODEX_BUNDLED_ELF \
     "/opt/agentd/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
 #define CODEX_SANDBOX_ALIAS "/usr/libexec/agentd/codex-linux-sandbox"
@@ -160,10 +161,14 @@ static bool starts_with(const char *value, const char *prefix) {
 }
 
 static bool valid_codex_sandbox_helper(const char *path) {
-    if (!starts_with(path, CODEX_ARG0_PREFIX)) {
+    const char *suffix;
+    if (starts_with(path, CODEX_ARG0_LINUX_PREFIX)) {
+        suffix = path + strlen(CODEX_ARG0_LINUX_PREFIX);
+    } else if (starts_with(path, CODEX_ARG0_PREFIX)) {
+        suffix = path + strlen(CODEX_ARG0_PREFIX);
+    } else {
         return false;
     }
-    const char *suffix = path + strlen(CODEX_ARG0_PREFIX);
     static const char helper_suffix[] = "/codex-linux-sandbox";
     if (strlen(suffix) != 6U + sizeof(helper_suffix) - 1U) {
         return false;

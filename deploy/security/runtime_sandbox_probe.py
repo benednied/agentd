@@ -227,21 +227,18 @@ def _require_bwrap_rewrite_audit(
 
 
 def _run_shim_rejection_probes() -> None:
+    missing_helpers = tuple(
+        str(AUTH_FILE.parent / "tmp" / root / "codex-arg0AAAAAA/codex-linux-sandbox")
+        for root in ("arg0", "arg0-linux")
+    )
     for arguments in (
         ("--share-net", "--version"),
         ("--dev", "/tmp/dev", "--version"),
         ("--dev-bind", "/dev/null", "/dev/null", "--version"),
         ("--dev-bind-try", "/dev", "/dev", "--version"),
         ("--args", "0"),
-        (
-            "--",
-            "/home/bened/.local/share/agentd/codex-home/tmp/arg0/"
-            "codex-arg0AAAAAA/codex-linux-sandbox",
-        ),
-        (
-            "/home/bened/.local/share/agentd/codex-home/tmp/arg0/"
-            "codex-arg0AAAAAA/codex-linux-sandbox",
-        ),
+        *(("--", helper) for helper in missing_helpers),
+        *((helper,) for helper in missing_helpers),
     ):
         result = subprocess.run(
             [str(BWRAP), *arguments],

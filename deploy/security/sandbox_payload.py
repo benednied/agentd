@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
-ARG0_ROOT = AUTH_FILE.parent / "tmp/arg0"
+ARG0_ROOTS = tuple(AUTH_FILE.parent / "tmp" / name for name in ("arg0", "arg0-linux"))
 STATE_DATABASE = Path("/home/bened/.local/state/agentd/state.sqlite")
 WORKSPACE_ROOT = Path("/home/bened/.local/share/agentd/workspaces")
 REPOSITORY_ROOT = Path("/home/bened/goldenage")
@@ -90,9 +90,10 @@ def main() -> int:
     if _is_readable(AUTH_FILE):
         print("sandbox opened the dedicated auth.json", file=sys.stderr)
         return 40
-    if _is_readable(ARG0_ROOT):
-        print("sandbox opened the Codex argv0 helper directory", file=sys.stderr)
-        return 47
+    for root in ARG0_ROOTS:
+        if _is_readable(root):
+            print(f"sandbox opened a Codex argv0 root: {root}", file=sys.stderr)
+            return 47
     if _is_readable(STATE_DATABASE):
         print("sandbox opened the agentd state database", file=sys.stderr)
         return 41
