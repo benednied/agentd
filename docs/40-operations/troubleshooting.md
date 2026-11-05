@@ -52,6 +52,39 @@ controller, and worker home that used the copy. Use a fresh sign-in for each
 new home. Keep the lock file and credential directory on the owner's local
 filesystem and use `codex-reauthorize` for future sign-ins to those homes.
 
+## GitHub REST budget
+
+Run `agentd github --config /path/to/controller.json health` to inspect
+`github_rest` and `source_observed_at`. The REST report includes cumulative
+request counts by component, operation, and outcome, plus the last reported
+remaining budget and reset time. A `304` is a conditional response confirming
+that the representation is unchanged. GitHub excludes authenticated `304`
+responses from the primary quota.
+
+The controller and publisher share one REST budget per controller database.
+On a primary or secondary limit, both pause REST requests until `retry_at`.
+The deadline survives restarts. `reset_at`, `retry_at`, and the quota's
+`observed_at` use Unix seconds. The existing source poll cadence and
+three-minute freshness window still apply. A failed or deferred sweep leaves
+`source_observed_at` at the last complete observation.
+
+The offline replay models one quiet hour at the HP's 60-second cadence, with
+28 tracked issues, 26 published PRs, and 25 publisher PR candidates. The old
+request estimates are from [issue #125](https://github.com/benednied/agentd/issues/125).
+The replay returns stable ETags and includes a publisher review read for each
+candidate on every sweep.
+
+| Component | Previous primary requests, estimated | Replay primary requests | Replay `304` responses |
+| --- | ---: | ---: | ---: |
+| Controller | 5,220 | 31 | 1,829 |
+| Publisher | 3,000 before review reads | 51 | 3,009 |
+
+The replay made 4,920 HTTP requests and used 82 of the 5,000 primary requests.
+Compared with the previous estimated demand of 8,220 requests per hour, this
+is about 40% fewer HTTP requests and 99% fewer primary requests. Live usage
+depends on changed responses, extra pages, cold starts, and other clients
+sharing the account.
+
 ## Metering and worktrees
 
 - `METERING_PENDING` means terminal usage was absent, inconsistent, or not present

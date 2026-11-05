@@ -398,12 +398,14 @@ def test_operating_controller_polls_executes_publishes_and_restarts(
             labels=("agentd:approved",),
         )
 
+        authority = [issue]
+
         class Source:
             def poll(self, repository):
                 return (issue,)
 
             def get(self, repository, number):
-                return issue
+                return authority[0]
 
         class Oracle:
             def __init__(self, store):
@@ -417,7 +419,9 @@ def test_operating_controller_polls_executes_publishes_and_restarts(
                 return snapshot
 
         github = AmbiguousGitHub()
-        monkeypatch.setattr("agentd.coding.controller.GitHubIssueSource", Source)
+        monkeypatch.setattr(
+            "agentd.coding.controller.GitHubIssueSource", lambda _rest: Source()
+        )
         monkeypatch.setattr(
             "agentd.coding.controller.AdministrativeOracle",
             lambda command, store, pool: Oracle(store),
@@ -479,6 +483,24 @@ def test_operating_controller_polls_executes_publishes_and_restarts(
         }
         runtime = create_controller(config)
         try:
+            runtime.intake.approve("test/repo", 1, actor="operator")
+            # The list can be stale when the scheduler is about to admit work.
+            authority[0] = replace(issue, body="Changed since the source poll")
+            for _ in range(100):
+                try:
+                    await runtime.daemon.tick()
+                except ValueError as error:
+                    assert "Source authorization changed" in str(error)
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Scheduler did not consult live GitHub authority")
+            assert not runtime.store.list_runs()
+            assert runtime.store.find_active_reservation(issue.job_id) is None
+            assert provider.starts == 0
+            authority[0] = issue
+            await runtime.aclose()
+            runtime = create_controller(config)
             runtime.intake.approve("test/repo", 1, actor="operator")
             # Discovery creates work; tick must refresh quota before admitting it.
             for _ in range(100):

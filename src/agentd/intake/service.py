@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from agentd.domain.enums import JobState
 from agentd.domain.models import Job
+from agentd.intake.github import GitHubIssueSource
 from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.service import ControlPlane
 from agentd.state.sqlite import SQLiteStateStore
@@ -42,11 +43,7 @@ class GitHubIntake:
         if self.workflow is not None:
             await self.workflow.poll_controls()
         observed = []
-        for policy in self.policies.values():
-            for issue in await asyncio.to_thread(self.source.poll, policy.repository):
-                await self.reconcile(issue)
-                observed.append(issue.key)
-        # Refresh every known job directly: pagination cannot hide closure/removal.
+        tracked: dict[str, list[SourceIssue]] = {repo: [] for repo in self.policies}
         for job in self.store.list_jobs():
             if job.terminal:
                 continue
@@ -63,10 +60,24 @@ class GitHubIntake:
                 ):
                     await self.control_plane.cancel(job.id)
                 continue
-            current = await asyncio.to_thread(
-                self.source.get, old.repository, old.number
-            )
-            await self.reconcile(current)
+            tracked[old.repository].append(old)
+        for repository, previous in tracked.items():
+            if isinstance(self.source, GitHubIssueSource):
+                issues = await asyncio.to_thread(
+                    self.source.poll, repository, tracked=tuple(previous)
+                )
+            else:
+                issues = await asyncio.to_thread(self.source.poll, repository)
+                seen = {issue.key for issue in issues}
+                for old in previous:
+                    if old.key not in seen:
+                        current = await asyncio.to_thread(
+                            self.source.get, repository, old.number
+                        )
+                        issues = (*issues, current)
+            for issue in issues:
+                await self.reconcile(issue)
+                observed.append(issue.key)
         return tuple(observed)
 
     async def reconcile(self, issue: SourceIssue) -> Job | None:
