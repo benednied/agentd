@@ -15,6 +15,7 @@ from agentd.domain.models import (
     utc_now,
 )
 from agentd.harness.codex_auth import CodexReauthorizationRequired
+from agentd.intake.github_rest import GitHubRateLimited
 from agentd.observability import event_logger
 from agentd.runtime.allowance import LocalAllowancePolicy
 from agentd.runtime.codex_oracle import AccountOracle
@@ -398,7 +399,8 @@ class AgentDaemon:
             log.bind(reason=error.reason, action=str(error)).error(
                 "provider_reauthorization_required"
             )
-        else:
+        elif not isinstance(error, GitHubRateLimited):
+            # The REST client logs shared backoff transitions once per deadline.
             log.error("operation_failed")
         if self._on_error is not None:
             self._on_error(error)

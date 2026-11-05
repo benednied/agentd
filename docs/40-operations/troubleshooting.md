@@ -79,8 +79,11 @@ candidate on every sweep.
 | Controller | 5,220 | 31 | 1,829 |
 | Publisher | 3,000 before review reads | 51 | 3,009 |
 
-The replay leaves 4,918 of 5,000 requests. Live usage depends on changed
-responses, extra pages, cold starts, and other clients sharing the account.
+The replay made 4,920 HTTP requests and used 82 of the 5,000 primary requests.
+Compared with the previous estimated demand of 8,220 requests per hour, this
+is about 40% fewer HTTP requests and 99% fewer primary requests. Live usage
+depends on changed responses, extra pages, cold starts, and other clients
+sharing the account.
 
 ## Metering and worktrees
 

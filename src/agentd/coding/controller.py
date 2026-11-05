@@ -60,6 +60,7 @@ from agentd.intake.workflow import (
     StandingGitHubPolicy,
 )
 from agentd.lifecycle import ControllerLock
+from agentd.observability import event_logger
 from agentd.publication import (
     BubblewrapValidationRunner,
     DraftPublisher,
@@ -215,7 +216,9 @@ class AdministrativeOracle:
 
 def _github_rest(config: dict[str, Any], component: str) -> GitHubREST:
     return GitHubREST(
-        database=Path(config["database"] + ".github-rest"), component=component
+        database=Path(config["database"] + ".github-rest"),
+        component=component,
+        repository=config["profile"]["repository"],
     )
 
 
@@ -384,13 +387,13 @@ async def serve_publisher(config: dict[str, Any]) -> None:
             while not stop.is_set():
                 runtime_health.pulse("publisher", state="validating")
                 try:
-                    rest.check_budget()
+                    rest.check_budget("publisher_poll")
                     for result in await publications.reconcile():
                         key = str(result.get("job_id") or result.get("url"))
                         payload = json.dumps(result, sort_keys=True)
                         if store.changed_report("publication:" + key, result):
                             print(payload, flush=True)
-                    rest.check_budget()
+                    rest.check_budget("integration_poll")
                     if (
                         integrations is not None
                         and time.monotonic() - last_integration_poll
@@ -400,7 +403,7 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                             print(json.dumps(result, sort_keys=True), flush=True)
                         last_integration_poll = time.monotonic()
                     if config.get("standing_github_policy"):
-                        rest.check_budget()
+                        rest.check_budget("status_poll")
                         reporter.enqueue(
                             status(
                                 store,
@@ -410,9 +413,11 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                             )
                         )
                         await reporter.publish_pending()
+                    rest.check_budget("publisher_poll")
                 except GitHubRateLimited:
-                    pass
-                runtime_health.pulse("publisher")
+                    runtime_health.pulse("publisher", state="github_rate_limited")
+                else:
+                    runtime_health.pulse("publisher")
                 with suppress(TimeoutError):
                     await asyncio.wait_for(
                         stop.wait(), timeout=config.get("poll_interval_seconds", 30)
@@ -683,7 +688,8 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             )
 
         async def refresh_sources() -> None:
-            rest.check_budget()
+            started = time.monotonic()
+            rest.check_budget("source_poll")
             if config.get("refresh_base_from_github") and backlog is None:
                 from agentd.intake.integration import GitHubIntegrationSource
 
@@ -697,8 +703,16 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                     config["base_branch"],
                 )
                 intake.compile_job = replace(intake.compile_job, base_commit=base)
-            await (backlog or intake).poll()
-            runtime_health.pulse("source")
+            observed = await (backlog or intake).poll()
+            pulse = runtime_health.pulse("source")
+            event_logger(
+                component="controller",
+                operation="source_poll",
+                repository=profile.repository,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                source_observed_at=pulse.observed_at.isoformat(),
+                source_count=len(observed),
+            ).info("github_source_poll_completed")
 
         async def report_recovery(error: Exception) -> None:
             del error
@@ -715,7 +729,12 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 reporter.enqueue(reports)
 
         def report_error(error: Exception) -> None:
-            runtime_health.pulse("controller", state="retrying")
+            runtime_health.pulse(
+                "controller",
+                state="github_rate_limited"
+                if isinstance(error, GitHubRateLimited)
+                else "retrying",
+            )
             if workflow is not None:
                 reports = status(
                     store,

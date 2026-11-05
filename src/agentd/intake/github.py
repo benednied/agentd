@@ -7,6 +7,7 @@ from typing import Any
 from agentd.coding.models import repository_name
 from agentd.intake.github_rest import GitHubREST
 from agentd.intake.models import SourceIssue
+from agentd.observability import event_logger
 
 
 class GitHubIssueSource:
@@ -53,6 +54,12 @@ class GitHubIssueSource:
             if len(items) < 100:
                 break
         else:
+            event_logger(
+                component=self.rest.component,
+                operation="source_issues",
+                repository=repository,
+                page_limit=max_pages,
+            ).warning("github_poll_incomplete")
             raise ValueError("GitHub issue pagination is incomplete")
         # Moving pages can miss a tracked issue. Reconcile it directly using
         # this sweep's verified repository identity, never absence alone.
@@ -67,6 +74,11 @@ class GitHubIssueSource:
             )
             issue = self._decode(repository, repository_id, item)
             if issue.key != previous.key:
+                event_logger(
+                    component=self.rest.component,
+                    operation="source_tracked_issue",
+                    repository=repository,
+                ).warning("github_source_identity_changed")
                 raise ValueError("Tracked GitHub issue identity changed")
             result.append(issue)
         return tuple(result)

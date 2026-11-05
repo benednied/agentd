@@ -99,7 +99,7 @@ class GitHubIntegrationAdapter:
         }"""
         # GraphQL uses its own primary rate budget. Integration still checks
         # the REST budget before making a change that must be read back.
-        self.rest.check_budget()
+        self.rest.check_budget("integration_ready")
         result = subprocess.run(
             ["gh", "api", "graphql", "--input", "-"],
             input=json.dumps({"query": query, "variables": {"id": node_id}}),

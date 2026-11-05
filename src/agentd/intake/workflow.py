@@ -22,6 +22,7 @@ from agentd.domain.models import CodingOperation, RunCommand
 from agentd.intake.github import GitHubIssueSource
 from agentd.intake.github_rest import GitHubRateLimited, GitHubREST
 from agentd.intake.models import SourceIssue
+from agentd.observability import event_logger
 
 if TYPE_CHECKING:
     from agentd.intake.service import GitHubIntake
@@ -187,10 +188,11 @@ class GitHubWorkflowSource(GitHubIssueSource):
     ) -> tuple[GitHubComment, ...]:
         repository = repository_name(repository)
         endpoint = "issues/comments" if kind == "comment" else "pulls/comments"
+        operation = "source_comments" if kind == "comment" else "source_review_comments"
         result = []
         for page in range(1, 101):
             items = self.rest.request(
-                "source_comments" if kind == "comment" else "source_review_comments",
+                operation,
                 f"repos/{repository}/{endpoint}?"
                 + urlencode({"since": since, "per_page": 100, "page": page}),
                 conditional=True,
@@ -215,6 +217,12 @@ class GitHubWorkflowSource(GitHubIssueSource):
                 )
             if len(items) < 100:
                 return tuple(result)
+        event_logger(
+            component=self.rest.component,
+            operation=operation,
+            repository=repository,
+            page_limit=100,
+        ).warning("github_poll_incomplete")
         raise ValueError("GitHub control comment pagination is incomplete")
 
     def verify_comment(self, comment: GitHubComment) -> tuple[tuple[str, int], ...]:
@@ -276,6 +284,12 @@ class GitHubWorkflowSource(GitHubIssueSource):
                 )
             if len(values) < 100:
                 return tuple(result)
+        event_logger(
+            component=self.rest.component,
+            operation="source_reviews",
+            repository=repository,
+            page_limit=100,
+        ).warning("github_poll_incomplete")
         raise ValueError("GitHub review control pagination is incomplete")
 
 
