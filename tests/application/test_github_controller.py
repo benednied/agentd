@@ -264,6 +264,53 @@ def test_oracle_rejects_observation_from_wrong_pool(controller_config):
         assert not store.list_provider_quota_snapshots("unrelated")
 
 
+def test_controller_reports_terminal_quota_auth_separately_from_liveness(
+    controller_config, monkeypatch
+):
+    from agentd.coding.controller import AdministrativeOracle, health
+    from agentd.harness.codex_auth import CodexReauthorizationRequired
+
+    path, _ = controller_config
+    config = load_config(path)
+    monkeypatch.setattr(
+        "agentd.coding.controller.ControllerLock.held", lambda _self: True
+    )
+    rejection = {
+        "auth_status": "reauthorization_required",
+        "pool_id": "account",
+        "reason": "refresh_token_reused",
+        "action": "synthetic secret to discard",
+    }
+    snapshot = ProviderQuotaSnapshot("account", "codex", primary_used_percent=12)
+    with SQLiteStateStore(config["database"]) as store:
+        store.register_quota_pool(QuotaPool("account", "codex", 200))
+        rejected = AdministrativeOracle(
+            [
+                sys.executable,
+                "-c",
+                f"print({json.dumps(rejection)!r}); raise SystemExit(2)",
+            ],
+            store,
+            "account",
+        )
+        with pytest.raises(CodexReauthorizationRequired, match="codex-reauthorize"):
+            asyncio.run(rejected.snapshot())
+        report = health(config, store)
+        assert report["controller_live"]
+        assert not report["admission_telemetry_ready"]
+        assert report["provider_auth"]["reason"] == "refresh_token_reused"
+        assert "synthetic secret" not in json.dumps(report)
+        assert store.latest_provider_quota_snapshot("account") is None
+
+        recovered = AdministrativeOracle(
+            [sys.executable, "-c", f"print({json.dumps(snapshot.to_dict())!r})"],
+            store,
+            "account",
+        )
+        assert asyncio.run(recovered.snapshot()) == snapshot
+        assert health(config, store)["provider_auth"]["state"] == "authorized"
+
+
 @pytest.mark.parametrize(
     "change",
     [

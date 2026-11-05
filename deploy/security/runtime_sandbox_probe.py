@@ -23,7 +23,13 @@ from openai_codex.generated.v2_all import (
 )
 
 from agentd.codex_versions import PINNED_OPENAI_CODEX_VERSION
-from agentd.harness.app_server import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT
+from agentd.harness.app_server import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    EXTERNAL_AUTH_CONFIG,
+    codex_access_params,
+)
+from agentd.harness.codex_auth import CodexSession
 
 EXPECTED_SDK_VERSION = PINNED_OPENAI_CODEX_VERSION
 AUTH_FILE = Path("/home/bened/.local/share/agentd/codex-home/auth.json")
@@ -375,6 +381,7 @@ def _run_codex_generated_command_probe(
             client_name="agentd_security_preflight",
             client_title="agentd security preflight",
             experimental_api=True,
+            config_overrides=(EXTERNAL_AUTH_CONFIG,),
         )
         payload = {
             "command": [str(toolchain_launcher), str(workspace_payload)],
@@ -386,6 +393,12 @@ def _run_codex_generated_command_probe(
         }
         with CodexClient(config) as client:
             client.initialize()
+            client.account_login_start(
+                {
+                    "type": "chatgptAuthTokens",
+                    **codex_access_params(CodexSession(AUTH_FILE.parent).access()),
+                }
+            )
             _require_model(client, model)
             profiles = client.request(
                 "permissionProfile/list",

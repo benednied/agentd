@@ -37,6 +37,11 @@ from agentd.domain.models import (
     WorkerNode,
     utc_now,
 )
+from agentd.harness.codex_auth import (
+    REAUTHORIZATION_ACTION,
+    REAUTHORIZATION_REQUIRED,
+    CodexReauthorizationRequired,
+)
 from agentd.harness.registry import DriverRegistry
 from agentd.intake.github import GitHubIssueSource
 from agentd.intake.models import IntakePolicy, SourceIssue
@@ -176,13 +181,29 @@ class AdministrativeOracle:
             self.command,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
             timeout=45,
         )
+        if result.returncode == 2:
+            with suppress(ValueError):
+                report = json.loads(result.stdout)
+                if (
+                    isinstance(report, dict)
+                    and report.get("pool_id") == self.pool_id
+                    and report.get("auth_status") == REAUTHORIZATION_REQUIRED
+                    and isinstance(report.get("reason"), str)
+                ):
+                    error = CodexReauthorizationRequired(report["reason"])
+                    with RuntimeHealthStore(self.store.path) as health_store:
+                        health_store.pulse("provider_auth", state=error.reason)
+                    raise error
+        result.check_returncode()
         snapshot = ProviderQuotaSnapshot.from_dict(json.loads(result.stdout))
         if snapshot.pool_id != self.pool_id:
             raise ValueError("quota observation belongs to a different account pool")
         self.store.append_provider_quota_snapshot(snapshot)
+        with RuntimeHealthStore(self.store.path) as health_store:
+            health_store.pulse("provider_auth", state="authorized")
         return snapshot
 
 
@@ -841,6 +862,7 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         controller_pulse = pulse_store.latest("controller")
         publisher_pulse = pulse_store.latest("publisher")
         source_pulse = pulse_store.latest("source")
+        auth_pulse = pulse_store.latest("provider_auth")
     profile = RepositoryProfile.from_dict(config["profile"])
     liveness = {
         "controller": runtime_liveness(
@@ -866,6 +888,17 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
     snapshot = store.latest_provider_quota_snapshot(config["account_pool"])
     policy = coding_provider_policies(config)[0]
     provider_reason = unattended_provider_wait_reason(snapshot, policy=policy)
+    auth_status: dict[str, str] = {"state": "unknown"}
+    if auth_pulse is not None:
+        if auth_pulse.state == "authorized":
+            auth_status = {"state": "authorized"}
+        else:
+            auth_status = {
+                "state": REAUTHORIZATION_REQUIRED,
+                "reason": CodexReauthorizationRequired(auth_pulse.state).reason,
+                "action": REAUTHORIZATION_ACTION,
+            }
+        auth_status["observed_at"] = auth_pulse.observed_at.isoformat()
     workers = [
         {
             "node_id": node.id,
@@ -903,6 +936,7 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         and all(w["fresh"] for w in workers)
         and source_fresh
         and provider_reason is None
+        and auth_status["state"] != REAUTHORIZATION_REQUIRED
     )
     return {
         "controller_live": controller_live,
@@ -916,6 +950,7 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         "admission_telemetry_ready": ready,
         "workers": workers,
         "provider_wait_reason": provider_reason,
+        "provider_auth": auth_status,
         "source_fresh": source_fresh,
         "backlog": backlog_status,
     }

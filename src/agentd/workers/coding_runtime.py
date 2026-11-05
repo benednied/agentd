@@ -518,6 +518,7 @@ async def create_verified_coding_sdk(
         client_factory=lambda execution: OpenAICodexClient(
             environment=runtime_environment,
             isolated_environment=True,
+            auth_home=Path(runtime_environment["CODEX_HOME"]),
         ),
         model=model,
     )

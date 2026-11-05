@@ -467,8 +467,9 @@ def test_provisioning_and_release_scripts_are_syntax_checked_and_local_only() ->
     assert "require_command sqlite3" not in combined
     assert '"$AGENTD_DB-wal"' in combined
     assert '"$AGENTD_DB-shm"' in combined
-    assert "AGENTD_AUTH_SOURCE" in combined
-    assert '"$AGENTD_AUTH_SOURCE" "$auth_tmp"' in combined
+    assert "AGENTD_AUTH_SOURCE" not in combined
+    assert '"$auth" "$target"' not in combined
+    assert "codex-reauthorize --device-auth" in combined
     assert "-m 0600" in combined and "-m 0700" in combined
     assert "systemctl --user" in combined
     assert '"$staging/deploy/scripts/check-container-security.sh"' in combined
