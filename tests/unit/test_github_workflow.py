@@ -8,6 +8,7 @@ import pytest
 from agentd.domain.enums import JobState, QoSClass
 from agentd.domain.models import EffortEstimate, Job, QuotaBudget
 from agentd.domain.transitions import transition_job
+from agentd.intake.github_rest import GitHubRateLimited
 from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.intake.service import GitHubIntake
 from agentd.intake.workflow import (
@@ -132,6 +133,46 @@ def compose(store, source, **workflow_options):
     )
     intake.workflow = workflow
     return intake, workflow
+
+
+def test_control_poll_resumes_from_durable_cursor_after_throttling(tmp_path):
+    path = tmp_path / "controller.sqlite"
+    source = Source(source_issue())
+    source.controls = [
+        replace(source_comment("/agentd pause"), updated_at="2026-10-03T10:15:00Z")
+    ]
+    with SQLiteStateStore(path) as store:
+        intake, _ = compose(store, source)
+        asyncio.run(intake.poll())
+        stream = "42:comment"
+        assert store.github_control_cursor(stream, "") == "2026-10-03T10:15:00Z"
+
+    original = source.comments
+
+    def rate_limited(*args, **kwargs):
+        raise GitHubRateLimited("primary", 100)
+
+    source.comments = rate_limited
+    with SQLiteStateStore(path) as store:
+        intake, _ = compose(store, source)
+        with pytest.raises(GitHubRateLimited):
+            asyncio.run(intake.poll())
+        assert store.github_control_cursor(stream, "") == "2026-10-03T10:15:00Z"
+
+    source.comments = original
+    source.controls = [
+        replace(
+            source_comment("/agentd cancel", identity=2),
+            updated_at="2026-10-03T10:14:00Z",
+        )
+    ]
+    with SQLiteStateStore(path) as store:
+        intake, _ = compose(store, source)
+        asyncio.run(intake.poll())
+        assert source.scans[-2] == ("2026-10-03T10:10:00+00:00", "comment")
+        assert store.github_control_cursor(stream, "") == "2026-10-03T10:15:00Z"
+        assert store.github_control("github:42:comment:2")["state"] == "applied"
+        assert store.get_job(source.issue.job_id).state is JobState.CANCELLED
 
 
 def test_repository_switch_preserves_history_and_scopes_pr_numbers_and_controls(

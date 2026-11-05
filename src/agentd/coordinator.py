@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -129,6 +130,7 @@ class SchedulerCoordinator:
         usage_policy: JobUsagePolicy = DEFAULT_JOB_USAGE_POLICY,
         provider_stop_policy: ProviderStopPolicy = DEFAULT_PROVIDER_STOP_POLICY,
         hard_cap_grace: timedelta = timedelta(seconds=120),
+        admission_check: Callable[[Job], Awaitable[None]] | None = None,
     ) -> None:
         if hard_cap_grace <= timedelta(0):
             raise ValueError("Hard-cap grace must be positive")
@@ -146,6 +148,7 @@ class SchedulerCoordinator:
         self._usage_policy = usage_policy
         self._provider_stop_policy = provider_stop_policy
         self._hard_cap_grace = hard_cap_grace
+        self._admission_check = admission_check
 
     def quota_wait_reason(self, job_id: str) -> str | None:
         """Read an unattended admission reason without dispatch side effects."""
@@ -196,6 +199,8 @@ class SchedulerCoordinator:
                 ):
                     continue
                 try:
+                    if self._admission_check is not None:
+                        await self._admission_check(job)
                     return await self._dispatch(
                         job,
                         placement,

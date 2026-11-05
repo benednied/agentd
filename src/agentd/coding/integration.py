@@ -18,6 +18,7 @@ from typing import Any
 from agentd.coding.models import exact_commit
 from agentd.domain.enums import JobState, RunOutcome, RunState
 from agentd.domain.transitions import transition_job
+from agentd.intake.github_rest import GitHubRateLimited, GitHubREST
 from agentd.intake.models import SourceIssue
 from agentd.intake.workflow import StandingGitHubPolicy, _instant, parse_control
 from agentd.state.sqlite import SQLiteStateStore
@@ -43,37 +44,32 @@ def integration_status(store: SQLiteStateStore, job_id: str) -> dict[str, Any] |
 
 
 class GitHubIntegrationAdapter:
-    def _api(
-        self,
-        endpoint: str,
-        *,
-        method: str = "GET",
-        payload: dict[str, Any] | None = None,
-    ) -> Any:
-        arguments = ["gh", "api", "--method", method, endpoint]
-        if payload is not None:
-            arguments.extend(("--input", "-"))
-        result = subprocess.run(
-            arguments,
-            input=json.dumps(payload) if payload is not None else None,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        return json.loads(result.stdout)
+    def __init__(self, rest: GitHubREST | None = None) -> None:
+        self.rest = rest or GitHubREST()
 
     def repository(self, repository: str) -> dict[str, Any]:
-        return self._api(f"repos/{repository}")
+        return self.rest.request(
+            "integration_repository", f"repos/{repository}", conditional=True
+        )
 
-    def pull_request(self, repository: str, number: int) -> dict[str, Any]:
-        return self._api(f"repos/{repository}/pulls/{number}")
+    def pull_request(
+        self, repository: str, number: int, *, conditional: bool = False
+    ) -> dict[str, Any]:
+        return self.rest.request(
+            "integration_pull",
+            f"repos/{repository}/pulls/{number}",
+            conditional=conditional,
+        )
 
-    def reviews(self, repository: str, number: int) -> tuple[dict[str, Any], ...]:
+    def reviews(
+        self, repository: str, number: int, *, conditional: bool = False
+    ) -> tuple[dict[str, Any], ...]:
         result = []
         for page in range(1, 101):
-            items = self._api(
-                f"repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}"
+            items = self.rest.request(
+                "integration_reviews",
+                f"repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}",
+                conditional=conditional,
             )
             result.extend(items)
             if len(items) < 100:
@@ -83,9 +79,10 @@ class GitHubIntegrationAdapter:
     def check_runs(self, repository: str, commit: str) -> tuple[dict[str, Any], ...]:
         result = []
         for page in range(1, 101):
-            data = self._api(
+            data = self.rest.request(
+                "integration_checks",
                 f"repos/{repository}/commits/{commit}/check-runs"
-                f"?filter=latest&per_page=100&page={page}"
+                f"?filter=latest&per_page=100&page={page}",
             )
             result.extend(data["check_runs"])
             if len(result) >= int(data["total_count"]):
@@ -100,18 +97,26 @@ class GitHubIntegrationAdapter:
             pullRequest { id isDraft }
           }
         }"""
-        data = self._api(
-            "graphql",
-            method="POST",
-            payload={"query": query, "variables": {"id": node_id}},
+        # GraphQL uses its own primary rate budget. Integration still checks
+        # the REST budget before making a change that must be read back.
+        self.rest.check_budget()
+        result = subprocess.run(
+            ["gh", "api", "graphql", "--input", "-"],
+            input=json.dumps({"query": query, "variables": {"id": node_id}}),
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=True,
         )
+        data = json.loads(result.stdout)
         if data.get("errors"):
             raise IntegrationBlocked("GitHub did not make the approved PR ready")
 
     def merge(
         self, repository: str, number: int, *, commit: str, method: str
     ) -> dict[str, Any]:
-        return self._api(
+        return self.rest.request(
+            "integration_merge",
             f"repos/{repository}/pulls/{number}/merge",
             method="PUT",
             payload={"sha": commit, "merge_method": method},
@@ -440,6 +445,7 @@ class GitHubIntegrationReconciler:
         if not self.config.get("integration", {}).get("enabled", False):
             return ()
         reports = []
+        repository_verified = False
         for job in self.store.list_jobs():
             publication = self.ledger.get(job.id)
             if publication is None or publication["stage"] != "published":
@@ -450,7 +456,16 @@ class GitHubIntegrationReconciler:
             if old and old["stage"] == "merged":
                 continue
             try:
+                if not repository_verified:
+                    repo = await asyncio.to_thread(
+                        self.adapter.repository, self.repository
+                    )
+                    if repo["id"] != self.repository_id:
+                        raise IntegrationBlocked("GitHub repository identity changed")
+                    repository_verified = True
                 reports.append(await asyncio.to_thread(self._reconcile, job.id))
+            except GitHubRateLimited:
+                break
             except Exception as error:
                 reason = (
                     str(error)
@@ -471,15 +486,15 @@ class GitHubIntegrationReconciler:
                         "integration_wait_reason": reason,
                     }
                 )
+                if not repository_verified:
+                    break
         return tuple(reports)
 
     def _reconcile(self, job_id: str) -> dict[str, Any]:
         publication = self.ledger.get(job_id)
         assert publication is not None
         number = self._number(publication)
-        if self.adapter.repository(self.repository)["id"] != self.repository_id:
-            raise IntegrationBlocked("GitHub repository identity changed")
-        pr = self.adapter.pull_request(self.repository, number)
+        pr = self.adapter.pull_request(self.repository, number, conditional=True)
         self._verify_pr(pr, publication)
         if pr.get("merged"):
             # Merging can close the issue before a lost-response reconciliation.
@@ -510,7 +525,7 @@ class GitHubIntegrationReconciler:
             raise IntegrationBlocked("delivered PR was closed without integration")
         self._hold_and_feedback(job_id, issue.number, number)
         if not self._approved(
-            publication, self.adapter.reviews(self.repository, number)
+            publication, self.adapter.reviews(self.repository, number, conditional=True)
         ):
             raise IntegrationBlocked(
                 "waiting for trusted human approval of the delivered head"
@@ -523,12 +538,20 @@ class GitHubIntegrationReconciler:
         if refreshed["intent"] != publication["intent"] or current_run != run:
             raise IntegrationBlocked("candidate changed during integration checks")
         self._hold_and_feedback(job_id, current_issue.number, number)
-        if pr.get("draft"):
-            self.adapter.ready(pr["node_id"])
         pr = self.adapter.pull_request(self.repository, number)
         self._verify_pr(pr, publication)
         if pr.get("merged"):
             return self._complete(publication, current_job, pr)
+        if pr["state"] != "open" or not self._approved(
+            publication, self.adapter.reviews(self.repository, number)
+        ):
+            raise IntegrationBlocked("live PR approval changed before integration")
+        if pr.get("draft"):
+            self.adapter.ready(pr["node_id"])
+            pr = self.adapter.pull_request(self.repository, number)
+            self._verify_pr(pr, publication)
+            if pr.get("merged"):
+                return self._complete(publication, current_job, pr)
         if pr["state"] != "open" or pr.get("draft") or pr.get("mergeable") is not True:
             raise IntegrationBlocked("approved PR is not ready and mergeable")
         self._record(publication, "merge_pending")

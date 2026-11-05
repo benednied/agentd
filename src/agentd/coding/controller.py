@@ -21,7 +21,11 @@ from agentd.coding.attempts import (
 )
 from agentd.coding.compiler import CodingJobCompiler
 from agentd.coding.descriptor import RemoteCodingDescriptor
-from agentd.coding.integration import GitHubIntegrationReconciler, integration_status
+from agentd.coding.integration import (
+    GitHubIntegrationAdapter,
+    GitHubIntegrationReconciler,
+    integration_status,
+)
 from agentd.coding.models import RepositoryProfile
 from agentd.coding.pipeline import CodingPublicationReconciler, CodingRepairReconciler
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
@@ -30,6 +34,7 @@ from agentd.domain.enums import JobState, QuotaUnit, RunState
 from agentd.domain.models import (
     CodingOperation,
     EffortEstimate,
+    Job,
     ProviderQuotaSnapshot,
     QuotaBudget,
     QuotaPool,
@@ -44,6 +49,7 @@ from agentd.harness.codex_auth import (
 )
 from agentd.harness.registry import DriverRegistry
 from agentd.intake.github import GitHubIssueSource
+from agentd.intake.github_rest import GitHubRateLimited, GitHubREST
 from agentd.intake.models import IntakePolicy, SourceIssue
 from agentd.intake.service import GitHubIntake
 from agentd.intake.workflow import (
@@ -207,7 +213,15 @@ class AdministrativeOracle:
         return snapshot
 
 
-def create_intake(config: dict[str, Any], store: SQLiteStateStore) -> GitHubIntake:
+def _github_rest(config: dict[str, Any], component: str) -> GitHubREST:
+    return GitHubREST(
+        database=Path(config["database"] + ".github-rest"), component=component
+    )
+
+
+def create_intake(
+    config: dict[str, Any], store: SQLiteStateStore, *, rest: GitHubREST | None = None
+) -> GitHubIntake:
     profile = RepositoryProfile.from_dict(config["profile"])
     if not profile.validation_commands:
         raise ValueError("coding requires at least one trusted validation command")
@@ -230,9 +244,9 @@ def create_intake(config: dict[str, Any], store: SQLiteStateStore) -> GitHubInta
     )
     return GitHubIntake(
         store,
-        GitHubWorkflowSource()
+        GitHubWorkflowSource(rest)
         if config.get("standing_github_policy")
-        else GitHubIssueSource(),
+        else GitHubIssueSource(rest),
         (
             IntakePolicy(
                 profile.repository,
@@ -268,15 +282,22 @@ class CodingController:
             self.owner.release()
 
 
-def create_backlog(config: dict[str, Any], intake: GitHubIntake) -> Any:
+def create_backlog(
+    config: dict[str, Any], intake: GitHubIntake, *, rest: GitHubREST | None = None
+) -> Any:
     from agentd.intake.backlog import GitHubAPITransport, GitHubBacklogSource
     from agentd.intake.backlog_service import BacklogReconciler
     from agentd.intake.integration import GitHubIntegrationSource
 
+    def get(endpoint: str) -> Any:
+        assert rest is not None
+        return rest.request("backlog", endpoint)
+
+    getter = get if rest is not None else None
     return BacklogReconciler(
         intake,
-        GitHubBacklogSource(GitHubAPITransport()),
-        GitHubIntegrationSource(),
+        GitHubBacklogSource(GitHubAPITransport(getter)),
+        GitHubIntegrationSource(getter),
         config,
     )
 
@@ -335,11 +356,14 @@ async def serve_publisher(config: dict[str, Any]) -> None:
     owner = ControllerLock(Path(config["database"] + ".publisher").resolve())
     with owner, SQLiteStateStore(config["database"]) as store:
         attempt_limits = coding_attempt_limits(config)
-        intake = create_intake(config, store)
-        backlog = create_backlog(config, intake) if config.get("backlog") else None
+        rest = _github_rest(config, "publisher")
+        intake = create_intake(config, store, rest=rest)
+        backlog = (
+            create_backlog(config, intake, rest=rest) if config.get("backlog") else None
+        )
         publications = create_publications(config, store, intake, backlog)
         reporter = GitHubStatusReporter(
-            store, GitHubStatusAdapter(), repository=config["profile"]["repository"]
+            store, GitHubStatusAdapter(rest), repository=config["profile"]["repository"]
         )
         integrations = (
             GitHubIntegrationReconciler(
@@ -347,6 +371,7 @@ async def serve_publisher(config: dict[str, Any]) -> None:
                 publications,
                 config,
                 source_refresh=(backlog or intake).refresh_authorization,
+                adapter=GitHubIntegrationAdapter(rest),
             )
             if config.get("integration", {}).get("enabled")
             else None
@@ -358,29 +383,35 @@ async def serve_publisher(config: dict[str, Any]) -> None:
         try:
             while not stop.is_set():
                 runtime_health.pulse("publisher", state="validating")
-                for result in await publications.reconcile():
-                    key = str(result.get("job_id") or result.get("url"))
-                    payload = json.dumps(result, sort_keys=True)
-                    if store.changed_report("publication:" + key, result):
-                        print(payload, flush=True)
-                if (
-                    integrations is not None
-                    and time.monotonic() - last_integration_poll
-                    >= config.get("integration_poll_seconds", 60)
-                ):
-                    for result in await integrations.reconcile():
-                        print(json.dumps(result, sort_keys=True), flush=True)
-                    last_integration_poll = time.monotonic()
-                if config.get("standing_github_policy"):
-                    reporter.enqueue(
-                        status(
-                            store,
-                            repository=config["profile"]["repository"],
-                            attempt_limits=attempt_limits,
-                            account_policy=coding_provider_policies(config)[0],
+                try:
+                    rest.check_budget()
+                    for result in await publications.reconcile():
+                        key = str(result.get("job_id") or result.get("url"))
+                        payload = json.dumps(result, sort_keys=True)
+                        if store.changed_report("publication:" + key, result):
+                            print(payload, flush=True)
+                    rest.check_budget()
+                    if (
+                        integrations is not None
+                        and time.monotonic() - last_integration_poll
+                        >= config.get("integration_poll_seconds", 60)
+                    ):
+                        for result in await integrations.reconcile():
+                            print(json.dumps(result, sort_keys=True), flush=True)
+                        last_integration_poll = time.monotonic()
+                    if config.get("standing_github_policy"):
+                        rest.check_budget()
+                        reporter.enqueue(
+                            status(
+                                store,
+                                repository=config["profile"]["repository"],
+                                attempt_limits=attempt_limits,
+                                account_policy=coding_provider_policies(config)[0],
+                            )
                         )
-                    )
-                    await reporter.publish_pending()
+                        await reporter.publish_pending()
+                except GitHubRateLimited:
+                    pass
                 runtime_health.pulse("publisher")
                 with suppress(TimeoutError):
                     await asyncio.wait_for(
@@ -413,8 +444,32 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         raise
     runtime_health = None
     try:
-        intake = create_intake(config, store)
-        backlog = create_backlog(config, intake) if config.get("backlog") else None
+        rest = _github_rest(config, "controller")
+        intake = create_intake(config, store, rest=rest)
+        backlog = (
+            create_backlog(config, intake, rest=rest) if config.get("backlog") else None
+        )
+
+        async def verify_admission(job: Job) -> None:
+            source = store.github_source_for_job(job.id)
+            if source is None or not isinstance(job.operation, CodingOperation):
+                raise LifecycleError("GitHub job lacks a source-bound work order")
+            await asyncio.to_thread(
+                (backlog or intake).refresh_authorization,
+                SourceIssue.from_dict(json.loads(source["payload"])),
+            )
+            current = store.github_source_for_job(job.id)
+            if (
+                store.get_job(job.id) != job
+                or store.github_job_held(job.id)
+                or current is None
+                or current["revoked"]
+                or not current["eligible"]
+                or current["approved_revision"] != current["revision"]
+                or current["revision"] != job.operation.work_order.source_revision
+            ):
+                raise LifecycleError("GitHub job changed before admission")
+
         backend = RemoteWorkerBackend(
             client,
             name=endpoint.name,
@@ -441,6 +496,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             backends=BackendRegistry([backend]),
             account_policy=coding_provider_policies(config)[0],
             provider_stop_policy=coding_provider_policies(config)[1],
+            admission_check=verify_admission,
             usage_policy=JobUsagePolicy(
                 top_up_at_fraction=config.get("top_up_at_fraction", 0.8),
                 checkpoint_at_fraction=config.get("checkpoint_at_fraction", 0.9),
@@ -471,7 +527,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
         publications = create_publications(config, store, intake, backlog)
         runtime_health = RuntimeHealthStore(config["database"])
         reporter = GitHubStatusReporter(
-            store, GitHubStatusAdapter(), repository=profile.repository
+            store, GitHubStatusAdapter(rest), repository=profile.repository
         )
         repairs = CodingRepairReconciler(
             store,
@@ -487,6 +543,7 @@ def create_controller(config: dict[str, Any]) -> CodingController:
                 publications,
                 config,
                 source_refresh=(backlog or intake).refresh_authorization,
+                adapter=GitHubIntegrationAdapter(rest),
             )
             if config.get("integration", {}).get("enabled")
             else None
@@ -626,11 +683,16 @@ def create_controller(config: dict[str, Any]) -> CodingController:
             )
 
         async def refresh_sources() -> None:
+            rest.check_budget()
             if config.get("refresh_base_from_github") and backlog is None:
                 from agentd.intake.integration import GitHubIntegrationSource
 
                 base = await asyncio.to_thread(
-                    GitHubIntegrationSource().target_commit,
+                    GitHubIntegrationSource(
+                        lambda endpoint: rest.request(
+                            "source_base", endpoint, conditional=True
+                        )
+                    ).target_commit,
                     profile.repository,
                     config["base_branch"],
                 )
@@ -913,6 +975,9 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         if node.id == config["worker"]["node_id"]
     ]
     backlog_status = None
+    github_rest = GitHubREST.diagnostics(
+        Path(config["database"] + ".github-rest"), now=now.timestamp()
+    )
     source_fresh = not config.get("backlog")
     if config.get("standing_github_policy"):
         source_fresh = bool(
@@ -935,6 +1000,7 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         and workers
         and all(w["fresh"] for w in workers)
         and source_fresh
+        and not github_rest.get("backoff")
         and provider_reason is None
         and auth_status["state"] != REAUTHORIZATION_REQUIRED
     )
@@ -952,5 +1018,9 @@ def health(config: dict[str, Any], store: SQLiteStateStore) -> dict[str, Any]:
         "provider_wait_reason": provider_reason,
         "provider_auth": auth_status,
         "source_fresh": source_fresh,
+        "source_observed_at": source_pulse.observed_at.isoformat()
+        if source_pulse
+        else None,
+        "github_rest": github_rest,
         "backlog": backlog_status,
     }

@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 from typing import Any
 
 from agentd.coding.models import repository_name
+from agentd.intake.github_rest import GitHubREST
 from agentd.intake.models import SourceIssue
 
 
 class GitHubIssueSource:
+    def __init__(self, rest: GitHubREST | None = None) -> None:
+        self.rest = rest or GitHubREST()
+
     def _get(self, endpoint: str) -> Any:
-        completed = subprocess.run(
-            ["gh", "api", "--method", "GET", endpoint],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return json.loads(completed.stdout)
+        return self.rest.request("source_authority", endpoint)
 
     def get(self, repository: str, number: int) -> SourceIssue:
         repository = repository_name(repository)
@@ -32,20 +27,48 @@ class GitHubIssueSource:
             self._get(f"repos/{repository}/issues/{number}"),
         )
 
-    def poll(self, repository: str, *, max_pages: int = 10) -> tuple[SourceIssue, ...]:
+    def poll(
+        self,
+        repository: str,
+        *,
+        max_pages: int = 10,
+        tracked: tuple[SourceIssue, ...] = (),
+    ) -> tuple[SourceIssue, ...]:
         repository = repository_name(repository)
-        repo = self._get(f"repos/{repository}")
+        repository_id = int(
+            self.rest.request(
+                "source_repository", f"repos/{repository}", conditional=True
+            )["id"]
+        )
         result = []
         for page in range(1, max_pages + 1):
-            items = self._get(
-                f"repos/{repository}/issues?state=all&per_page=100&page={page}"
+            items = self.rest.request(
+                "source_issues",
+                f"repos/{repository}/issues?state=all&per_page=100&page={page}",
+                conditional=True,
             )
             result.extend(
-                self._decode(repository, int(repo["id"]), item) for item in items
+                self._decode(repository, repository_id, item) for item in items
             )
             if len(items) < 100:
-                return tuple(result)
-        # Never infer cancellation from absence in a bounded/incomplete poll.
+                break
+        else:
+            raise ValueError("GitHub issue pagination is incomplete")
+        # Moving pages can miss a tracked issue. Reconcile it directly using
+        # this sweep's verified repository identity, never absence alone.
+        seen = {issue.key for issue in result}
+        for previous in tracked:
+            if previous.key in seen:
+                continue
+            item = self.rest.request(
+                "source_tracked_issue",
+                f"repos/{repository}/issues/{previous.number}",
+                conditional=True,
+            )
+            issue = self._decode(repository, repository_id, item)
+            if issue.key != previous.key:
+                raise ValueError("Tracked GitHub issue identity changed")
+            result.append(issue)
         return tuple(result)
 
     @staticmethod

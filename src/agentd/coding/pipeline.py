@@ -14,6 +14,7 @@ from agentd.coding.models import RepositoryProfile
 from agentd.coordinator import LifecycleError, SchedulerCoordinator
 from agentd.domain.enums import JobState, RunOutcome, RunState
 from agentd.domain.models import CodingOperation, Job, RunRecord
+from agentd.intake.github_rest import GitHubRateLimited
 from agentd.intake.models import SourceIssue
 from agentd.publication import (
     CollectedCodingResult,
@@ -74,6 +75,8 @@ class CodingPublicationReconciler:
                 continue
             try:
                 results.append(await asyncio.to_thread(self.publish_job, job.id))
+            except GitHubRateLimited:
+                break
             except Exception as error:
                 preflight = (
                     self.publisher.store.preflight_for(job.id, latest.id)
@@ -97,6 +100,8 @@ class CodingPublicationReconciler:
         run = self.store.latest_run(job_id)
         try:
             result = self._publish_job(self.store.get_job(job_id), run)
+        except GitHubRateLimited:
+            raise
         except Exception as error:
             if run is not None:
                 self.publisher.store.record_preflight_error(job_id, run.id, error)

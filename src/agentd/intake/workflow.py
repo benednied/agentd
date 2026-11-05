@@ -20,6 +20,7 @@ from agentd.coding.models import fingerprint, repository_name
 from agentd.domain.enums import JobState
 from agentd.domain.models import CodingOperation, RunCommand
 from agentd.intake.github import GitHubIssueSource
+from agentd.intake.github_rest import GitHubRateLimited, GitHubREST
 from agentd.intake.models import SourceIssue
 
 if TYPE_CHECKING:
@@ -188,9 +189,11 @@ class GitHubWorkflowSource(GitHubIssueSource):
         endpoint = "issues/comments" if kind == "comment" else "pulls/comments"
         result = []
         for page in range(1, 101):
-            items = self._get(
+            items = self.rest.request(
+                "source_comments" if kind == "comment" else "source_review_comments",
                 f"repos/{repository}/{endpoint}?"
-                + urlencode({"since": since, "per_page": 100, "page": page})
+                + urlencode({"since": since, "per_page": 100, "page": page}),
+                conditional=True,
             )
             for item in items:
                 subject = item.get("issue_url") or item.get("pull_request_url")
@@ -246,8 +249,10 @@ class GitHubWorkflowSource(GitHubIssueSource):
     def reviews(self, repository: str, number: int) -> tuple[GitHubComment, ...]:
         result = []
         for page in range(1, 101):
-            values = self._get(
-                f"repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}"
+            values = self.rest.request(
+                "source_reviews",
+                f"repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}",
+                conditional=True,
             )
             for item in values:
                 body = item.get("body") or ""
@@ -401,8 +406,15 @@ class GitHubWorkflow:
         for kind in ("comment", "review-comment"):
             stream = f"{self.policy.repository_id}:{kind}"
             cursor = store.github_control_cursor(stream, self.policy.activated_at)
+            # Replay a bounded overlap to cover events arriving while pages move.
+            # Durable event IDs make the replay safe after an interrupted sweep.
             since = (
-                (_instant(cursor) - timedelta(seconds=1)).astimezone(UTC).isoformat()
+                max(
+                    _instant(self.policy.activated_at) - timedelta(seconds=1),
+                    _instant(cursor) - timedelta(minutes=5),
+                )
+                .astimezone(UTC)
+                .isoformat()
             )
             comments = await asyncio.to_thread(
                 self.source.comments,
@@ -430,7 +442,10 @@ class GitHubWorkflow:
                 )
             if comments:
                 store.advance_github_control_cursor(
-                    stream, max((item.updated_at for item in comments), key=_instant)
+                    stream,
+                    max(
+                        (cursor, *(item.updated_at for item in comments)), key=_instant
+                    ),
                 )
         for number in self.published_subjects():
             reviews = await asyncio.to_thread(
@@ -596,6 +611,8 @@ class GitHubWorkflow:
                 )
                 if job_id:
                     store.resolve_github_control_blocks(job_id, event["event_id"])
+            except GitHubRateLimited:
+                raise
             except (LookupError, ValueError, RuntimeError) as error:
                 store.finish_github_control(
                     event["event_id"], job_id=job_id, state="blocked", reason=str(error)
@@ -665,18 +682,14 @@ class GitHubStatusRejected(RuntimeError):
 class GitHubStatusAdapter(GitHubIssueSource):
     """Publisher-owned write adapter, separate from intake credentials."""
 
-    def __init__(self) -> None:
+    def __init__(self, rest: GitHubREST | None = None) -> None:
+        super().__init__(rest)
         self._publisher_id: int | None = None
 
     def _write(self, method: str, endpoint: str, body: str) -> dict[str, Any]:
         try:
-            completed = subprocess.run(
-                ["gh", "api", "--method", method, endpoint, "--input", "-"],
-                input=json.dumps({"body": body}),
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            return self.rest.request(
+                "status_write", endpoint, method=method, payload={"body": body}
             )
         except subprocess.CalledProcessError as error:
             rejected = re.search(
@@ -687,21 +700,24 @@ class GitHubStatusAdapter(GitHubIssueSource):
                     f"GitHub rejected status write (HTTP {rejected[1]})"
                 ) from error
             raise
-        return json.loads(completed.stdout)
 
     def verify_repository(self, repository: str, repository_id: int) -> None:
-        if int(self._get(f"repos/{repository}")["id"]) != repository_id:
+        if (
+            int(self.rest.request("status_repository", f"repos/{repository}")["id"])
+            != repository_id
+        ):
             raise ValueError("GitHub status repository identity changed")
 
     def find_status(
         self, repository: str, number: int, marker: str
     ) -> dict[str, Any] | None:
         if self._publisher_id is None:
-            self._publisher_id = int(self._get("user")["id"])
+            self._publisher_id = int(self.rest.request("status_account", "user")["id"])
         found = []
         for page in range(1, 101):
-            values = self._get(
-                f"repos/{repository}/issues/{number}/comments?per_page=100&page={page}"
+            values = self.rest.request(
+                "status_comments",
+                f"repos/{repository}/issues/{number}/comments?per_page=100&page={page}",
             )
             found.extend(
                 value
@@ -845,12 +861,19 @@ class GitHubStatusReporter:
 
     async def publish_pending(self) -> tuple[dict[str, Any], ...]:
         results = []
+        verified: set[tuple[str, int]] = set()
         for report in self.store.pending_github_status():
             if self.repository is not None and report["repository"] != self.repository:
                 continue
             try:
+                identity = (report["repository"], report["repository_id"])
+                if identity not in verified:
+                    await asyncio.to_thread(self.adapter.verify_repository, *identity)
+                    verified.add(identity)
                 result = await asyncio.to_thread(self._publish, report)
                 results.append(result)
+            except GitHubRateLimited:
+                break
             except Exception as error:
                 results.append(
                     {
@@ -861,7 +884,6 @@ class GitHubStatusReporter:
         return tuple(results)
 
     def _publish(self, report: dict[str, Any]) -> dict[str, Any]:
-        self.adapter.verify_repository(report["repository"], report["repository_id"])
         marker = f"<!-- agentd-status:{fingerprint(report['report_key'])} -->"
         existing = self.adapter.find_status(
             report["repository"], report["issue_number"], marker
@@ -879,7 +901,7 @@ class GitHubStatusReporter:
                 existing = self.adapter.create(
                     report["repository"], report["issue_number"], report["body"]
                 )
-            except GitHubStatusRejected:
+            except (GitHubStatusRejected, GitHubRateLimited):
                 self.store.retry_rejected_github_status(report["report_key"])
                 raise
         elif existing["body"] != report["body"]:

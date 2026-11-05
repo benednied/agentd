@@ -9,10 +9,11 @@ from pathlib import Path
 import pytest
 
 from agentd.cli import main
-from agentd.coding.controller import create_controller, load_config, status
+from agentd.coding.controller import create_controller, health, load_config, status
 from agentd.coding.models import RepositoryProfile
 from agentd.domain.enums import QuotaUnit
 from agentd.domain.models import ProviderQuotaSnapshot, QuotaPool
+from agentd.intake.github_rest import GitHubRateLimited
 from agentd.intake.models import SourceIssue
 from agentd.state.sqlite import SQLiteStateStore
 
@@ -44,7 +45,9 @@ def controller_config(tmp_path, monkeypatch):
             return (self.current,)
 
     source = Source()
-    monkeypatch.setattr("agentd.coding.controller.GitHubIssueSource", lambda: source)
+    monkeypatch.setattr(
+        "agentd.coding.controller.GitHubIssueSource", lambda _rest: source
+    )
     profile = RepositoryProfile(
         "repo",
         "1",
@@ -335,6 +338,30 @@ def test_publication_refresh_rejects_changed_authority(controller_config, change
             intake.refresh_authorization(approved)
 
 
+def test_incomplete_source_poll_does_not_refresh_health(controller_config):
+    path, source = controller_config
+
+    async def scenario():
+        config = load_config(path)
+        runtime = create_controller(config)
+        try:
+            await runtime.daemon.tick()
+            observed = health(config, runtime.store)["source_observed_at"]
+            assert observed is not None
+
+            def rate_limited(repository):
+                raise GitHubRateLimited("secondary", 100)
+
+            source.poll = rate_limited
+            await runtime.daemon.tick()
+            assert runtime.daemon.source_refresh_failed
+            assert health(config, runtime.store)["source_observed_at"] == observed
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_standing_owner_policy_wires_automatic_intake_without_a_label_or_cli(
     controller_config, monkeypatch
 ):
@@ -350,7 +377,9 @@ def test_standing_owner_policy_wires_automatic_intake_without_a_label_or_cli(
     source.issue_authority = lambda issue: (issue, (("owner", 123), ("owner", 123)))
     source.comments = lambda *_args, **_kwargs: ()
     source.reviews = lambda *_args, **_kwargs: ()
-    monkeypatch.setattr("agentd.coding.controller.GitHubWorkflowSource", lambda: source)
+    monkeypatch.setattr(
+        "agentd.coding.controller.GitHubWorkflowSource", lambda _rest: source
+    )
     config = load_config(path)
     config.update(
         {

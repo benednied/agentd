@@ -57,11 +57,11 @@ class GitHub:
         assert repository == "owner/repo"
         return {"id": self.repository_id}
 
-    def pull_request(self, repository, number):
+    def pull_request(self, repository, number, *, conditional=False):
         assert (repository, number) == ("owner/repo", 8)
         return self.pr
 
-    def reviews(self, repository, number):
+    def reviews(self, repository, number, *, conditional=False):
         return tuple(self.review_data)
 
     def check_runs(self, repository, commit):
@@ -241,6 +241,27 @@ def test_comment_approval_is_db_only_and_publisher_integrates_one_exact_checked_
 def test_no_merge_without_human_approval_even_when_model_and_checks_say_success(rig):
     report = asyncio.run(rig.integration.reconcile())[0]
     assert "human approval" in report["integration_wait_reason"]
+    assert rig.adapter.merges == rig.adapter.readies == 0
+
+
+def test_merge_checks_live_reviews_after_a_conditional_approval(rig):
+    def reviews(repository, number, *, conditional=False):
+        return (
+            {
+                "id": 1,
+                "user": {"login": "owner", "id": 123},
+                "state": "APPROVED" if conditional else "DISMISSED",
+                "commit_id": HEAD,
+                "submitted_at": rig.when,
+            },
+        )
+
+    rig.adapter.reviews = reviews
+    report = asyncio.run(rig.integration.reconcile())[0]
+    assert (
+        report["integration_wait_reason"]
+        == "live PR approval changed before integration"
+    )
     assert rig.adapter.merges == rig.adapter.readies == 0
 
 
