@@ -9,6 +9,9 @@ import os
 import platform
 import signal
 import stat
+import subprocess
+import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -49,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default=str(defaults.database))
     parser.add_argument("--workspace-root", default=str(defaults.workspace_root))
-    parser.add_argument("--codex-home", default=str(defaults.codex_home))
+    parser.add_argument("--codex-home")
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("init", help="initialize the SQLite control-plane state")
@@ -217,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--bucket",
         help="show one bucket instead of the most restrictive reported bucket",
     )
+    reauthorize = commands.add_parser(
+        "codex-reauthorize", help="sign in a dedicated Codex service home again"
+    )
+    reauthorize.add_argument("--device-auth", action="store_true")
 
     node = commands.add_parser("register-node", help="register or update a node")
     node.add_argument("node_id")
@@ -252,8 +259,13 @@ def _service_config(args: argparse.Namespace) -> ServiceConfig:
     values.update(
         AGENTD_DB=args.db,
         AGENTD_WORKSPACE_ROOT=args.workspace_root,
-        AGENTD_CODEX_HOME=args.codex_home,
     )
+    if args.codex_home is not None:
+        values["AGENTD_CODEX_HOME"] = args.codex_home
+    elif (
+        args.command in {"codex-status", "codex-reauthorize"} and "CODEX_HOME" in values
+    ):
+        values.setdefault("AGENTD_CODEX_HOME", values["CODEX_HOME"])
     return ServiceConfig.from_environment(values)
 
 
@@ -289,20 +301,95 @@ def _run_process_command(
         report = run_doctor(config)
         print(json.dumps([asdict(check) for check in report.checks], indent=2))
         return 0 if report.healthy else 1
+    if args.command == "codex-reauthorize":
+        return _reauthorize_codex(config.codex_home, device_auth=args.device_auth)
     if args.command == "codex-status":
+        from agentd.harness.app_server import OpenAICodexClient
+        from agentd.harness.codex_auth import (
+            REAUTHORIZATION_REQUIRED,
+            CodexReauthorizationRequired,
+            CodexRefreshUnavailable,
+        )
         from agentd.runtime.codex_oracle import CodexAccountOracle
 
-        with _store(args.db) as store:
-            snapshot = asyncio.run(
-                CodexAccountOracle(
-                    args.pool,
-                    bucket_id=args.bucket,
-                    store=store,
-                ).snapshot()
+        try:
+            with _store(args.db) as store:
+                snapshot = asyncio.run(
+                    CodexAccountOracle(
+                        args.pool,
+                        bucket_id=args.bucket,
+                        store=store,
+                        client_factory=lambda: OpenAICodexClient(
+                            environment={"CODEX_HOME": str(config.codex_home)},
+                            auth_home=config.codex_home,
+                        ),
+                    ).snapshot()
+                )
+        except CodexReauthorizationRequired as error:
+            print(
+                json.dumps(
+                    {
+                        "auth_status": REAUTHORIZATION_REQUIRED,
+                        "pool_id": args.pool,
+                        "reason": error.reason,
+                        "action": str(error),
+                    }
+                )
             )
-            _print_model(snapshot)
+            return 2
+        except CodexRefreshUnavailable as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        except Exception:
+            print("Could not read Codex quota status.", file=sys.stderr)
+            return 1
+        _print_model(snapshot)
         return 0
     return None
+
+
+def _reauthorize_codex(home: Path, *, device_auth: bool) -> int:
+    from codex_cli_bin import bundled_codex_path
+
+    from agentd.harness.codex_auth import CodexReauthorizationRequired, CodexSession
+
+    home = home.resolve()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = home.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        print(
+            "The dedicated Codex home must be owned by you and mode 0700.",
+            file=sys.stderr,
+        )
+        return 1
+    command = [
+        str(bundled_codex_path()),
+        "--config",
+        'cli_auth_credentials_store="file"',
+        "login",
+    ]
+    if device_auth:
+        command.append("--device-auth")
+    with tempfile.TemporaryDirectory(prefix=".agentd-login-", dir=home) as directory:
+        environment = {**os.environ, "CODEX_HOME": directory}
+        for key in (
+            "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        ):
+            environment.pop(key, None)
+        result = subprocess.run(command, cwd=directory, env=environment, check=False)
+        if result.returncode != 0:
+            return 1
+        try:
+            CodexSession(home).install(Path(directory) / "auth.json")
+        except CodexReauthorizationRequired:
+            print(
+                "Codex sign-in did not produce a usable ChatGPT session.",
+                file=sys.stderr,
+            )
+            return 1
+    print("Codex session installed. Run codex-status to verify quota recovery.")
+    return 0
 
 
 async def _github_command(args: argparse.Namespace) -> int:
@@ -741,6 +828,7 @@ async def _serve_service(config: ServiceConfig) -> int:
             config.database,
             config.workspace_root,
             config=config,
+            include_codex_cli_driver=False,
             trusted_provisioning=True,
             enforce_codex_account_policy=True,
             additional_drivers=remote_workers.drivers,

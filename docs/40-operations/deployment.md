@@ -13,7 +13,7 @@ not provision or deploy a remote-worker fleet.
 - a local UID/GID `1000:1000` account with home `/home/bened`;
 - Goldenage checked out at `/home/bened/goldenage`, owned by that account;
 - Docker Engine with Compose v2 and BuildKit; rootless Docker is preferred;
-- `git`, `python3` with SQLite, `sha256sum`, `tar`, and user systemd;
+- `git`, `python3` with SQLite, `uv` for host sign-in, `sha256sum`, `tar`, and user systemd;
 - at least 6 CPUs, 12 GiB RAM, and storage for releases, worktrees, images, and
   SQLite backups; and
 - build-time access to the pinned Python, Node, uv, Debian, and Codex sources or
@@ -30,14 +30,14 @@ only paths owned by the service account and installs its user unit. It does not
 install packages, change sysctls, copy shell history or general Codex configuration,
 or contact another host.
 
-Provisioning requires an explicitly selected `auth.json` source. It validates a
-small non-symlink JSON object, installs it as mode `0600` in the mode-`0700`
-dedicated Codex home, and never copies the source into the repository, image,
-environment file, or command line.
+Provisioning creates a mode-`0700` dedicated Codex home. Sign in to that home as
+the service user before the first start. Each service role uses its own fresh
+sign-in and mode-`0600` `auth.json`.
 
 ```bash
-export AGENTD_AUTH_SOURCE=/secure/reviewed/auth.json
-sudo --preserve-env=AGENTD_AUTH_SOURCE ./deploy/scripts/provision-host.sh
+sudo ./deploy/scripts/provision-host.sh
+uv run agentd --codex-home "$HOME/.local/share/agentd/codex-home" \
+  codex-reauthorize --device-auth
 systemctl --user daemon-reload
 systemctl --user enable agentd.service
 ```
@@ -54,6 +54,12 @@ profiles, and TLS keypair live under the worker state root. Controller health
 uses authenticated worker heartbeats and durable run ownership.
 The publisher runs only the publication command and has its own configuration
 file. Each unit stops only its own Compose service.
+
+Run `codex-reauthorize` separately for `AGENTD_CONTROLLER_CODEX_HOME` on the
+controller host and `AGENTD_WORKER_CODEX_HOME` on the worker host. The HP
+self-host coding profile uses `~/.local/state/agentd-selfhost/coding/controller-codex`
+and `~/.local/state/agentd-selfhost/coding/worker-codex`. Prepare both sessions
+before running `deploy/scripts/prepare-selfhost.sh`.
 
 ## SHA-versioned deployment
 
@@ -125,14 +131,13 @@ worktrees, releases, Codex home, and uv cache are separate from the Goldenage
 service. The HP must already satisfy the prerequisites above, with a complete
 agentd Git checkout at `/home/bened/agentd`, owned by UID/GID `1000:1000`.
 
-Run these commands on the HP, as `bened`, from that checkout. Select an existing
-authenticated Codex `auth.json` explicitly; provisioning copies only that file
-into the dedicated service home with mode `0600`.
+Run these commands on the HP, as `bened`, from that checkout. Sign in separately
+for the self-hosted daemon before its first deployment.
 
 ```bash
-AGENTD_PROFILE=selfhost \
-  AGENTD_AUTH_SOURCE=/home/bened/.local/share/agentd/codex-home/auth.json \
-  ./deploy/scripts/provision-host.sh
+AGENTD_PROFILE=selfhost ./deploy/scripts/provision-host.sh
+uv run agentd --codex-home "$HOME/.local/share/agentd-selfhost/codex-home" \
+  codex-reauthorize --device-auth
 systemctl --user daemon-reload
 systemctl --user enable agentd-selfhost.service
 AGENTD_PROFILE=selfhost ./deploy/scripts/deploy.sh "$(git rev-parse HEAD)"

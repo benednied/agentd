@@ -136,7 +136,8 @@ uv run agentd --db PATH submit \
 ```bash
 uv run agentd --db PATH --workspace-root PATH --codex-home PATH serve
 uv run agentd --db PATH --workspace-root PATH --codex-home PATH doctor
-CODEX_HOME=PATH uv run agentd --db PATH codex-status --pool codex --bucket primary
+uv run agentd --db PATH --codex-home PATH codex-status --pool codex --bucket primary
+uv run agentd --codex-home PATH codex-reauthorize --device-auth
 uv run agentd --db PATH usage --job JOB_ID
 uv run agentd --db PATH repair JOB_ID --instruction "Address the review findings"
 uv run agentd --db PATH accept JOB_ID

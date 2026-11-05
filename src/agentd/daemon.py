@@ -14,6 +14,7 @@ from agentd.domain.models import (
     RunRecord,
     utc_now,
 )
+from agentd.harness.codex_auth import CodexReauthorizationRequired
 from agentd.observability import event_logger
 from agentd.runtime.allowance import LocalAllowancePolicy
 from agentd.runtime.codex_oracle import AccountOracle
@@ -388,11 +389,17 @@ class AgentDaemon:
 
     def _record_error(self, error: Exception, *, operation: str) -> None:
         self._last_error = error
-        event_logger(
+        log = event_logger(
             component="daemon",
             operation=operation,
             error_type=type(error).__name__,
-        ).error("operation_failed")
+        )
+        if isinstance(error, CodexReauthorizationRequired):
+            log.bind(reason=error.reason, action=str(error)).error(
+                "provider_reauthorization_required"
+            )
+        else:
+            log.error("operation_failed")
         if self._on_error is not None:
             self._on_error(error)
 

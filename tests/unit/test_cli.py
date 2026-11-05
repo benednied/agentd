@@ -266,6 +266,7 @@ def test_serve_service_composes_remote_workers_and_scrubs_transport_psk(
 
     runtime_kwargs = observed["runtime_kwargs"]
     assert isinstance(runtime_kwargs, dict)
+    assert runtime_kwargs["include_codex_cli_driver"] is False
     assert len(runtime_kwargs["worker_backends"]) == 1
     assert len(runtime_kwargs["additional_drivers"]) == 1
     assert runtime_kwargs["additional_drivers"][0].capabilities().name == "operations"

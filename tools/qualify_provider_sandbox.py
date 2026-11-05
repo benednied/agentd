@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,11 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from openai_codex.client import CodexClient, CodexConfig
-from openai_codex.generated.v2_all import CommandExecResponse, GetAccountResponse
+from openai_codex.generated.v2_all import CommandExecResponse
 
 from agentd.harness.app_server import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_PERMISSION_PROFILE,
+    EXTERNAL_AUTH_CONFIG,
     OpenAICodexClient,
 )
 
@@ -60,16 +62,16 @@ async def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "qualification base",
     )
     base = git(workspace, "rev-parse", "HEAD")
-    client = OpenAICodexClient(cwd=str(workspace))
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
+    environment = {"CODEX_HOME": str(home)}
+    client = OpenAICodexClient(
+        cwd=str(workspace), environment=environment, auth_home=home
+    )
     thread = turn = None
     maximum_observed_tokens = 0
     terminal = None
     try:
         await client.start()
-        # Normal managed credential refresh; never copy, print or export tokens.
-        await client._client.request(
-            "account/read", {"refreshToken": True}, response_model=GetAccountResponse
-        )
         raw = await client.account_rate_limits()
         buckets = _object(raw.get("rateLimitsByLimitId") or {})
         bucket = _object(buckets.get("codex") or raw.get("rateLimits") or {})
@@ -137,7 +139,12 @@ async def qualify(args: argparse.Namespace) -> dict[str, Any]:
 
     # Never import or execute model-produced code in the credentialed controller.
     with CodexClient(
-        CodexConfig(cwd=str(workspace), experimental_api=True)
+        CodexConfig(
+            cwd=str(workspace),
+            env=environment,
+            experimental_api=True,
+            config_overrides=(EXTERNAL_AUTH_CONFIG,),
+        )
     ) as validator:
         validator.initialize()
         result = validator.request(

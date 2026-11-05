@@ -22,6 +22,36 @@ uv run agentd \
   doctor
 ```
 
+## Codex quota and reauthorization
+
+`codex-status` exits with code `2` and reports `reauthorization_required` when
+the service session is missing, unusable, or rejected during refresh. The main
+daemon logs `provider_reauthorization_required`. The coding controller exposes
+the same condition in `github health` under `provider_auth`, alongside process
+`liveness`. A failed poll leaves the last successful snapshot in place and
+unattended admission still enforces the existing freshness limit.
+
+On the credential owner's host, run these commands as the service user. Use the
+service's dedicated home and the account and workspace assigned to that service.
+
+```bash
+uv run agentd --codex-home /absolute/path/to/service-codex-home \
+  codex-reauthorize --device-auth
+uv run agentd --codex-home /absolute/path/to/service-codex-home \
+  --db /absolute/path/to/controller.sqlite codex-status --pool codex
+```
+
+Use the browser flow by omitting `--device-auth`. The command signs in to a
+private staging directory and atomically installs the new session. The next
+successful poll clears the controller's auth status. For a worker-only home,
+verify the worker's preflight and authenticated heartbeat after sign-in.
+
+For deployments that previously copied a Codex cache, stop the services using
+the copied session during migration. Run a separate sign-in for every daemon,
+controller, and worker home that used the copy. Use a fresh sign-in for each
+new home. Keep the lock file and credential directory on the owner's local
+filesystem and use `codex-reauthorize` for future sign-ins to those homes.
+
 ## Metering and worktrees
 
 - `METERING_PENDING` means terminal usage was absent, inconsistent, or not present

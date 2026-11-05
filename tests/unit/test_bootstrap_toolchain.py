@@ -105,8 +105,9 @@ def test_runtime_pins_dev_toolchain_and_codex_environment(
                     "UV_OFFLINE": "1",
                 },
                 "cwd": str(tmp_path / "leased-worktree"),
+                "auth_home": config.codex_home,
             },
-            {"environment": expected_environment},
+            {"environment": expected_environment, "auth_home": config.codex_home},
         ]
     finally:
         runtime.close()

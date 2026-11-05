@@ -141,6 +141,7 @@ def create_local_runtime(
                     "UV_OFFLINE": "1",
                 },
                 cwd=execution.working_directory,
+                auth_home=effective_config.codex_home,
             )
 
         supervisor = RunSupervisor(
@@ -152,7 +153,9 @@ def create_local_runtime(
         drivers.register(CodexSdkDriver(supervisor, model=effective_config.model))
         account_oracle = CodexAccountOracle(
             "codex",
-            client_factory=lambda: OpenAICodexClient(environment=codex_environment),
+            client_factory=lambda: OpenAICodexClient(
+                environment=codex_environment, auth_home=effective_config.codex_home
+            ),
             store=store,
         )
     if include_codex_cli_driver:

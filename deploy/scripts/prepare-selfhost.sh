@@ -16,11 +16,12 @@ for role in read publish; do
   [ -f "$source/hosts.yml" ] && [ ! -L "$source/hosts.yml" ]
   install -m 0600 "$source/hosts.yml" "$target/hosts.yml"
 done
-auth="$share/codex-home/auth.json"
-[ -f "$auth" ] && [ ! -L "$auth" ]
 for role in controller worker; do
-  target="$state/$role-codex/auth.json"
-  [ -e "$target" ] || install -m 0600 "$auth" "$target"
+  home="$state/$role-codex"
+  if [ ! -f "$home/auth.json" ] || [ -L "$home/auth.json" ]; then
+    printf '%s\n' "Sign in separately for $role: agentd --codex-home $home codex-reauthorize --device-auth" >&2
+    exit 1
+  fi
 done
 transport="$state/transport"
 if [ ! -f "$transport/worker.psk" ]; then

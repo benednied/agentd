@@ -12,7 +12,6 @@ case "$provisioning_uid" in
 esac
 require_command getent
 require_command install
-require_command python3
 require_command stat
 
 owner_record=$(getent passwd 1000 || true)
@@ -29,7 +28,6 @@ owner_home=$(printf '%s\n' "$owner_record" | awk -F: '{print $6}')
 install -d -o 1000 -g 1000 -m 0700 \
     "$AGENTD_STATE_ROOT" \
     "$AGENTD_BACKUP_ROOT" \
-    "$AGENTD_STATE_ROOT/auth-backups" \
     "$AGENTD_UV_CACHE" \
     "$AGENTD_WORKSPACE_ROOT" \
     "$AGENTD_CODEX_HOME"
@@ -63,36 +61,6 @@ if [ -r /proc/sys/user/max_user_namespaces ]; then
         || die "user.max_user_namespaces must be positive"
 fi
 
-: "${AGENTD_AUTH_SOURCE:?set AGENTD_AUTH_SOURCE to the reviewed auth.json source}"
-[ -f "$AGENTD_AUTH_SOURCE" ] || die "AGENTD_AUTH_SOURCE is not a regular file"
-[ ! -L "$AGENTD_AUTH_SOURCE" ] || die "AGENTD_AUTH_SOURCE must not be a symlink"
-[ "$(basename -- "$AGENTD_AUTH_SOURCE")" = auth.json ] \
-    || die "AGENTD_AUTH_SOURCE must name auth.json"
-[ "$(stat -c %s "$AGENTD_AUTH_SOURCE")" -le 1048576 ] \
-    || die "auth.json is unexpectedly large"
-python3 - "$AGENTD_AUTH_SOURCE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not isinstance(payload, dict) or not payload:
-    raise SystemExit("auth.json must contain a nonempty JSON object")
-PY
-
-target_auth=$AGENTD_CODEX_HOME/auth.json
-if [ -f "$target_auth" ]; then
-    auth_backup=$AGENTD_STATE_ROOT/auth-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$-auth.json
-    install -o 1000 -g 1000 -m 0600 "$target_auth" "$auth_backup"
-fi
-auth_tmp=$AGENTD_CODEX_HOME/.auth.json.install-$$
-trap 'case "$auth_tmp" in "$AGENTD_CODEX_HOME"/.auth.json.install-*) rm -f -- "$auth_tmp" ;; esac' EXIT HUP INT TERM
-install -o 1000 -g 1000 -m 0600 "$AGENTD_AUTH_SOURCE" "$auth_tmp"
-mv -f "$auth_tmp" "$target_auth"
-chown 1000:1000 "$target_auth"
-chmod 0600 "$target_auth"
-trap - EXIT HUP INT TERM
-
 unit_dir=$AGENTD_HOME/.config/systemd/user
 install -d -o 1000 -g 1000 -m 0700 "$unit_dir"
 install -o 1000 -g 1000 -m 0644 \
@@ -106,5 +74,6 @@ if [ "${AGENTD_PROFILE:-goldenage}" = goldenage ]; then
 fi
 
 printf '%s\n' \
-    "Provisioned exact agentd paths, $config_status reviewed config.toml, and auth.json." \
+    "Provisioned exact agentd paths and $config_status reviewed config.toml." \
+    "For a new service home, as UID 1000 run: agentd --codex-home $AGENTD_CODEX_HOME codex-reauthorize --device-auth" \
     "As UID 1000, run: systemctl --user daemon-reload"
