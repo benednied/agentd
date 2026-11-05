@@ -640,8 +640,9 @@ def test_runtime_preflight_exercises_direct_and_pinned_codex_sandboxes() -> None
     assert '"command": [str(toolchain_launcher), str(workspace_payload)]' in preflight
     assert "result.exit_code != 0" in preflight
     assert "/home/bened/.local/share/agentd/codex-home/auth.json" in payload
-    assert 'ARG0_ROOT = AUTH_FILE.parent / "tmp/arg0"' in payload
-    assert "_is_readable(ARG0_ROOT)" in payload
+    assert '("arg0", "arg0-linux")' in payload
+    assert "for root in ARG0_ROOTS:" in payload
+    assert "_is_readable(root)" in payload
     assert "/home/bened/.local/state/agentd/state.sqlite" in payload
     assert 'REPOSITORY_ROOT = Path("/home/bened/goldenage")' in payload
     assert 'UV_CACHE_ROOT = Path("/home/bened/.cache/uv")' in payload
