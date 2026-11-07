@@ -24,6 +24,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from agentd.candidate_runtime import (
+    CandidatePreparationError,
+    CandidateRuntimePreparation,
+)
+
 
 class PublicationError(RuntimeError):
     """A conflicting identity or failed trusted validation blocks publication."""
@@ -948,8 +953,13 @@ class TrustedFinalizer:
     mandatory; the default has no uncontained subprocess fallback.
     """
 
-    def __init__(self, runner: ValidationRunner | None = None) -> None:
+    def __init__(
+        self,
+        runner: ValidationRunner | None = None,
+        preparation: CandidateRuntimePreparation | None = None,
+    ) -> None:
         self.runner = runner
+        self.preparation = preparation
 
     def validate(
         self,
@@ -1017,10 +1027,41 @@ class TrustedFinalizer:
             # A forged core.fsmonitor hook would otherwise escape containment.
             trusted_git = root / "trusted.git"
             shutil.copytree(checkout / ".git", trusted_git)
+            runner = self.runner
+            runtime = None
+            if self.preparation is not None:
+                if not isinstance(runner, BubblewrapValidationRunner):
+                    raise PublicationError(
+                        "Candidate preparation requires Linux containment"
+                    )
+                try:
+                    runtime = self.preparation.prepare(checkout, root / "runtime")
+                    runtime.verify(checkout)
+                except (
+                    CandidatePreparationError,
+                    OSError,
+                    ValueError,
+                    subprocess.TimeoutExpired,
+                ) as error:
+                    raise CandidatePreparationError(
+                        "Candidate preparation unavailable"
+                    ) from error
+                runner = BubblewrapValidationRunner(
+                    executable=runner.executable,
+                    runtime_mounts=(*runner.runtime_mounts, runtime.root),
+                )
             evidence = []
             for command in intent.validation_commands:
+                if runtime is not None:
+                    runtime.verify(checkout)
+                    command = tuple(
+                        part.replace(
+                            "{candidate_python}", str(runtime.root / "venv/bin/python")
+                        ).replace("{candidate_lock_sha256}", runtime.lock_sha256)
+                        for part in command
+                    )
                 try:
-                    result = self.runner.run(
+                    result = runner.run(
                         command,
                         cwd=checkout,
                         env=env,
@@ -1125,11 +1166,22 @@ class DraftPublisher:
             state = self.store.bind(intent)
             if state["stage"] == "published":
                 return state["pr"]
+            if state["stage"] == "preparation_blocked":
+                preparation = self.finalizer.preparation
+                if (
+                    preparation is None
+                    or state["evidence"][-1].get("prerequisite")
+                    == preparation.prerequisite
+                ):
+                    raise PublicationPending("Candidate dependency preparation blocked")
             if state["stage"] == "validation_failed":
                 raise PublicationError("Recorded trusted validation failed")
             if state["stage"] == "validation_blocked":
                 raise PublicationError("Recorded trusted validation boundary failed")
-            if state["evidence"] is None or state["stage"] == "validation_unavailable":
+            if state["evidence"] is None or state["stage"] in {
+                "validation_unavailable",
+                "preparation_blocked",
+            }:
                 recorded = state["evidence"] or []
                 attempt = (
                     max(
@@ -1144,6 +1196,24 @@ class DraftPublisher:
                     )
                 try:
                     evidence = self.finalizer.validate(intent, collected, repository)
+                except CandidatePreparationError:
+                    self.store.save(
+                        intent,
+                        "preparation_blocked",
+                        evidence=[
+                            *recorded,
+                            {
+                                "commit": intent.result_commit,
+                                "returncode": None,
+                                "error": "candidate-preparation-unavailable",
+                                "prerequisite": self.finalizer.preparation.prerequisite,
+                                "validation_attempt": attempt,
+                            },
+                        ],
+                    )
+                    raise PublicationPending(
+                        "Candidate dependency preparation blocked"
+                    ) from None
                 except (OSError, subprocess.TimeoutExpired):
                     evidence = [
                         {
