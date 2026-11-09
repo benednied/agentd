@@ -7,7 +7,7 @@ ARG UV_VERSION=0.11.6
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-runtime
 
 FROM ${NODE_IMAGE} AS codex-cli
-ARG CODEX_VERSION=0.166.0
+ARG CODEX_VERSION=0.167.0
 RUN npm install --global --omit=dev "@openai/codex@${CODEX_VERSION}" \
     && codex --version
 
