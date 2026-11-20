@@ -28,3 +28,9 @@ the unused `60-*` range is intentional.
 
 The root [README](../README.md) is the project landing page. It links into this
 map but does not duplicate the normative details.
+
+## Product roadmap
+
+See the [unattended backlog roadmap](ROADMAP.md) and the
+[Goldenage technical breakdown](40-operations/goldenage-autonomy-breakdown.md)
+for the distinction between the issue-to-draft slice and unattended operation.
